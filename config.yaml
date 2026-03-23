@@ -40,9 +40,9 @@ extended_days: 100
 # ==================== 因子配置 ====================
 factors:
   # 使用的因子集
-  #   - alpha158: 标准Alpha158（量价因子）
-  #   - alpha158_futures: Alpha158 + 期货特有因子（推荐）
-  factor_set: "alpha158_futures"
+  #   - alpha158: 标准Alpha158（量价因子）✅ 推荐先用这个
+  #   - alpha158_futures: Alpha158 + 期货特有因子（需要额外字段）
+  factor_set: "alpha158"
 
   # 期货特有因子窗口
   futures_windows: [5, 10, 20]
