@@ -224,8 +224,13 @@ class FuturesAlpha158(AlphaDataset):
             # 真实波幅
             self.add_feature(
                 f"atr_{w}",
-                f"ts_mean(ts_greater(high - low, ts_abs(high - ts_delay(close, 1))), {w}) / close"
-            )
+                f"ts_mean("
+                f"  ts_max("
+                f"    ts_max(high - low, ts_abs(high - ts_delay(close, 1))),"
+                f"    ts_abs(low - ts_delay(close, 1))"
+                f"  ), {w}"
+                f") / close"
+           )
 
             # 收益率波动率
             self.add_feature(
@@ -250,7 +255,10 @@ class FuturesAlpha158(AlphaDataset):
             # 量价同步性（量涨价涨、量跌价跌的比例）
             self.add_feature(
                 f"vol_price_sync_{w}",
-                f"ts_mean((close > ts_delay(close, 1)) == (volume > ts_delay(volume, 1)), {w})"
+                f"ts_mean("
+                f"  (close - ts_delay(close, 1)) * (volume - ts_delay(volume, 1)) > 0,"
+                f"  {w}"
+                f")"
             )
 
             # ====== 收益分布因子 ======

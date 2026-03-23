@@ -10,15 +10,14 @@ data:
 # ==================== 品种配置 ====================
 # symbols: 交易品种列表
 #   格式: ["品种代号"]
-#   示例: ["RB", "IF", "CU", "AU", "SC", "M", "P"]
-#   - RB: 螺纹钢    IF: 沪深300期货  CU: 铜
-#   - AU: 黄金      SC: 原油         M: 豆粕   P: 棕榈油
+#   上期所品种: RB(螺纹钢), CU(铜), AU(黄金), AG(白银), AL(铝), 
+#              ZN(锌), RU(橡胶), NI(镍), HC(热卷), BU(沥青)
 symbols:
-  - "RB"
-  - "IF"
-  - "CU"
-  - "AU"
-  - "M"
+  - "RB"   # 螺纹钢
+  - "CU"   # 铜
+  - "AU"   # 黄金
+  - "AG"   # 白银
+  - "RU"   # 橡胶
 
 # 连续合约构建方式
 #   - volume: 按成交量切换主力合约（推荐）
@@ -120,12 +119,6 @@ contracts:
     long_rate: 0.0001     # 开仓手续费率
     short_rate: 0.0001    # 平仓手续费率
 
-  IF:
-    multiplier: 300
-    pricetick: 0.2
-    margin_rate: 0.12
-    long_rate: 0.000023
-    short_rate: 0.000023
 
   CU:
     multiplier: 5
@@ -141,12 +134,19 @@ contracts:
     long_rate: 0.00002
     short_rate: 0.00002
 
-  M:
-    multiplier: 10
+  AG:
+    multiplier: 15
     pricetick: 1
     margin_rate: 0.08
-    long_rate: 0.00015
-    short_rate: 0.00015
+    long_rate: 0.00005
+    short_rate: 0.00005
+  
+  RU:
+    multiplier: 10
+    pricetick: 5
+    margin_rate: 0.09
+    long_rate: 0.000045
+    short_rate: 0.000045
 
 # ==================== 并行计算 ====================
 parallel:

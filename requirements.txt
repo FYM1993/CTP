@@ -5,7 +5,7 @@
 vnpy>=4.0.0
 
 # 因子分析
-alphalens-reloaded>=0.5.0
+alphalens-reloaded>=0.4.6
 
 # 机器学习
 lightgbm>=4.0.0

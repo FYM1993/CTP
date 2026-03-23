@@ -9,9 +9,8 @@
 - oi: 按持仓量切换
 """
 
-import os
+import re
 from pathlib import Path
-from datetime import datetime
 
 import polars as pl
 
@@ -24,9 +23,31 @@ def load_raw_contracts(data_dir: str, symbol: str) -> pl.DataFrame:
     - datetime, symbol, open, high, low, close, volume, turnover, open_interest
     - symbol 格式: RB2401, IF2312 等
 
-    也支持直接从 vnpy AlphaLab 的 parquet 目录加载。
+    支持的数据源（按优先级）：
+    1. cleaned/SHFE/shfe_all.csv - 清洗后的完整数据
+    2. raw/{symbol}/*.csv - 按品种分目录的原始CSV
+    3. daily/{symbol}*.parquet - vnpy AlphaLab parquet格式
     """
     data_path = Path(data_dir)
+
+    # 优先尝试从清洗后的 SHFE 数据加载
+    shfe_csv = data_path / "cleaned" / "SHFE" / "shfe_all.csv"
+    if shfe_csv.exists():
+        # 读取完整数据并筛选目标品种
+        df = pl.read_csv(shfe_csv, try_parse_dates=True)
+        # 品种代码：从 AG2401.SHFE 提取 AG
+        variety_pattern = f"{symbol.upper()}"
+        df_filtered = df.filter(
+            pl.col("symbol").str.starts_with(variety_pattern + "2") | 
+            pl.col("symbol").str.starts_with(variety_pattern + "1") |
+            pl.col("symbol").str.starts_with(variety_pattern + "0")
+        )
+        if len(df_filtered) > 0:
+            # 移除 .SHFE 后缀以匹配期望格式
+            df_filtered = df_filtered.with_columns([
+                pl.col("symbol").str.replace(r"\.SHFE$", "")
+            ])
+            return df_filtered.sort(["datetime", "symbol"])
 
     # 尝试从 CSV 目录加载
     csv_dir = data_path / "raw" / symbol
@@ -70,10 +91,10 @@ def build_continuous(
     构建连续合约
 
     Args:
-        raw_df: 原始合约数据，必须包含 datetime, symbol, open, high, low, close,
+        raw_df: 单品种原始合约数据，必须包含 datetime, symbol, open, high, low, close,
                 volume, open_interest 列
         method: 切换方式 "volume" 或 "oi"
-        switch_threshold: 切换阈值（新合约的成交量/持仓量超过旧合约的此比例时切换）
+        switch_threshold: 切换阈值（新合约的量/持仓量达到旧合约的此比例时切换）
         min_active_days: 合约最少活跃天数（过滤掉极不活跃的合约）
 
     Returns:
@@ -81,68 +102,78 @@ def build_continuous(
     """
     sort_col = "volume" if method == "volume" else "open_interest"
 
-    # 按日期排序
-    df = raw_df.sort("datetime")
+    # ========== 防御性检查: 确保单品种数据 ==========
+    variety_set = set(
+        m.group(1)
+        for s in raw_df["symbol"].unique().to_list()
+        if (m := re.match(r'([A-Z]+)', s))
+    )
+    if len(variety_set) > 1:
+        raise ValueError(
+            f"输入数据包含多个品种 {variety_set}，请按品种分别调用"
+        )
 
-    # 获取所有交易日
-    all_dates = df.select("datetime").unique().sort("datetime")
+    # ========== 构建 (datetime, symbol) → volume 查找字典 ==========
+    # 用于 O(1) 查询当前主力的量，避免反复 filter 大表
+    lookup = {}
+    for row in raw_df.select(["datetime", "symbol", sort_col]).iter_rows(named=True):
+        lookup[(row["datetime"], row["symbol"])] = row[sort_col] or 0
 
-    records = []
+    # ========== 每日 top 合约（向量化）==========
+    daily_top = (
+        raw_df
+        .group_by("datetime", maintain_order=True)
+        .agg(
+            pl.col("symbol").sort_by(pl.col(sort_col), descending=True).first().alias("top_symbol"),
+        )
+        .sort("datetime")
+    )
+
+    # ========== 模拟主力合约切换 ==========
+    dates = daily_top["datetime"].to_list()
+    top_symbols = daily_top["top_symbol"].to_list()
+
     current_symbol = None
+    dominant_symbols = []
 
-    for row in all_dates.iter_rows(named=True):
-        dt = row["datetime"]
-
-        # 当日各合约数据
-        day_df = df.filter(pl.col("datetime") == dt)
-
-        if day_df.is_empty():
-            continue
-
-        # 找当日主力（成交量/持仓量最大的合约）
-        day_df = day_df.sort(sort_col, descending=True)
-        top_contract = day_df.row(0, named=True)
-        top_symbol = top_contract["symbol"]
-        top_value = top_contract[sort_col]
+    for i in range(len(dates)):
+        dt = dates[i]
+        top_sym = top_symbols[i]
 
         if current_symbol is None:
-            # 首日，直接选定
-            current_symbol = top_symbol
-        else:
-            # 检查是否需要切换
-            current_day = day_df.filter(pl.col("symbol") == current_symbol)
+            current_symbol = top_sym
+        elif top_sym != current_symbol:
+            current_val = lookup.get((dt, current_symbol), 0)
+            top_val = lookup.get((dt, top_sym), 0)
 
-            if current_day.is_empty():
-                # 当前合约已退市，切换到新主力
-                current_symbol = top_symbol
-            else:
-                current_value = current_day.row(0, named=True)[sort_col]
+            if current_val == 0:
+                # 当前合约已退市
+                current_symbol = top_sym
+            elif top_val > current_val * switch_threshold:
+                current_symbol = top_sym
 
-                if current_value and top_value:
-                    if top_value > current_value * (1 + (1 - switch_threshold)):
-                        # 新合约的量足够大，切换
-                        current_symbol = top_symbol
+        dominant_symbols.append(current_symbol)
 
-        # 记录当日数据
-        contract_data = day_df.filter(pl.col("symbol") == current_symbol)
-        if not contract_data.is_empty():
-            row_data = contract_data.row(0, named=True)
-            records.append({
-                "datetime": dt,
-                "open": row_data["open"],
-                "high": row_data["high"],
-                "low": row_data["low"],
-                "close": row_data["close"],
-                "volume": row_data.get("volume", 0),
-                "turnover": row_data.get("turnover", 0),
-                "open_interest": row_data.get("open_interest", 0),
-                "contract": current_symbol,  # 记录实际合约
-            })
+    # ========== join 提取连续合约数据 ==========
+    dominant_df = pl.DataFrame({
+        "datetime": dates,
+        "contract": dominant_symbols,
+    })
 
-    continuous_df = pl.DataFrame(records).sort("datetime")
+    continuous_df = (
+        raw_df
+        .join(
+            dominant_df,
+            left_on=["datetime", "symbol"],
+            right_on=["datetime", "contract"],
+            how="inner",
+        )
+        .select(["datetime", "open", "high", "low", "close", "volume", "turnover", "open_interest", "symbol"])
+        .rename({"symbol": "contract"})
+        .sort("datetime")
+    )
 
     # 过滤掉数据量过少的片段
-    # （通常连续合约前后可能有数据缺失）
     if len(continuous_df) < min_active_days:
         print(f"  ⚠️ 数据量不足 {min_active_days} 天，跳过")
         return pl.DataFrame()

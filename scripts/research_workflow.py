@@ -157,17 +157,33 @@ def load_data_to_lab(
 
         bars = []
         for row in df.iter_rows(named=True):
+            # 确保 datetime 是 datetime 对象而不是 date
+            dt = row["datetime"]
+            if hasattr(dt, 'hour'):  # 已经是 datetime
+                bar_datetime = dt
+            else:  # 是 date，转换为 datetime
+                from datetime import datetime as dt_class
+                bar_datetime = dt_class.combine(dt, dt_class.min.time())
+            
+            # 计算 vwap (成交金额 / 成交量)
+            volume = float(row.get("volume", 0))
+            turnover = float(row.get("turnover", 0))
+            if volume > 0:
+                vwap_price = turnover / volume
+            else:
+                vwap_price = float(row["close"])  # 如果没有成交量，用收盘价
+            
             bar = BarData(
-                symbol=symbol,
+                symbol=vt_symbol,  # 使用连续合约代号（如 RB00）
                 exchange=exchange,
-                datetime=row["datetime"],
+                datetime=bar_datetime,
                 interval=Interval.DAILY,
                 open_price=float(row["open"]),
                 high_price=float(row["high"]),
                 low_price=float(row["low"]),
                 close_price=float(row["close"]),
-                volume=float(row.get("volume", 0)),
-                turnover=float(row.get("turnover", 0)),
+                volume=volume,
+                turnover=turnover,
                 open_interest=float(row.get("open_interest", 0)),
                 gateway_name="DB",
             )
@@ -211,23 +227,57 @@ def build_dataset(
     print("  加载行情数据...")
     all_dfs = []
 
+    # 直接读取 parquet 文件，避免 vnpy 的文件名问题
+    import glob
+    daily_dir = Path(config["data"].get("lab_path", "./data/lab/futures")) / "daily"
+    
     for vt_symbol in vt_symbols:
-        df = lab.load_bar_df(
-            [vt_symbol],
-            "d",
-            seg["train"][0],
-            seg["test"][1],
-            extended_days=extended_days,
+        # 查找对应的 parquet 文件（可能是 RB00.SHFE.parquet）
+        pattern = str(daily_dir / f"{vt_symbol}*.parquet")
+        files = glob.glob(pattern)
+        
+        if not files:
+            print(f"  ⚠️ 未找到 {vt_symbol} 的数据文件")
+            continue
+        
+        df = pl.read_parquet(files[0])
+        
+        # 确保有 vt_symbol 列
+        if "vt_symbol" not in df.columns:
+            df = df.with_columns([
+                pl.lit(vt_symbol).alias("vt_symbol")
+            ])
+        
+        # 时间筛选
+        start_date = seg["train"][0]
+        end_date = seg["test"][1]
+        
+        from datetime import datetime, timedelta
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=extended_days)
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        
+        df = df.filter(
+            (pl.col("datetime") >= start_dt) &
+            (pl.col("datetime") <= end_dt)
         )
-        if df is not None and not df.is_empty():
+        
+        if not df.is_empty():
+            # 计算并添加 vwap 列
+            df = df.with_columns([
+                pl.when(pl.col("volume") > 0)
+                .then(pl.col("turnover") / pl.col("volume"))
+                .otherwise(pl.col("close"))
+                .alias("vwap")
+            ])
             all_dfs.append(df)
+            print(f"  ✅ {vt_symbol}: {len(df)} 条")
 
     merged_df = pl.concat(all_dfs) if all_dfs else None
 
     if merged_df is None or merged_df.is_empty():
         raise RuntimeError("无法加载任何数据，请检查数据目录")
 
-    print(f"  数据量: {len(merged_df)} 行, {merged_df['vt_symbol'].n_unique()} 个品种")
+    print(f"  合并后数据: {len(merged_df)} 行, {merged_df['vt_symbol'].n_unique()} 个品种")
 
     # 创建因子数据集
     factor_set = config["factors"]["factor_set"]
