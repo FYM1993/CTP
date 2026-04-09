@@ -19,27 +19,25 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
-import akshare as aks
+
+from data_cache import get_daily
+from wyckoff import (
+    wyckoff_phase, vsa_scan, analyze_oi, oi_divergence,
+    analyze_volume_pattern, detect_climax, detect_spring_upthrust,
+    detect_sos_sow, relative_volume, close_position,
+)
 
 
 def load_config() -> dict:
-    with open("config.yaml", "r", encoding="utf-8") as f:
+    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def fetch_data(symbol: str, days: int = 500) -> pd.DataFrame:
-    """拉取最新主力合约日线数据"""
-    start = pd.Timestamp.now() - pd.Timedelta(days=days * 2)
-    df = aks.futures_main_sina(symbol=symbol, start_date=start.strftime("%Y%m%d"))
-    df = df.rename(columns={
-        "日期": "date", "开盘价": "open", "最高价": "high",
-        "最低价": "low", "收盘价": "close",
-        "成交量": "volume", "持仓量": "oi", "动态结算价": "settle",
-    })
-    for c in ["open", "high", "low", "close", "volume", "oi"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = pd.to_datetime(df["date"])
-    return df.sort_values("date").reset_index(drop=True).tail(days)
+    """通过缓存层获取日线数据"""
+    df = get_daily(symbol, days)
+    return df if df is not None else pd.DataFrame()
 
 
 # ========== 技术指标计算 ==========
@@ -130,85 +128,159 @@ def calc_fibonacci(high: float, low: float, direction: str, levels: list[float])
 # ========== 信号评分 ==========
 
 def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
-    """综合评分: -100(强空) ~ +100(强多)"""
+    """
+    综合评分: -100(强空) ~ +100(强多)
+
+    评分体系 (总计 ±100):
+      经典指标 (50分):
+        均线排列  15分  — 趋势方向
+        MACD     10分  — 趋势动能
+        RSI      10分  — 超买超卖
+        布林带    10分  — 价格位置
+        动量       5分  — 短期惯性
+      Wyckoff 量价 (35分):
+        阶段判断  15分  — 吸筹/派发/上涨/下跌
+        量价关系  10分  — 上涨日量 vs 下跌日量
+        VSA信号  10分  — 最近K线的量价行为
+      期货持仓 (15分):
+        OI信号   15分  — 价格+持仓量四象限
+    """
     close = df["close"]
     last = close.iloc[-1]
     scores = {}
 
-    # 1. 均线排列 (权重25)
+    # ===== 经典指标 (50分) =====
+
+    # 1. 均线排列 (15) — 综合价格位置和均线排列
     ma_cfg = cfg.get("ma_windows", [5, 10, 20, 60, 120])
     mas = {w: calc_ma(close, w).iloc[-1] for w in ma_cfg}
-    short_mas = [mas[w] for w in ma_cfg[:3] if w in mas]
-    long_mas = [mas[w] for w in ma_cfg[3:] if w in mas]
-    
-    if short_mas and long_mas:
-        avg_short = np.mean(short_mas)
-        avg_long = np.mean(long_mas)
-        ma_score = (avg_short / avg_long - 1) * 1000
-        scores["均线排列"] = np.clip(ma_score, -25, 25)
+    all_ma_vals = [mas[w] for w in ma_cfg if w in mas]
+    if all_ma_vals:
+        # (a) 价格在均线上方/下方的数量: 全在上方=多头, 全在下方=空头
+        above_count = sum(1 for m in all_ma_vals if last > m)
+        price_vs_ma = (above_count / len(all_ma_vals) - 0.5) * 2  # -1~+1
+
+        # (b) 均线排列方向: 短均 vs 长均
+        short_mas = [mas[w] for w in ma_cfg[:3] if w in mas]
+        long_mas = [mas[w] for w in ma_cfg[3:] if w in mas]
+        if short_mas and long_mas:
+            alignment = np.sign(np.mean(short_mas) / np.mean(long_mas) - 1)
+        else:
+            alignment = 0
+
+        # 价格位置权重70%、排列方向权重30%
+        # 价格跌破所有均线时，即使短均还在长均上方也给负分
+        raw = price_vs_ma * 0.7 + alignment * 0.3
+        scores["均线排列"] = np.clip(raw * 15, -15, 15)
     else:
         scores["均线排列"] = 0
 
-    # 2. MACD (权重20)
+    # 2. MACD (10)
     mcfg = cfg.get("macd", {})
     dif, dea, hist = calc_macd(close, mcfg.get("fast", 12), mcfg.get("slow", 26), mcfg.get("signal", 9))
     hist_now = hist.iloc[-1]
     hist_prev = hist.iloc[-2]
-    
     if hist_now > 0 and hist_now > hist_prev:
-        scores["MACD"] = 20
-    elif hist_now > 0:
         scores["MACD"] = 10
+    elif hist_now > 0:
+        scores["MACD"] = 5
     elif hist_now < 0 and hist_now < hist_prev:
-        scores["MACD"] = -20
-    elif hist_now < 0:
         scores["MACD"] = -10
+    elif hist_now < 0:
+        scores["MACD"] = -5
     else:
         scores["MACD"] = 0
 
-    # 3. RSI (权重15)
+    # 3. RSI (10)
     rsi_w = cfg.get("rsi_window", 14)
     rsi = calc_rsi(close, rsi_w).iloc[-1]
-    if rsi < 30:
-        scores["RSI"] = 15    # 超卖 → 利多
-    elif rsi > 70:
-        scores["RSI"] = -15   # 超买 → 利空
-    elif rsi < 45:
+    if rsi < 25:
+        scores["RSI"] = 10
+    elif rsi < 35:
         scores["RSI"] = 5
-    elif rsi > 55:
+    elif rsi > 75:
+        scores["RSI"] = -10
+    elif rsi > 65:
         scores["RSI"] = -5
     else:
         scores["RSI"] = 0
 
-    # 4. 布林带位置 (权重15)
+    # 4. 布林带位置 (10)
     bcfg = cfg.get("bollinger", {})
     upper, mid, lower = calc_bollinger(close, bcfg.get("window", 20), bcfg.get("std", 2))
     bb_pos = (last - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1] + 1e-12)
-    scores["布林带"] = np.clip((0.5 - bb_pos) * 30, -15, 15)
+    scores["布林带"] = np.clip((0.5 - bb_pos) * 20, -10, 10)
 
-    # 5. 成交量趋势 (权重10)
-    vol = df["volume"]
-    vol_ma5 = calc_ma(vol, 5).iloc[-1]
-    vol_ma20 = calc_ma(vol, 20).iloc[-1]
-    vol_ratio = vol_ma5 / (vol_ma20 + 1e-12)
-    if vol_ratio > 1.5:
-        scores["量能"] = 10 if direction == "long" and last > close.iloc[-2] else -10
-    elif vol_ratio < 0.7:
-        scores["量能"] = -5
-    else:
-        scores["量能"] = 0
-
-    # 6. 价格动量 (权重15)
+    # 5. 动量 (5)
     ret_5 = last / close.iloc[-6] - 1
     ret_20 = last / close.iloc[-21] - 1
-    momentum = (ret_5 * 0.6 + ret_20 * 0.4) * 1000
-    scores["动量"] = np.clip(momentum, -15, 15)
+    momentum = (ret_5 * 0.6 + ret_20 * 0.4) * 500
+    scores["动量"] = np.clip(momentum, -5, 5)
+
+    # ===== Wyckoff 量价分析 (35分) =====
+
+    # 6. 阶段判断 (15)
+    phase = wyckoff_phase(df, lookback=120)
+    if phase.phase == "accumulation":
+        scores["Wyckoff阶段"] = 15 * phase.confidence
+    elif phase.phase == "markup":
+        scores["Wyckoff阶段"] = 8 * phase.confidence
+    elif phase.phase == "distribution":
+        scores["Wyckoff阶段"] = -15 * phase.confidence
+    elif phase.phase == "markdown":
+        scores["Wyckoff阶段"] = -8 * phase.confidence
+    else:
+        scores["Wyckoff阶段"] = 0
+
+    # 7. 量价关系 (10) — 上涨日成交量 vs 下跌日成交量
+    vp = analyze_volume_pattern(df, lookback=60)
+    ratio = vp["up_down_ratio"]
+    if ratio > 1.5:
+        scores["量价关系"] = 10
+    elif ratio > 1.2:
+        scores["量价关系"] = 5
+    elif ratio < 0.67:
+        scores["量价关系"] = -10
+    elif ratio < 0.83:
+        scores["量价关系"] = -5
+    else:
+        scores["量价关系"] = 0
+
+    # 8. VSA 最近K线 (10)
+    vsa_bars = vsa_scan(df, window=20)
+    recent_vsa = vsa_bars[-5:]
+    bullish_strength = sum(b.strength for b in recent_vsa if b.bias == "bullish")
+    bearish_strength = sum(b.strength for b in recent_vsa if b.bias == "bearish")
+    vsa_net = bullish_strength - bearish_strength
+    scores["VSA信号"] = np.clip(vsa_net * 3, -10, 10)
+
+    # ===== 期货持仓分析 (15分) =====
+
+    # 9. OI 信号 (15)
+    oi_sig = analyze_oi(df, window=5)
+    if oi_sig:
+        if oi_sig.pattern == "new_long":
+            scores["持仓信号"] = 15
+        elif oi_sig.pattern == "short_covering":
+            scores["持仓信号"] = 5
+        elif oi_sig.pattern == "new_short":
+            scores["持仓信号"] = -15
+        elif oi_sig.pattern == "long_liquidation":
+            scores["持仓信号"] = -5
+        else:
+            scores["持仓信号"] = 0
+    else:
+        scores["持仓信号"] = 0
 
     return scores
 
 
-def analyze_one(symbol: str, name: str, direction: str, cfg: dict):
-    """对单个品种执行完整的盘前分析"""
+def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
+    """
+    对单个品种执行完整的盘前分析
+
+    返回: {"symbol", "name", "direction", "score", "actionable", "entry", "stop", "tp1"} 或 None
+    """
     print(f"\n{'='*60}")
     dir_icon = "🟢 做多" if direction == "long" else "🔴 做空"
     print(f"  {name} ({symbol})  {dir_icon}")
@@ -219,7 +291,7 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict):
     df = fetch_data(symbol, days=400)
     if df.empty:
         print("  ❌ 数据获取失败")
-        return
+        return None
 
     close = df["close"]
     last = close.iloc[-1]
@@ -230,45 +302,105 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict):
     print(f"     收盘价: {last:.0f}  涨跌: {change_pct:+.2f}%")
     print(f"     成交量: {df['volume'].iloc[-1]:,.0f}  持仓量: {df['oi'].iloc[-1]:,.0f}")
 
-    # 均线
     pre_cfg = cfg
+
+    # ==================== 第一部分: 经典技术指标 ====================
+    print(f"\n  ┌─ 经典技术指标 ─────────────────────────────┐")
+
+    # 均线
     ma_windows = pre_cfg.get("ma_windows", [5, 10, 20, 60, 120])
-    print(f"\n  📈 均线系统")
+    print(f"  │ 均线系统:")
     for w in ma_windows:
         ma_val = calc_ma(close, w).iloc[-1]
         diff_pct = (last / ma_val - 1) * 100
         above = "▲" if last > ma_val else "▼"
-        print(f"     MA{w}: {ma_val:.0f}  ({above} {diff_pct:+.2f}%)")
+        print(f"  │   MA{w}: {ma_val:.0f}  ({above} {diff_pct:+.2f}%)")
 
     # MACD
     mcfg = pre_cfg.get("macd", {})
     dif, dea, hist = calc_macd(close, mcfg.get("fast", 12), mcfg.get("slow", 26), mcfg.get("signal", 9))
-    print(f"\n  📉 MACD")
-    print(f"     DIF: {dif.iloc[-1]:.2f}  DEA: {dea.iloc[-1]:.2f}  柱: {hist.iloc[-1]:.2f}")
-    if hist.iloc[-1] > hist.iloc[-2]:
-        print(f"     状态: 红柱放大 ↑")
-    elif hist.iloc[-1] > 0:
-        print(f"     状态: 红柱缩小 ↓")
-    elif hist.iloc[-1] < hist.iloc[-2]:
-        print(f"     状态: 绿柱放大 ↓")
-    else:
-        print(f"     状态: 绿柱缩小 ↑")
+    hist_status = ("红柱放大 ↑" if hist.iloc[-1] > hist.iloc[-2] else "红柱缩小 ↓") \
+        if hist.iloc[-1] > 0 else ("绿柱放大 ↓" if hist.iloc[-1] < hist.iloc[-2] else "绿柱缩小 ↑")
+    print(f"  │ MACD: DIF={dif.iloc[-1]:.2f} DEA={dea.iloc[-1]:.2f} 柱={hist.iloc[-1]:.2f} [{hist_status}]")
 
     # RSI
     rsi = calc_rsi(close, pre_cfg.get("rsi_window", 14)).iloc[-1]
-    rsi_status = "超卖" if rsi < 30 else "超买" if rsi > 70 else "中性"
-    print(f"\n  📊 RSI(14): {rsi:.1f}  ({rsi_status})")
+    rsi_status = "超卖🔥" if rsi < 30 else "超买⚠️" if rsi > 70 else "中性"
+    print(f"  │ RSI(14): {rsi:.1f}  ({rsi_status})")
 
     # ATR
     atr = calc_atr(df, pre_cfg.get("atr_window", 14)).iloc[-1]
     atr_pct = atr / last * 100
-    print(f"  📊 ATR(14): {atr:.1f}  ({atr_pct:.2f}%)")
+    print(f"  │ ATR(14): {atr:.1f}  ({atr_pct:.2f}%)")
 
     # 布林带
     bcfg = pre_cfg.get("bollinger", {})
     upper, mid, lower = calc_bollinger(close, bcfg.get("window", 20), bcfg.get("std", 2))
-    print(f"\n  📊 布林带")
-    print(f"     上轨: {upper.iloc[-1]:.0f}  中轨: {mid.iloc[-1]:.0f}  下轨: {lower.iloc[-1]:.0f}")
+    print(f"  │ 布林带: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
+    print(f"  └────────────────────────────────────────────┘")
+
+    # ==================== 第二部分: Wyckoff 量价分析 ====================
+    print(f"\n  ┌─ Wyckoff 量价分析 ─────────────────────────┐")
+
+    # 阶段判断
+    phase = wyckoff_phase(df, lookback=120)
+    phase_icon = {
+        "accumulation": "🟢吸筹", "markup": "🔵上涨",
+        "distribution": "🔴派发", "markdown": "🟡下跌",
+    }.get(phase.phase, "⚪")
+    print(f"  │ 市场阶段: {phase_icon} (置信度{phase.confidence:.0%})")
+    print(f"  │   {phase.description}")
+
+    # 量价关系
+    vp = analyze_volume_pattern(df, lookback=60)
+    ratio = vp["up_down_ratio"]
+    if ratio > 1.3:
+        vp_label = "多方主导 🟢"
+    elif ratio < 0.77:
+        vp_label = "空方主导 🔴"
+    else:
+        vp_label = "均衡"
+    print(f"  │ 量价关系: 上涨日量/下跌日量 = {ratio:.2f} ({vp_label})")
+    print(f"  │   量能趋势(20日/40日): {vp['vol_trend']:.2f}  量价相关性: {vp['price_vol_corr']:+.2f}")
+
+    # VSA 最近K线分析
+    vsa_bars = vsa_scan(df, window=20)
+    recent_notable = [b for b in vsa_bars[-10:] if b.strength >= 1]
+    if recent_notable:
+        print(f"  │ VSA信号 (近10日):")
+        for bar in recent_notable[-3:]:
+            bias_icon = "🟢" if bar.bias == "bullish" else "🔴" if bar.bias == "bearish" else "⚪"
+            print(f"  │   {bias_icon} [{bar.bar_type}] {bar.description}")
+    else:
+        print(f"  │ VSA信号: 近期无显著量价信号")
+
+    # 关键事件
+    events = detect_climax(df, 60) + detect_spring_upthrust(df, 60) + detect_sos_sow(df, 60)
+    if events:
+        print(f"  │ Wyckoff事件 (近60日):")
+        for evt in events[-3:]:
+            evt_icon = "🟢" if evt["bias"] == "bullish" else "🔴"
+            print(f"  │   {evt_icon} {evt['date']} {evt['type']}")
+            print(f"  │     {evt['detail']}")
+
+    print(f"  └────────────────────────────────────────────┘")
+
+    # ==================== 第三部分: 持仓量分析 ====================
+    print(f"\n  ┌─ 持仓量(OI)分析 ──────────────────────────┐")
+    oi_sig = analyze_oi(df, window=5)
+    if oi_sig:
+        oi_icon = "🟢" if oi_sig.bias == "bullish" else "🔴"
+        print(f"  │ {oi_icon} {oi_sig.label} ({oi_sig.strength})")
+        print(f"  │   {oi_sig.description}")
+    else:
+        print(f"  │ 无持仓数据")
+
+    oi_div = oi_divergence(df, window=20)
+    if oi_div:
+        print(f"  │ {oi_div}")
+    print(f"  └────────────────────────────────────────────┘")
+
+    # ==================== 第四部分: 支撑阻力 & 目标位 ====================
 
     # 支撑阻力
     lookback = pre_cfg.get("sr_lookback", 120)
@@ -299,12 +431,20 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict):
     scores = score_signals(df, direction, pre_cfg)
     total = sum(scores.values())
 
-    print(f"\n  🧮 综合评分")
+    print(f"\n  🧮 综合评分 (经典指标50分 + 量价分析35分 + 持仓15分)")
+    section_labels = {
+        "均线排列": "经典", "MACD": "经典", "RSI": "经典", "布林带": "经典", "动量": "经典",
+        "Wyckoff阶段": "量价", "量价关系": "量价", "VSA信号": "量价",
+        "持仓信号": "持仓",
+    }
     for k, v in scores.items():
-        bar = "█" * int(abs(v)) + "░" * (25 - int(abs(v)))
+        section = section_labels.get(k, "")
+        bar_len = int(abs(v))
+        bar = "█" * bar_len + "░" * (15 - bar_len)
         sign = "+" if v > 0 else ""
-        print(f"     {k:6s}: {sign}{v:5.1f}  {'🟢' if v > 0 else '🔴' if v < 0 else '⚪'} {bar}")
-    print(f"     {'─'*40}")
+        icon = "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
+        print(f"     {section:2s} {k:8s}: {sign}{v:5.1f}  {icon} {bar}")
+    print(f"     {'─'*45}")
     print(f"     总分:   {total:+.1f} / 100  ", end="")
 
     if direction == "long":
@@ -333,23 +473,61 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict):
         stop = entry - 2 * atr
         tp1 = resistances[0] if resistances else last * 1.05
         tp2 = resistances[1] if len(resistances) > 1 else last * 1.10
+        rr = (tp1 - entry) / (entry - stop + 1e-12)
         print(f"     方向: 做多")
         print(f"     参考入场: {entry:.0f} (支撑位/布林下轨附近)")
         print(f"     止损位:   {stop:.0f} (入场价 - 2*ATR)")
         print(f"     止盈1:    {tp1:.0f} (第一阻力位)")
         print(f"     止盈2:    {tp2:.0f} (第二阻力位)")
-        print(f"     盈亏比:   {(tp1 - entry) / (entry - stop + 1e-12):.2f}")
+        print(f"     盈亏比:   {rr:.2f}")
     else:
         entry = min(resistances[0] if resistances else last * 1.02, upper.iloc[-1])
         stop = entry + 2 * atr
         tp1 = supports[-1] if supports else last * 0.95
         tp2 = supports[-2] if len(supports) > 1 else last * 0.90
+        rr = (entry - tp1) / (stop - entry + 1e-12)
         print(f"     方向: 做空")
         print(f"     参考入场: {entry:.0f} (阻力位/布林上轨附近)")
         print(f"     止损位:   {stop:.0f} (入场价 + 2*ATR)")
         print(f"     止盈1:    {tp1:.0f} (第一支撑位)")
         print(f"     止盈2:    {tp2:.0f} (第二支撑位)")
-        print(f"     盈亏比:   {(entry - tp1) / (stop - entry + 1e-12):.2f}")
+        print(f"     盈亏比:   {rr:.2f}")
+
+    # 是否可操作：评分方向一致 且 |总分| > 20 且 盈亏比 > 1
+    score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
+    rr_ok = rr >= 1.0
+    actionable = score_ok and rr_ok
+    if score_ok and not rr_ok:
+        print(f"  ⚠️ 评分达标但盈亏比({rr:.2f})不足1.0，暂不建议入场")
+
+    # 构建评分原因摘要
+    classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量"]
+    wyckoff_keys = ["Wyckoff阶段", "量价关系", "VSA信号"]
+    oi_keys = ["持仓信号"]
+    classical_total = sum(scores.get(k, 0) for k in classical_keys)
+    wyckoff_total = sum(scores.get(k, 0) for k in wyckoff_keys)
+    oi_total = sum(scores.get(k, 0) for k in oi_keys)
+
+    top_factors = sorted(scores.items(), key=lambda x: abs(x[1]), reverse=True)
+    reason_parts = [f"{k}{v:+.0f}" for k, v in top_factors[:3] if abs(v) >= 3]
+
+    # Wyckoff 阶段
+    phase_info = wyckoff_phase(df)
+    wk_phase = phase_info.phase
+
+    return {
+        "symbol": symbol, "name": name, "direction": direction,
+        "score": float(total), "actionable": actionable,
+        "price": float(last),
+        "entry": float(entry), "stop": float(stop),
+        "tp1": float(tp1), "tp2": float(tp2),
+        "rr": float(rr),
+        "classical_score": float(classical_total),
+        "wyckoff_score": float(wyckoff_total),
+        "oi_score": float(oi_total),
+        "wyckoff_phase": wk_phase,
+        "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
+    }
 
 
 def main():

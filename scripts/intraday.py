@@ -34,21 +34,22 @@ from datetime import datetime
 import yaml
 import numpy as np
 import pandas as pd
-import akshare as aks
+
+from pathlib import Path
+from data_cache import get_minute
+from wyckoff import vsa_scan, classify_vsa_bar, relative_volume, close_position
 
 
 def load_config() -> dict:
-    with open("config.yaml", "r", encoding="utf-8") as f:
+    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def fetch_minute_data(symbol: str, period: str = "5") -> pd.DataFrame:
-    """获取分钟级数据，period: 1/5/15/30/60"""
-    df = aks.futures_zh_minute_sina(symbol=symbol, period=period)
-    for c in ["open", "high", "low", "close", "volume", "hold"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    return df.sort_values("datetime").reset_index(drop=True)
+    """通过缓存层获取分钟数据"""
+    df = get_minute(symbol, period)
+    return df if df is not None else pd.DataFrame()
 
 
 # ========== 指标 ==========
@@ -263,6 +264,43 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
                 "reason": f"RSI={r:.1f} 超卖, 注意反弹风险",
             })
 
+    # ===== VSA 量价信号 =====
+    vsa_bars = vsa_scan(df, window=20)
+    last_vsa = vsa_bars[-1] if vsa_bars else None
+    prev_vsa = vsa_bars[-2] if len(vsa_bars) >= 2 else None
+
+    if last_vsa and last_vsa.strength >= 2:
+        if direction == "long" and last_vsa.bias == "bullish":
+            signals.append({
+                "type": "开多",
+                "strength": "强" if last_vsa.strength >= 3 else "中",
+                "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
+                "entry": last,
+                "stop": last - 2 * atr_val,
+                "target": u,
+            })
+        elif direction == "long" and last_vsa.bias == "bearish" and last_vsa.strength >= 2:
+            signals.append({
+                "type": "平多",
+                "strength": "中",
+                "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
+            })
+        elif direction == "short" and last_vsa.bias == "bearish":
+            signals.append({
+                "type": "开空",
+                "strength": "强" if last_vsa.strength >= 3 else "中",
+                "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
+                "entry": last,
+                "stop": last + 2 * atr_val,
+                "target": lo,
+            })
+        elif direction == "short" and last_vsa.bias == "bullish" and last_vsa.strength >= 2:
+            signals.append({
+                "type": "平空",
+                "strength": "中",
+                "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
+            })
+
     return signals
 
 
@@ -290,6 +328,20 @@ def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cf
     print(f"│ RSI: {rsi:.1f}  KDJ: {k.iloc[-1]:.0f}/{d.iloc[-1]:.0f}/{j.iloc[-1]:.0f}")
     print(f"│ MACD: {dif.iloc[-1]:.1f}/{dea.iloc[-1]:.1f}  柱:{hist.iloc[-1]:.1f}")
     print(f"│ ATR: {atr:.1f} ({atr/last*100:.2f}%)")
+
+    # VSA 最近K线分析
+    vsa_bars = vsa_scan(df, window=20)
+    last_vsa = vsa_bars[-1] if vsa_bars else None
+    if last_vsa and last_vsa.strength >= 1:
+        bias_icon = "🟢" if last_vsa.bias == "bullish" else "🔴" if last_vsa.bias == "bearish" else "⚪"
+        print(f"│ VSA: {bias_icon} [{last_vsa.bar_type}] {'★' * last_vsa.strength}")
+
+    # 相对成交量
+    rel_vol = relative_volume(df, 20)
+    rv = float(rel_vol.iloc[-1]) if not np.isnan(rel_vol.iloc[-1]) else 1.0
+    vol_label = "放量🔥" if rv > 2 else "偏高" if rv > 1.3 else "缩量" if rv < 0.6 else ""
+    if vol_label:
+        print(f"│ 量比: {rv:.1f} {vol_label}")
 
     # 生成信号
     signals = generate_signals(df, direction, cfg)

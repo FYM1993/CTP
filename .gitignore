@@ -44,6 +44,7 @@ results/
 !results/.gitkeep
 
 # Logs
+logs/
 *.log
 
 # Model checkpoints
