@@ -37,6 +37,8 @@ import pandas as pd
 
 from data_cache import (
     get_all_symbols, get_daily, get_minute, get_inventory,
+    get_warehouse_receipt, get_hog_fundamentals,
+    get_seasonality, get_oi_structure,
     prefetch_all, get_request_count,
 )
 from pre_market import analyze_one, score_signals
@@ -131,24 +133,37 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 25) -> 
     long_cands = [c for c in candidates if c["direction"] == "long"]
     short_cands = [c for c in candidates if c["direction"] == "short"]
 
+    def _print_cand(c):
+        line = (f"     {c['name']:6s} ({c['symbol']:5s})  "
+                f"区间位{c['range_pct']:3.0f}%  RSI={c['rsi']:.0f}  "
+                f"技术={c.get('tech_score', 0):+.0f}  基本面={c.get('fund_score', 0):+.0f}  "
+                f"总分={c['score']:+.0f}")
+        fd = c.get("fund_details", "")
+        if fd:
+            line += f"  [{fd}]"
+        print(line)
+
     if long_cands:
         print(f"  🟢 做多候选:")
         for c in long_cands[:8]:
-            print(f"     {c['name']:6s} ({c['symbol']:5s})  "
-                  f"区间位{c['range_pct']:3.0f}%  RSI={c['rsi']:.0f}  "
-                  f"Wyckoff={c['wyckoff_phase']:4s}  评分={c['score']:+.0f}")
+            _print_cand(c)
     if short_cands:
         print(f"  🔴 做空候选:")
         for c in short_cands[:8]:
-            print(f"     {c['name']:6s} ({c['symbol']:5s})  "
-                  f"区间位{c['range_pct']:3.0f}%  RSI={c['rsi']:.0f}  "
-                  f"Wyckoff={c['wyckoff_phase']:4s}  评分={c['score']:+.0f}")
+            _print_cand(c)
 
     return candidates
 
 
 def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict | None:
-    """对单品种计算筛选评分（纯本地计算，不调API）"""
+    """
+    对单品种计算筛选评分。
+
+    评分维度:
+      技术面: 价格位置(±30), RSI(±15), 均线趋势(±10), Wyckoff量价(±25)
+      基本面: 库存水平(±20), 库存分位(±10), 仓单变化(±15),
+              持仓结构(±10), 季节性(±10), 生猪专项(±15)
+    """
     try:
         close = df["close"]
         last = float(close.iloc[-1])
@@ -159,65 +174,164 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
         low_all = float(recent["close"].min())
         range_pct = (last - low_all) / (high_all - low_all + 1e-12) * 100
 
-        # RSI
         delta = close.diff()
         gain = delta.clip(lower=0).rolling(14).mean()
         loss = (-delta.clip(upper=0)).rolling(14).mean()
         rsi = float((100 - 100 / (1 + gain / (loss + 1e-12))).iloc[-1])
 
-        # 均线趋势
         ma5 = float(close.rolling(5).mean().iloc[-1])
         ma60 = float(close.rolling(min(60, len(close))).mean().iloc[-1])
         ma_trend = (ma5 / ma60 - 1) * 100
 
-        # 动量
         ret_5d = (last / float(close.iloc[-6]) - 1) * 100 if len(close) > 6 else 0
         ret_20d = (last / float(close.iloc[-21]) - 1) * 100 if len(close) > 21 else 0
 
-        # Wyckoff 量价
         wk = wyckoff_score(df) if len(df) > 60 else {}
         wk_phase = wk.get("phase", "")
         wk_composite = wk.get("composite", 0)
 
-        # 库存（东方财富API，不受新浪限流影响）
+        # ---- 基本面数据采集 ----
         inv = get_inventory(sym)
+        receipt = get_warehouse_receipt(sym)
+        oi_struct = get_oi_structure(df)
+        seasonal = get_seasonality(df)
+        hog = get_hog_fundamentals() if sym == "LH0" else None
 
-        # --- 综合评分 ---
-        score = 0.0
+        # ---- 技术面评分 ----
+        tech_score = 0.0
 
-        # 价格位置 (±30)
-        if range_pct < 10: score -= 30
-        elif range_pct < 20: score -= 20
-        elif range_pct < 30: score -= 10
-        elif range_pct > 90: score += 30
-        elif range_pct > 80: score += 20
-        elif range_pct > 70: score += 10
+        if range_pct < 10: tech_score -= 30
+        elif range_pct < 20: tech_score -= 20
+        elif range_pct < 30: tech_score -= 10
+        elif range_pct > 90: tech_score += 30
+        elif range_pct > 80: tech_score += 20
+        elif range_pct > 70: tech_score += 10
 
-        # RSI (±15)
-        if rsi < 25: score -= 15
-        elif rsi < 35: score -= 8
-        elif rsi > 75: score += 15
-        elif rsi > 65: score += 8
+        if rsi < 25: tech_score -= 15
+        elif rsi < 35: tech_score -= 8
+        elif rsi > 75: tech_score += 15
+        elif rsi > 65: tech_score += 8
 
-        # 均线 (±10)
-        if ma_trend < -5: score -= 10
-        elif ma_trend < -2: score -= 5
-        elif ma_trend > 5: score += 10
-        elif ma_trend > 2: score += 5
+        if ma_trend < -5: tech_score -= 10
+        elif ma_trend < -2: tech_score -= 5
+        elif ma_trend > 5: tech_score += 10
+        elif ma_trend > 2: tech_score += 5
 
-        # Wyckoff (±25)
-        score += np.clip(wk_composite, -25, 25)
+        tech_score += np.clip(wk_composite, -25, 25)
 
-        # 库存 (±20)
+        # ---- 基本面评分 ----
+        fund_score = 0.0
+        fund_details = []
+
+        # 库存变化 (±20)
+        inv_4wk = None
+        inv_pct = None
         if inv:
             inv_4wk = inv["inv_change_4wk"]
+            inv_pct = inv.get("inv_percentile")
             cum = inv.get("inv_cumulating_weeks", 4)
-            if inv_4wk > 10: score += 10
-            elif inv_4wk > 3: score += 5
-            elif inv_4wk < -10: score -= 10
-            elif inv_4wk < -3: score -= 5
-            if cum >= 6: score += 10
-            elif cum <= 2: score -= 10
+            trend = inv.get("inv_trend", "持平")
+
+            if inv_4wk > 10: fund_score += 10
+            elif inv_4wk > 3: fund_score += 5
+            elif inv_4wk < -10: fund_score -= 10
+            elif inv_4wk < -3: fund_score -= 5
+            if cum >= 6: fund_score += 10
+            elif cum <= 2: fund_score -= 10
+
+            fund_details.append(f"库存{trend}({inv_4wk:+.1f}%)")
+
+        # 库存分位 (±10): 库存极高=做空信号，库存极低=做多信号
+        if inv_pct is not None:
+            if inv_pct > 85:
+                fund_score += 10
+                fund_details.append(f"库存高位{inv_pct:.0f}%")
+            elif inv_pct > 70:
+                fund_score += 5
+            elif inv_pct < 15:
+                fund_score -= 10
+                fund_details.append(f"库存低位{inv_pct:.0f}%")
+            elif inv_pct < 30:
+                fund_score -= 5
+
+        # 仓单 (±15): 仓单增加=供应压力=价格下行信号
+        receipt_change = None
+        if receipt:
+            rc = receipt["receipt_change"]
+            receipt_change = rc
+            rt = receipt["receipt_total"]
+            if rc > 0 and rt > 0:
+                change_ratio = rc / (rt + 1e-12)
+                if change_ratio > 0.05:
+                    fund_score += 15
+                    fund_details.append(f"仓单大增{rc:+.0f}")
+                elif change_ratio > 0.01:
+                    fund_score += 8
+            elif rc < 0 and rt > 0:
+                change_ratio = abs(rc) / (rt + 1e-12)
+                if change_ratio > 0.05:
+                    fund_score -= 15
+                    fund_details.append(f"仓单大减{rc:+.0f}")
+                elif change_ratio > 0.01:
+                    fund_score -= 8
+
+        # 持仓结构 (±10)
+        oi_pct = None
+        oi_vs_price = None
+        if oi_struct:
+            oi_pct = oi_struct["oi_percentile"]
+            oi_vs_price = oi_struct["oi_vs_price"]
+            if oi_vs_price == "增仓上涨":
+                fund_score += 5
+            elif oi_vs_price == "增仓下跌":
+                fund_score += 5
+            elif oi_vs_price == "减仓上涨":
+                fund_score -= 5
+            elif oi_vs_price == "减仓下跌":
+                fund_score -= 5
+
+            if oi_pct > 80:
+                fund_score += 5
+                fund_details.append(f"持仓高位{oi_pct:.0f}%")
+            elif oi_pct < 20:
+                fund_score -= 5
+
+        # 季节性 (±10)
+        seasonal_sig = None
+        if seasonal:
+            sig = seasonal["seasonal_signal"]
+            seasonal_sig = sig
+            avg_ret = seasonal["hist_avg_return"]
+            if abs(sig) > 0.6:
+                s = np.clip(sig * 10, -10, 10)
+                fund_score += s
+                direction = "上涨" if sig > 0 else "下跌"
+                fund_details.append(f"季节性偏{direction}(历史{avg_ret:+.1f}%)")
+
+        # 生猪专项 (±15)
+        hog_profit = None
+        if hog:
+            if "profit_margin" in hog:
+                pm = hog["profit_margin"]
+                hog_profit = pm
+                if pm < -15:
+                    fund_score -= 15
+                    fund_details.append(f"养殖亏损{pm:.0f}%")
+                elif pm < -5:
+                    fund_score -= 8
+                elif pm > 20:
+                    fund_score += 10
+                elif pm > 10:
+                    fund_score += 5
+
+            if "price_trend" in hog:
+                pt = hog["price_trend"]
+                if pt < -3:
+                    fund_score -= 5
+                elif pt > 3:
+                    fund_score += 5
+
+        score = tech_score + fund_score
 
         return {
             "symbol": sym, "name": name, "exchange": exchange,
@@ -226,8 +340,18 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
             "ret_5d": ret_5d, "ret_20d": ret_20d,
             "wyckoff_phase": wk_phase,
             "score": score,
+            "tech_score": tech_score,
+            "fund_score": fund_score,
+            "fund_details": ", ".join(fund_details) if fund_details else "",
+            "inv_change_4wk": inv_4wk,
+            "inv_percentile": inv_pct,
+            "receipt_change": receipt_change,
+            "oi_percentile": oi_pct,
+            "oi_vs_price": oi_vs_price,
+            "seasonal_signal": seasonal_sig,
+            "hog_profit": hog_profit,
         }
-    except Exception:
+    except Exception as e:
         return None
 
 
@@ -245,19 +369,26 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
 
     for cand in candidates:
         try:
-            # 构建基本面摘要传入 Phase 2
             fund_parts = []
             if "range_pct" in cand:
                 fund_parts.append(f"区间位{cand['range_pct']:.0f}%")
             if "rsi" in cand:
                 fund_parts.append(f"RSI={cand['rsi']:.0f}")
-            if "inv_change_4wk" in cand:
+            if cand.get("inv_change_4wk") is not None:
                 fund_parts.append(f"库存4周{cand['inv_change_4wk']:+.1f}%")
+            if cand.get("inv_percentile") is not None:
+                fund_parts.append(f"库存分位{cand['inv_percentile']:.0f}%")
+            if cand.get("receipt_change") is not None:
+                fund_parts.append(f"仓单{cand['receipt_change']:+.0f}")
+            if cand.get("oi_vs_price"):
+                fund_parts.append(cand["oi_vs_price"])
+            if cand.get("fund_details"):
+                fund_parts.append(cand["fund_details"])
             fund_reason = ", ".join(fund_parts) if fund_parts else ""
 
             merged_cfg = {
                 **pre_cfg,
-                "reason": f"筛选评分{cand['score']:+.0f}, {fund_reason}",
+                "reason": f"筛选评分{cand['score']:+.0f}(技术{cand.get('tech_score',0):+.0f}/基本面{cand.get('fund_score',0):+.0f}), {fund_reason}",
             }
             result = analyze_one(
                 symbol=cand["symbol"],
@@ -266,11 +397,18 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
                 cfg=merged_cfg,
             )
             if result:
-                # 将基本面数据附加到结果
                 result["fund_range_pct"] = cand.get("range_pct", 0)
                 result["fund_rsi"] = cand.get("rsi", 50)
                 result["fund_inv_change"] = cand.get("inv_change_4wk")
+                result["fund_inv_percentile"] = cand.get("inv_percentile")
+                result["fund_receipt_change"] = cand.get("receipt_change")
+                result["fund_oi_vs_price"] = cand.get("oi_vs_price")
+                result["fund_seasonal"] = cand.get("seasonal_signal")
+                result["fund_hog_profit"] = cand.get("hog_profit")
                 result["fund_screen_score"] = cand.get("score", 0)
+                result["fund_tech_score"] = cand.get("tech_score", 0)
+                result["fund_fund_score"] = cand.get("fund_score", 0)
+                result["fund_details"] = cand.get("fund_details", "")
                 if result["actionable"]:
                     actionable.append(result)
         except Exception as e:
@@ -430,17 +568,33 @@ def save_targets(targets: list[dict]):
                         "markup": "上涨", "markdown": "下跌"}.get(phase, phase)
             reason = f"Wyckoff:{phase_cn}; {reason}"
 
-        # 基本面摘要
         fund_parts = []
         fund_range = t.get("fund_range_pct")
         fund_inv = t.get("fund_inv_change")
-        fund_rsi = t.get("fund_rsi")
+        fund_inv_pct = t.get("fund_inv_percentile")
+        fund_receipt = t.get("fund_receipt_change")
+        fund_oi_vp = t.get("fund_oi_vs_price")
+        fund_seasonal = t.get("fund_seasonal")
+        fund_hog = t.get("fund_hog_profit")
+        fd = t.get("fund_details", "")
+
         if fund_range is not None:
             fund_parts.append(f"区间位{fund_range:.0f}%")
-        if fund_rsi is not None and (fund_rsi < 30 or fund_rsi > 70):
-            fund_parts.append(f"RSI={fund_rsi:.0f}")
         if fund_inv is not None:
-            fund_parts.append(f"库存{fund_inv:+.1f}%")
+            fund_parts.append(f"库存4周{fund_inv:+.1f}%")
+        if fund_inv_pct is not None:
+            fund_parts.append(f"库存分位{fund_inv_pct:.0f}%")
+        if fund_receipt is not None:
+            fund_parts.append(f"仓单{fund_receipt:+.0f}")
+        if fund_oi_vp:
+            fund_parts.append(fund_oi_vp)
+        if fund_seasonal is not None and abs(fund_seasonal) > 0.5:
+            direction = "偏多" if fund_seasonal > 0 else "偏空"
+            fund_parts.append(f"季节性{direction}")
+        if fund_hog is not None:
+            fund_parts.append(f"养殖利润{fund_hog:+.0f}%")
+        if fd and not any(fd in p for p in fund_parts):
+            fund_parts.append(fd)
         fund_str = ", ".join(fund_parts) if fund_parts else "-"
 
         lines.append(
@@ -454,43 +608,52 @@ def save_targets(targets: list[dict]):
     lines.append("")
     lines.append("## 评分说明")
     lines.append("")
-    lines.append("### 评分体系总览")
+    lines.append("### Phase 1 筛选评分体系")
     lines.append("")
-    lines.append("| 维度 | 满分 | 说明 |")
-    lines.append("| :--- | ---: | :--- |")
-    lines.append("| 技术面 | ±50 | 经典技术指标综合 |")
-    lines.append("| 量价面 | ±35 | Wyckoff量价理论分析 |")
-    lines.append("| 持仓面 | ±15 | 期货特有的持仓量分析 |")
+    lines.append("初筛综合技术面和基本面两个大类评分，正分=偏空信号（做空机会），负分=偏多信号（做多机会）。")
     lines.append("")
-    lines.append("正分 = 偏多信号，负分 = 偏空信号。")
-    lines.append("做多品种：总分 > +20 且盈亏比 >= 1.0 视为可操作。")
-    lines.append("做空品种：总分 < -20 且盈亏比 >= 1.0 视为可操作。")
-    lines.append("")
-    lines.append("### 各指标详细说明")
+    lines.append("#### 技术面维度 (±80)")
     lines.append("")
     lines.append("| 指标 | 满分 | 含义 |")
     lines.append("| :--- | ---: | :--- |")
-    lines.append("| 均线排列 | ±15 | 价格在几条均线(MA5/10/20/60/120)上方/下方。"
-                 "价格在所有均线下方=-15(强空)，上方=+15(强多) |")
-    lines.append("| MACD | ±10 | MACD柱状图方向。红柱放大=+10，绿柱放大=-10 |")
-    lines.append("| RSI | ±10 | 相对强弱指标。RSI<25=+10(超卖反弹机会)，RSI>75=-10(超买回落风险) |")
-    lines.append("| 布林带 | ±10 | 价格在布林通道中的位置。"
-                 "靠近下轨=正分(超跌)，靠近上轨=负分(超买)。注意：强趋势中超跌可以更超跌 |")
-    lines.append("| 动量 | ±5 | 近5日和20日的价格动量 |")
-    lines.append("| Wyckoff阶段 | ±15 | 市场所处阶段：吸筹(底部)、上涨、派发(顶部)、下跌 |")
-    lines.append("| 量价关系 | ±10 | 上涨日成交量 vs 下跌日成交量的比值 |")
-    lines.append("| VSA信号 | ±10 | 最近K线的量价行为(无供给、无需求、停止量等) |")
-    lines.append("| 持仓信号 | ±15 | 价格变化+持仓量变化四象限：新多入场/空头回补/新空入场/多头平仓 |")
+    lines.append("| 价格区间位 | ±30 | 价格在近300日高低点间的位置。<10%极低位=-30, >90%极高位=+30 |")
+    lines.append("| RSI(14) | ±15 | 超卖(<25)=-15, 超买(>75)=+15 |")
+    lines.append("| 均线趋势 | ±10 | MA5/MA60比值。多头排列=+10, 空头排列=-10 |")
+    lines.append("| Wyckoff量价 | ±25 | 综合阶段判定、量价关系、VSA信号 |")
+    lines.append("")
+    lines.append("#### 基本面维度 (±80)")
+    lines.append("")
+    lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
+    lines.append("| :--- | ---: | :--- | :--- |")
+    lines.append("| 库存变化 | ±20 | 东方财富(~30品种) | 4周库存变化率+连续累库/去库周数。累库=供过于求=做空信号 |")
+    lines.append("| 库存分位 | ±10 | 东方财富 | 当前库存在52周范围内的位置。>85%=库存高位=做空, <15%=库存低位=做多 |")
+    lines.append("| 仓单变化 | ±15 | 上期所仓单 | 仓单增加=交割品供应增加=价格下行压力 |")
+    lines.append("| 持仓结构 | ±10 | 日线OI数据 | OI+价格四象限分析。增仓上涨=多方主导, 增仓下跌=空方主导 |")
+    lines.append("| 季节性 | ±10 | 历史日线 | 当前月份的历史涨跌概率与平均收益率 |")
+    lines.append("| 生猪专项 | ±15 | 卓创资讯 | 仅LH0: 养殖利润率(猪价×120kg/成本)、价格趋势 |")
+    lines.append("")
+    lines.append("### Phase 2 深度分析评分体系")
+    lines.append("")
+    lines.append("| 维度 | 满分 | 说明 |")
+    lines.append("| :--- | ---: | :--- |")
+    lines.append("| 技术面 | ±50 | 均线排列、MACD、RSI、布林带、动量 |")
+    lines.append("| 量价面 | ±35 | Wyckoff阶段、量价关系、VSA信号 |")
+    lines.append("| 持仓面 | ±15 | OI价格四象限、OI背离 |")
+    lines.append("")
+    lines.append("做多品种：总分 > +20 且盈亏比 >= 1.0 视为可操作。")
+    lines.append("做空品种：总分 < -20 且盈亏比 >= 1.0 视为可操作。")
     lines.append("")
     lines.append("### 关键术语")
     lines.append("")
-    lines.append("- **盈亏比** = (入场价到止盈1的距离) / (入场价到止损的距离)。>=2理想，>=1可接受，<1不建议入场")
-    lines.append("- **止盈价1**：最近的阻力位/支撑位（保守目标）")
-    lines.append("- **止盈价2**：第二道阻力位/支撑位（进取目标）")
-    lines.append("- **价格区间位**：当前价格在近300日最高价和最低价之间的位置。10%=接近最低点，90%=接近最高点")
+    lines.append("- **盈亏比** = |入场价-止盈价1| / |入场价-止损价|。>=2理想，>=1可接受，<1不建议入场")
+    lines.append("- **止盈价1**：最近的支撑/阻力位（保守目标）")
+    lines.append("- **止盈价2**：第二道支撑/阻力位（进取目标）")
+    lines.append("- **库存分位**：当前库存在近52周最高与最低之间的百分比位置")
+    lines.append("- **仓单**：交易所注册仓单量。仓单增加意味着现货被注册为可交割品，反映卖方意愿增强")
+    lines.append("- **持仓四象限**：价格涨+OI增=新多入场(偏多)、价格跌+OI增=新空入场(偏空)、价格涨+OI减=空头回补(中性偏多)、价格跌+OI减=多头平仓(中性偏空)")
+    lines.append("- **季节性**：该品种在当前月份的历史平均涨跌幅和上涨概率")
     lines.append("")
 
-    # 每品种详细建议
     lines.append("## 品种详细建议")
     lines.append("")
     for t in targets:
@@ -498,34 +661,62 @@ def save_targets(targets: list[dict]):
         direction_cn = "做多" if t["direction"] == "long" else "做空"
         lines.append(f"### {name}(主力) — {direction_cn}")
         lines.append("")
-        lines.append(f"- **当前价格**: {t['price']:.0f}")
-        lines.append(f"- **建议入场价**: {t['entry']:.0f}")
-        lines.append(f"- **止损价格**: {t['stop']:.0f}")
-        lines.append(f"- **止盈目标1**: {t['tp1']:.0f}")
-        lines.append(f"- **止盈目标2**: {t['tp2']:.0f}")
-        lines.append(f"- **盈亏比**: {t['rr']:.2f}")
-        lines.append(f"- **综合评分**: {t.get('score', 0):+.1f} "
+
+        lines.append("**交易参数**")
+        lines.append("")
+        lines.append(f"| 当前价 | 入场价 | 止损价 | 止盈1 | 止盈2 | 盈亏比 |")
+        lines.append(f"| ---: | ---: | ---: | ---: | ---: | ---: |")
+        lines.append(f"| {t['price']:.0f} | {t['entry']:.0f} | {t['stop']:.0f} "
+                     f"| {t['tp1']:.0f} | {t['tp2']:.0f} | {t['rr']:.2f} |")
+        lines.append("")
+
+        lines.append("**评分分解**")
+        lines.append("")
+        lines.append(f"- Phase 2 综合: {t.get('score', 0):+.1f} "
                      f"(技术{t.get('classical_score', 0):+.1f} / "
                      f"量价{t.get('wyckoff_score', 0):+.1f} / "
                      f"持仓{t.get('oi_score', 0):+.1f})")
-        # 基本面
-        fund_parts_detail = []
-        if t.get("fund_range_pct") is not None:
-            lines.append(f"- **价格区间位**: {t['fund_range_pct']:.0f}%（年度高低点间的位置）")
-        if t.get("fund_inv_change") is not None:
-            lines.append(f"- **库存4周变化**: {t['fund_inv_change']:+.1f}%")
-        if t.get("fund_screen_score") is not None:
-            lines.append(f"- **Phase1筛选评分**: {t['fund_screen_score']:+.0f}")
+        fs = t.get("fund_screen_score")
+        ft = t.get("fund_tech_score")
+        ff = t.get("fund_fund_score")
+        if fs is not None:
+            lines.append(f"- Phase 1 筛选: {fs:+.0f} "
+                         f"(技术{ft:+.0f} / 基本面{ff:+.0f})" if ft is not None else f"- Phase 1 筛选: {fs:+.0f}")
+        lines.append("")
 
-        reason = t.get("reason", "")
+        lines.append("**基本面数据**")
+        lines.append("")
+        if t.get("fund_range_pct") is not None:
+            lines.append(f"- 价格区间位: {t['fund_range_pct']:.0f}%（年度高低点间的位置）")
+        if t.get("fund_inv_change") is not None:
+            lines.append(f"- 库存4周变化: {t['fund_inv_change']:+.1f}%")
+        if t.get("fund_inv_percentile") is not None:
+            lines.append(f"- 库存52周分位: {t['fund_inv_percentile']:.0f}%")
+        if t.get("fund_receipt_change") is not None:
+            lines.append(f"- 仓单日增减: {t['fund_receipt_change']:+.0f}")
+        if t.get("fund_oi_vs_price"):
+            lines.append(f"- 持仓-价格关系: {t['fund_oi_vs_price']}")
+        if t.get("fund_seasonal") is not None:
+            sig = t["fund_seasonal"]
+            if abs(sig) > 0.3:
+                lines.append(f"- 季节性信号: {'偏多' if sig > 0 else '偏空'} (强度{abs(sig):.1f})")
+        if t.get("fund_hog_profit") is not None:
+            lines.append(f"- 养殖利润率: {t['fund_hog_profit']:+.0f}%")
+        fd = t.get("fund_details", "")
+        if fd:
+            lines.append(f"- 其他: {fd}")
+        lines.append("")
+
         phase = t.get("wyckoff_phase", "")
         if phase:
             phase_cn = {"accumulation": "吸筹", "distribution": "派发",
                         "markup": "上涨", "markdown": "下跌"}.get(phase, phase)
-            lines.append(f"- **Wyckoff阶段**: {phase_cn}")
+            lines.append(f"**Wyckoff阶段**: {phase_cn}")
+            lines.append("")
+        reason = t.get("reason", "")
         if reason:
-            lines.append(f"- **主要依据**: {reason}")
-        lines.append("")
+            lines.append(f"**主要依据**: {reason}")
+            lines.append("")
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
     print(f"\n  💾 报告已保存:")
