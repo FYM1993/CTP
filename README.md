@@ -1,111 +1,84 @@
-# 期货量化研究系统
+# 期货 CTA 策略系统
 
-基于 vnpy Alpha 模块的期货量化研究和回测系统。
+基于基本面筛选 + 技术面择时的期货交易辅助系统。
+
+## 功能
+
+- **盘前分析** — 综合技术指标给出入场时机建议和目标价位预估
+- **日内监控** — 实时拉取分钟K线，自动生成交易信号
 
 ## 项目结构
 
 ```
-futures_quant/
-├── config.yaml                # 配置文件（所有参数）
-├── requirements.txt           # 依赖
+ctp/
+├── config.yaml          # 策略配置（品种、参数）
+├── requirements.txt     # 依赖
 ├── scripts/
-│   └── research_workflow.py   # 主研究流程（一键运行）
-├── src/
-│   ├── continuous.py          # 连续合约构建
-│   ├── alpha_futures.py       # 期货Alpha158因子集
-│   └── model_lgb.py           # LightGBM模型封装
-├── data/                      # 数据目录
-│   ├── raw/                   # 原始合约数据（CSV）
-│   │   └── {品种}/            # 每个品种一个子目录
-│   │       └── *.csv          # 各合约CSV
-│   ├── continuous/            # 连续合约（自动生成）
-│   └── lab/                   # AlphaLab数据（自动生成）
-└── results/                   # 回测结果（自动生成）
+│   ├── pre_market.py    # 盘前分析
+│   ├── intraday.py      # 日内策略监控
+│   └── download_futures_data.py  # 批量下载历史数据
+├── data/                # 数据缓存（.gitignore）
+└── results/             # 分析结果（.gitignore）
 ```
 
 ## 快速开始
-
-### 1. 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 准备数据
+### 盘前分析
 
-将期货日线数据放入 `data/raw/{品种}/` 目录，CSV 格式：
-
-```csv
-datetime,symbol,open,high,low,close,volume,turnover,open_interest
-2020-01-02,RB2001,3500,3520,3490,3510,100000,350000000,500000
-```
-
-或者如果你已有 vnpy 的 parquet 数据，放入 `data/daily/` 目录。
-
-### 3. 修改配置
-
-编辑 `config.yaml`：
-
-- `symbols`: 选择要交易的品种
-- `segments`: 设置训练/验证/测试时间段
-- `model.lightgbm`: 调整模型参数
-- `backtest`: 设置回测参数和手续费
-
-### 4. 运行
+每日开盘前运行，获取技术面综合评分和操作建议：
 
 ```bash
-cd futures_quant
-python scripts/research_workflow.py
+python scripts/pre_market.py
 ```
 
-或使用自定义配置：
+输出包括：
+- 多周期均线排列（MA5/10/20/60/120）
+- 支撑/阻力位
+- RSI、MACD、布林带状态
+- Fibonacci 目标价位
+- 综合评分和入场建议
+
+### 日内监控
+
+盘中实时监控，自动检测交易信号：
 
 ```bash
-python scripts/research_workflow.py my_config.yaml
+# 持续监控（每60秒刷新）
+python scripts/intraday.py
+
+# 单次分析
+python scripts/intraday.py --once
+
+# 指定K线周期
+python scripts/intraday.py --period 15
+
+# 自定义刷新间隔
+python scripts/intraday.py --interval 30
 ```
 
-## 因子集说明
+信号类型：
+- 布林带 + RSI 超买超卖反转
+- MACD 金叉/死叉
+- KDJ 交叉确认
+- 放量突破/跌破均线
 
-### Alpha158（158个标准量价因子）
+## 当前跟踪品种
 
-与 vnpy / qlib 的 Alpha158 一致，包含：
-- K线形态因子（9个）
-- 价格位置因子（4个）
-- 时序动量/均值/波动/极值因子（60个）
-- 量价关联因子（60个）
-- 成交量因子（25个）
+| 品种 | 代码 | 方向 | 逻辑 |
+|------|------|------|------|
+| 生猪 | LH0 | 做多 | 基本面超跌，等待技术确认入场 |
+| 多晶硅 | PS0 | 做空 | 库存过多，需求无增长 |
 
-### 期货特有因子（额外 ~33个）
+在 `config.yaml` 的 `positions` 中增删品种即可。
 
-在 Alpha158 基础上扩展：
-- **持仓量因子**: 变化率、均值比、趋势
-- **波动率因子**: ATR、收益率波动率、偏度
-- **量能因子**: 成交额变化、量价同步性
-- **收益分布因子**: 连涨占比、最大涨跌幅
+## 配置说明
 
-### 标签定义
+`config.yaml` 包含三部分参数：
 
-- `ret_1`: T+1 收益率
-- `ret_3`: T+3 收益率（T+1 买入持有到 T+3，默认）
-- `ret_5`: T+5 收益率
-
-## 回测说明
-
-回测使用 vnpy 的 `BacktestingEngine`，支持：
-- 多空双向交易
-- 按合约规格计算手续费
-- 滑点模拟
-- 逐日盯市盈亏计算
-- Sharpe Ratio、最大回撤等统计指标
-
-## 与你的 stock 项目对比
-
-| | stock（A股） | futures_quant（期货） |
-|---|---|---|
-| 框架 | Qlib | vnpy Alpha |
-| 因子 | Alpha158 | Alpha158 + 期货因子 |
-| 模型 | DEnsemble / LGB | LightGBM |
-| 数据 | qlib bin | polars Parquet |
-| 回测 | Qlib 内置 | vnpy BacktestingEngine |
-| 交易方向 | 仅做多 | 多空双向 |
-| 执行层 | 需额外对接 | vnpy CTA 直接可用 |
+- **positions** — 品种列表及方向、合约乘数等
+- **pre_market** — 盘前分析的均线窗口、ATR/RSI/MACD/Bollinger 参数、Fibonacci 级别
+- **intraday** — 日内策略的突破窗口、均值回归参数、量能过滤、风控阈值

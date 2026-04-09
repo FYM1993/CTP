@@ -1,153 +1,76 @@
-# 期货量化策略配置文件
+# 期货CTA策略配置
 # ============================
 
 # 数据源配置
 data:
-  # 数据目录
-  data_dir: "./data"
-  results_dir: "./results"
+  source: "akshare"
+  start_date: "20200101"
+  output_dir: "./data/futures"
 
-# ==================== 品种配置 ====================
-# symbols: 交易品种列表
-#   格式: ["品种代号"]
-#   上期所品种: RB(螺纹钢), CU(铜), AU(黄金), AG(白银), AL(铝), 
-#              ZN(锌), RU(橡胶), NI(镍), HC(热卷), BU(沥青)
-symbols:
-  - "RB"   # 螺纹钢
-  - "CU"   # 铜
-  - "AU"   # 黄金
-  - "AG"   # 白银
-  - "RU"   # 橡胶
-
-# 连续合约构建方式
-#   - volume: 按成交量切换主力合约（推荐）
-#   - oi: 按持仓量切换主力合约
-#   - fixed: 固定某个月份合约
-continuous_method: "volume"
-
-# 主力合约切换阈值（成交量/持仓量超过阈值时切换）
-switch_threshold: 0.8
-
-# ==================== 时间配置 ====================
-segments:
-  train: ["2015-01-01", "2021-12-31"]
-  valid: ["2022-01-01", "2022-12-31"]
-  test:  ["2023-01-01", "2024-12-31"]
-
-# 向前扩展天数（用于计算MA等指标的前置数据）
-extended_days: 100
-
-# ==================== 因子配置 ====================
-factors:
-  # 使用的因子集
-  #   - alpha158: 标准Alpha158（量价因子）✅ 推荐先用这个
-  #   - alpha158_futures: Alpha158 + 期货特有因子（需要额外字段）
-  factor_set: "alpha158"
-
-  # 期货特有因子窗口
-  futures_windows: [5, 10, 20]
-
-  # 标签定义
-  #   - ret_1: T+1收益
-  #   - ret_3: T+3收益（默认，与vnpy示例一致）
-  #   - ret_5: T+5收益
-  label: "ret_3"
-
-# ==================== 模型配置 ====================
-model:
-  type: "lightgbm"
-
-  lightgbm:
-    # 树结构
-    max_depth: 6
-    num_leaves: 31
-
-    # 学习参数
-    learning_rate: 0.05
-    n_estimators: 500
-
-    # 采样（防过拟合）
-    subsample: 0.8
-    colsample_bytree: 0.8
-
-    # 正则化
-    reg_alpha: 0.1
-    reg_lambda: 0.1
-
-    # 其他
-    min_child_samples: 50
-    random_state: 42
-
-# ==================== 回测配置 ====================
-backtest:
-  # 初始资金
-  capital: 1000000
-
-  # 持仓方向
-  #   - long: 只做多
-  #   - short: 只做空
-  #   - both: 多空双向
-  direction: "both"
-
-  # 每个品种最大持仓手数
-  max_position: 5
-
-  # 信号阈值：预测收益超过此值才开仓
-  long_threshold: 0.005
-  short_threshold: -0.005
-
-  # 手续费（万分比）
-  commission_rate: 0.0003
-
-  # 滑点（价格百分比）
-  slippage: 0.0005
-
-  # 年化交易天数
-  annual_days: 240
-
-  # 无风险利率
-  risk_free: 0.03
-
-# ==================== 合约规格 ====================
-# 各品种的合约乘数和最小变动价位
-# 需要根据实际情况配置
-contracts:
-  RB:
-    multiplier: 10        # 合约乘数（元/吨 × 10吨/手）
-    pricetick: 1          # 最小变动价位（元/吨）
-    margin_rate: 0.08     # 保证金比例
-    long_rate: 0.0001     # 开仓手续费率
-    short_rate: 0.0001    # 平仓手续费率
-
-
-  CU:
-    multiplier: 5
-    pricetick: 10
+# ==================== 交易品种 ====================
+# 基于基本面筛选的品种及策略方向
+positions:
+  LH0:
+    name: "生猪"
+    exchange: "dce"
+    direction: "long"       # 做多
+    multiplier: 16           # 合约乘数: 16吨/手
+    pricetick: 5             # 最小变动: 5元/吨
     margin_rate: 0.08
-    long_rate: 0.00005
-    short_rate: 0.00005
+    commission: 2.0          # 手续费: 2元/手
+    reason: "基本面超跌, 库存仍超出需求, 判断处于低位, 等待入场做多时机"
 
-  AU:
-    multiplier: 1000
-    pricetick: 0.02
-    margin_rate: 0.08
-    long_rate: 0.00002
-    short_rate: 0.00002
+  PS0:
+    name: "多晶硅"
+    exchange: "gfex"
+    direction: "short"      # 做空
+    multiplier: 3            # 合约乘数: 3吨/手
+    pricetick: 5             # 最小变动: 5元/吨
+    margin_rate: 0.12
+    commission: 3.0          # 手续费: 3元/手
+    reason: "库存过多, 需求无明显增长, 做空"
 
-  AG:
-    multiplier: 15
-    pricetick: 1
-    margin_rate: 0.08
-    long_rate: 0.00005
-    short_rate: 0.00005
-  
-  RU:
-    multiplier: 10
-    pricetick: 5
-    margin_rate: 0.09
-    long_rate: 0.000045
-    short_rate: 0.000045
+# ==================== 盘前分析参数 ====================
+pre_market:
+  # 均线系统
+  ma_windows: [5, 10, 20, 60, 120]
 
-# ==================== 并行计算 ====================
-parallel:
-  max_workers: 6
+  # 支撑阻力
+  sr_lookback: 120          # 支撑阻力回看天数
+  sr_touch_count: 3         # 至少触及次数
+
+  # 趋势判断
+  atr_window: 14
+  rsi_window: 14
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  bollinger:
+    window: 20
+    std: 2
+
+  # 目标价位
+  fib_levels: [0.236, 0.382, 0.5, 0.618, 0.786]
+
+# ==================== 日内策略参数 ====================
+intraday:
+  # 突破策略
+  breakout:
+    window: 20              # N日高低点突破
+    atr_stop_multiplier: 2  # ATR止损倍数
+
+  # 均值回归策略
+  mean_reversion:
+    bb_window: 20           # 布林带窗口
+    bb_std: 2               # 布林带标准差
+    rsi_oversold: 30        # RSI超卖
+    rsi_overbought: 70      # RSI超买
+
+  # 信号过滤
+  volume_filter: 1.5        # 成交量需大于均量的倍数
+
+  # 风控
+  max_loss_pct: 0.02        # 单笔最大亏损 2%
+  daily_max_loss_pct: 0.05  # 当日最大亏损 5%
+  max_trades_per_day: 5     # 当日最大交易次数
