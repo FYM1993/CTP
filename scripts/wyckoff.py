@@ -1013,6 +1013,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
         "signal_bar": None, "signal_detail": None,
         "current_stage": "", "next_expected": "",
         "confidence": 0.0,
+        "signal_strength": 0.0,
         "all_events": relevant, "suspect_events": suspect,
     }
 
@@ -1020,6 +1021,19 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
         confidence = 0.7 if fresh_entry["signal"] in ("SOS", "SOW") else 0.55
         if prep_events:
             confidence = min(confidence + 0.15, 0.95)
+
+        # signal_strength: 基于 priority 的连续值
+        pri = fresh_entry.get("priority", 2)
+        if pri >= 4:
+            strength = 0.85
+        elif pri >= 3:
+            strength = 0.75
+        elif pri >= 2:
+            strength = 0.65
+        else:
+            strength = 0.5
+        if prep_events:
+            strength = min(strength + 0.1, 0.95)
 
         days_ago = fresh_entry.get("days_ago", 0)
         freshness = "今日" if days_ago == 0 else f"{days_ago}天前"
@@ -1033,6 +1047,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
 
         return {
             "has_signal": True,
+            "signal_strength": strength,
             "signal_type": fresh_entry["signal"],
             "signal_date": fresh_entry["date"],
             "signal_bar": fresh_entry["bar"],
@@ -1055,6 +1070,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             next_exp = "等新的UT或SOW出现"
 
         result = dict(_no_signal)
+        result["signal_strength"] = 0.45
         result["current_stage"] = stage
         result["next_expected"] = next_exp
         result["all_events"] = relevant
@@ -1071,6 +1087,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             next_exp = "等UT(假突破回落)或SOW(放量跌破)"
 
         result = dict(_no_signal)
+        result["signal_strength"] = 0.35
         result["current_stage"] = stage
         result["next_expected"] = next_exp
         return result
@@ -1086,6 +1103,10 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
         stage += f"（有{len(suspect)}个疑似信号未达标）"
 
     result = dict(_no_signal)
+    if suspect:
+        result["signal_strength"] = 0.15
+    else:
+        result["signal_strength"] = 0.0
     result["current_stage"] = stage
     result["next_expected"] = next_exp
     return result
