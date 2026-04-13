@@ -175,13 +175,14 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     """
     综合评分: -100(强空) ~ +100(强多)
 
-    评分体系 (总计 ±100):
-      经典指标 (50分):
+    评分体系 (总计 ±105):
+      经典指标 (55分):
         均线排列  15分  — 趋势方向
         MACD     10分  — 趋势动能
         RSI      10分  — 超买超卖
         布林带    10分  — 价格位置
         动量       5分  — 短期惯性
+        价格位置   5分  — 历史高低点间的位置上下文
       Wyckoff 量价 (35分):
         阶段判断  15分  — 吸筹/派发/上涨/下跌
         量价关系  10分  — 上涨日量 vs 下跌日量
@@ -193,7 +194,7 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     last = close.iloc[-1]
     scores = {}
 
-    # ===== 经典指标 (50分) =====
+    # ===== 经典指标 (55分) =====
 
     # 1. 均线排列 (15) — 综合价格位置和均线排列
     ma_cfg = cfg.get("ma_windows", [5, 10, 20, 60, 120])
@@ -261,9 +262,22 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     momentum = (ret_5 * 0.6 + ret_20 * 0.4) * 500
     scores["动量"] = np.clip(momentum, -5, 5)
 
+    # 6. 价格位置 (5) — 从 Phase 1 迁入，作为上下文而非逆势信号
+    n = min(len(df), 300)
+    recent_prices = df.tail(n)["close"]
+    high_all = float(recent_prices.max())
+    low_all = float(recent_prices.min())
+    range_pct = (last - low_all) / (high_all - low_all + 1e-12) * 100
+    if range_pct < 10:
+        scores["价格位置"] = 5
+    elif range_pct > 90:
+        scores["价格位置"] = -5
+    else:
+        scores["价格位置"] = 0
+
     # ===== Wyckoff 量价分析 (35分) =====
 
-    # 6. 阶段判断 (15)
+    # 7. 阶段判断 (15)
     phase = wyckoff_phase(df, lookback=120)
     if phase.phase == "accumulation":
         scores["Wyckoff阶段"] = 15 * phase.confidence
@@ -276,7 +290,7 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     else:
         scores["Wyckoff阶段"] = 0
 
-    # 7. 量价关系 (10) — 上涨日成交量 vs 下跌日成交量
+    # 8. 量价关系 (10) — 上涨日成交量 vs 下跌日成交量
     vp = analyze_volume_pattern(df, lookback=60)
     ratio = vp["up_down_ratio"]
     if ratio > 1.5:
@@ -290,7 +304,7 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     else:
         scores["量价关系"] = 0
 
-    # 8. VSA 最近K线 (10)
+    # 9. VSA 最近K线 (10)
     vsa_bars = vsa_scan(df, window=20)
     recent_vsa = vsa_bars[-5:]
     bullish_strength = sum(b.strength for b in recent_vsa if b.bias == "bullish")
@@ -300,7 +314,7 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
 
     # ===== 期货持仓分析 (15分) =====
 
-    # 9. OI 信号 (15)
+    # 10. OI 信号 (15)
     oi_sig = analyze_oi(df, window=5)
     if oi_sig:
         if oi_sig.pattern == "new_long":
@@ -475,9 +489,10 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     scores = score_signals(df, direction, pre_cfg)
     total = sum(scores.values())
 
-    print(f"\n  🧮 综合评分 (经典指标50分 + 量价分析35分 + 持仓15分)")
+    print(f"\n  🧮 综合评分 (经典指标55分 + 量价分析35分 + 持仓15分)")
     section_labels = {
         "均线排列": "经典", "MACD": "经典", "RSI": "经典", "布林带": "经典", "动量": "经典",
+        "价格位置": "经典",
         "Wyckoff阶段": "量价", "量价关系": "量价", "VSA信号": "量价",
         "持仓信号": "持仓",
     }
@@ -489,7 +504,7 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         icon = "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
         print(f"     {section:2s} {k:8s}: {sign}{v:5.1f}  {icon} {bar}")
     print(f"     {'─'*45}")
-    print(f"     总分:   {total:+.1f} / 100  ", end="")
+    print(f"     总分:   {total:+.1f} / 105  ", end="")
 
     if direction == "long":
         if total > 30:
@@ -527,7 +542,7 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     print(f"  └────────────────────────────────────────────┘")
 
     # --- 构建评分原因摘要 ---
-    classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量"]
+    classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量", "价格位置"]
     wyckoff_keys = ["Wyckoff阶段", "量价关系", "VSA信号"]
     oi_keys = ["持仓信号"]
     classical_total = sum(scores.get(k, 0) for k in classical_keys)
