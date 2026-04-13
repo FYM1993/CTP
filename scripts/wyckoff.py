@@ -694,6 +694,7 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
 
     # 收集已出现的事件类型（用于 SOS/SOW 前序事件验证）
     seen_signals = set()
+    suspect_signals = set()
 
     for i in range(20, len(recent)):
         idx = recent.index[i]
@@ -737,6 +738,7 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "bar": bar, "detail": f"疑似SC(量比{rv:.1f}, 承接{cp:.0%}不够强或跌幅不极端)",
                     "priority": 0,
                 })
+                suspect_signals.add("SC")
 
         # ====== Buying Climax ======
         if rv >= 2.5 and rs >= 1.5 and row["close"] > prev["close"]:
@@ -758,6 +760,7 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "bar": bar, "detail": f"疑似BC(量比{rv:.1f}, 回落{cp:.0%}不够强或涨幅不极端)",
                     "priority": 0,
                 })
+                suspect_signals.add("BC")
 
         # ====== Spring ======
         # 形态: 低点破前低 + 收盘收回前低上方
@@ -806,6 +809,7 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                         "detail": f"疑似Spring: 跌破前低{prev_low:.0f}后收回, 但{'; '.join(reasons)}",
                         "ref_level": prev_low, "priority": 0,
                     })
+                    suspect_signals.add("Spring")
 
         # ====== Upthrust ======
         # 形态: 高点破前高 + 收盘回落前高下方
@@ -853,16 +857,18 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                         "detail": f"疑似UT: 突破前高{prev_high:.0f}后回落, 但{'; '.join(reasons)}",
                         "ref_level": prev_high, "priority": 0,
                     })
+                    suspect_signals.add("UT")
 
         # ====== SOS (Sign of Strength) ======
         # 形态: 放量收盘突破前高
         # 验证: 1)前序事件(SC/Spring/StopVol_Bull) 2)突破幅度>0.5%
         if rv >= 1.5 and row["close"] > prev_high:
             breakout_pct = (row["close"] - prev_high) / (prev_high + 1e-12) * 100
-            has_precursor = bool(seen_signals & {"SC", "Spring", "StopVol_Bull"})
+            has_strong_precursor = bool(seen_signals & {"SC", "Spring", "StopVol_Bull"})
+            has_weak_precursor = bool(suspect_signals & {"SC", "Spring", "StopVol_Bull"})
             breakout_ok = breakout_pct > 0.5
 
-            if has_precursor and breakout_ok:
+            if has_strong_precursor and breakout_ok:
                 events.append({
                     "signal": "SOS", "date": date_str, "bias": "bullish",
                     "bar": bar,
@@ -870,9 +876,17 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "ref_level": prev_high, "priority": 4,
                 })
                 seen_signals.add("SOS")
+            elif has_weak_precursor and breakout_ok:
+                events.append({
+                    "signal": "SOS", "date": date_str, "bias": "bullish",
+                    "bar": bar,
+                    "detail": f"放量(量比{rv:.1f})突破前高{prev_high:.0f}(+{breakout_pct:.1f}%), 有疑似前序信号(弱确认)",
+                    "ref_level": prev_high, "priority": 2,
+                })
+                seen_signals.add("SOS")
             else:
                 reasons = []
-                if not has_precursor:
+                if not has_strong_precursor and not has_weak_precursor:
                     reasons.append("无前序SC/Spring信号")
                 if not breakout_ok:
                     reasons.append(f"突破幅度仅{breakout_pct:.1f}%")
@@ -888,10 +902,11 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
         # 验证: 1)前序事件(BC/UT/StopVol_Bear) 2)跌破幅度>0.5%
         if rv >= 1.5 and row["close"] < prev_low:
             breakdown_pct = (prev_low - row["close"]) / (prev_low + 1e-12) * 100
-            has_precursor = bool(seen_signals & {"BC", "UT", "StopVol_Bear"})
+            has_strong_precursor = bool(seen_signals & {"BC", "UT", "StopVol_Bear"})
+            has_weak_precursor = bool(suspect_signals & {"BC", "UT", "StopVol_Bear"})
             breakdown_ok = breakdown_pct > 0.5
 
-            if has_precursor and breakdown_ok:
+            if has_strong_precursor and breakdown_ok:
                 events.append({
                     "signal": "SOW", "date": date_str, "bias": "bearish",
                     "bar": bar,
@@ -899,9 +914,17 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "ref_level": prev_low, "priority": 4,
                 })
                 seen_signals.add("SOW")
+            elif has_weak_precursor and breakdown_ok:
+                events.append({
+                    "signal": "SOW", "date": date_str, "bias": "bearish",
+                    "bar": bar,
+                    "detail": f"放量(量比{rv:.1f})跌破前低{prev_low:.0f}(-{breakdown_pct:.1f}%), 有疑似前序信号(弱确认)",
+                    "ref_level": prev_low, "priority": 2,
+                })
+                seen_signals.add("SOW")
             else:
                 reasons = []
-                if not has_precursor:
+                if not has_strong_precursor and not has_weak_precursor:
                     reasons.append("无前序BC/UT信号")
                 if not breakdown_ok:
                     reasons.append(f"跌破幅度仅{breakdown_pct:.1f}%")
