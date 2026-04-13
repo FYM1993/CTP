@@ -25,6 +25,7 @@ from wyckoff import (
     wyckoff_phase, vsa_scan, analyze_oi, oi_divergence,
     analyze_volume_pattern, detect_climax, detect_spring_upthrust,
     detect_sos_sow, relative_volume, close_position,
+    assess_reversal_status,
 )
 
 
@@ -77,32 +78,75 @@ def calc_bollinger(s: pd.Series, w=20, std=2):
     return mid + std * sd, mid, mid - std * sd
 
 def find_support_resistance(df: pd.DataFrame, lookback: int = 120, n_levels: int = 5):
-    """基于价格密集区和历史高低点计算支撑阻力"""
+    """基于多维度寻找有意义的支撑阻力位，合并过近的价位"""
     recent = df.tail(lookback)
     highs = recent["high"].values
     lows = recent["low"].values
     closes = recent["close"].values
     current = closes[-1]
+    atr = calc_atr(df).iloc[-1]
+    min_gap = atr * 1.5  # 价位之间至少间隔 1.5×ATR
 
-    all_prices = np.concatenate([highs, lows])
-    
-    # 用核密度估计找到价格密集区
+    # --- 多来源收集关键价位候选 ---
+    candidates = []
+
+    # 1) 局部极值（近期高低点转折）
+    from scipy.signal import argrelextrema
+    order = max(3, lookback // 20)
+    local_highs_idx = argrelextrema(highs, np.greater_equal, order=order)[0]
+    local_lows_idx = argrelextrema(lows, np.less_equal, order=order)[0]
+    for i in local_highs_idx:
+        candidates.append(("pivot_h", highs[i]))
+    for i in local_lows_idx:
+        candidates.append(("pivot_l", lows[i]))
+
+    # 2) KDE 价格密集区
     from scipy.stats import gaussian_kde
     try:
-        kde = gaussian_kde(all_prices, bw_method=0.05)
+        all_prices = np.concatenate([highs, lows])
+        kde = gaussian_kde(all_prices, bw_method=0.08)
         price_range = np.linspace(all_prices.min() * 0.95, all_prices.max() * 1.05, 500)
         density = kde(price_range)
-        
-        # 找到密度峰值作为关键价位
-        from scipy.signal import find_peaks
-        peaks, props = find_peaks(density, distance=20, prominence=0.0001)
-        key_levels = sorted(price_range[peaks])
+        from scipy.signal import find_peaks as fp
+        peaks, _ = fp(density, distance=30, prominence=0.0001)
+        for p in peaks:
+            candidates.append(("kde", price_range[p]))
     except Exception:
-        # fallback: 使用简单分位数
-        key_levels = list(np.percentile(all_prices, [10, 25, 50, 75, 90]))
+        pass
 
-    supports = [p for p in key_levels if p < current]
-    resistances = [p for p in key_levels if p > current]
+    # 3) 整数关口（心理价位）
+    magnitude = 10 ** max(0, int(np.log10(current)) - 1)
+    round_step = magnitude
+    lo = current * 0.85
+    hi = current * 1.15
+    r = lo - (lo % round_step)
+    while r <= hi:
+        if abs(r - current) > min_gap * 0.5:
+            candidates.append(("round", r))
+        r += round_step
+
+    # 4) 历史成交量加权价格（VWAP 近似）
+    if "volume" in recent.columns and recent["volume"].sum() > 0:
+        vwap = (recent["close"] * recent["volume"]).sum() / recent["volume"].sum()
+        candidates.append(("vwap", vwap))
+
+    # 5) 长周期关键位（250日高低点、中位数）
+    long_df = df.tail(250)
+    candidates.append(("long_high", long_df["high"].max()))
+    candidates.append(("long_low", long_df["low"].min()))
+    candidates.append(("long_mid", (long_df["high"].max() + long_df["low"].min()) / 2))
+
+    # --- 合并过近的价位 ---
+    raw_levels = sorted(set(v for _, v in candidates))
+    merged = []
+    for lvl in raw_levels:
+        if merged and abs(lvl - merged[-1]) < min_gap:
+            merged[-1] = (merged[-1] + lvl) / 2
+        else:
+            merged.append(lvl)
+
+    supports = [p for p in merged if p < current - atr * 0.3]
+    resistances = [p for p in merged if p > current + atr * 0.3]
 
     return supports[-n_levels:], resistances[:n_levels]
 
@@ -466,54 +510,128 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         else:
             print("→ ❌ 偏多，不宜做空")
 
-    # 交易建议
-    print(f"\n  💡 交易建议")
-    if direction == "long":
-        entry = max(supports[-1] if supports else last * 0.98, lower.iloc[-1])
-        stop = entry - 2 * atr
-        tp1 = resistances[0] if resistances else last * 1.05
-        tp2 = resistances[1] if len(resistances) > 1 else last * 1.10
-        rr = (tp1 - entry) / (entry - stop + 1e-12)
-        print(f"     方向: 做多")
-        print(f"     参考入场: {entry:.0f} (支撑位/布林下轨附近)")
-        print(f"     止损位:   {stop:.0f} (入场价 - 2*ATR)")
-        print(f"     止盈1:    {tp1:.0f} (第一阻力位)")
-        print(f"     止盈2:    {tp2:.0f} (第二阻力位)")
-        print(f"     盈亏比:   {rr:.2f}")
+    # ==================== 第五部分: 反转信号评估 & 交易建议 ====================
+
+    reversal = assess_reversal_status(df, direction, lookback=60)
+
+    print(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
+    print(f"  │ 当前阶段: {reversal['current_stage']}")
+    print(f"  │ 下一步:   {reversal['next_expected']}")
+    if reversal["all_events"]:
+        print(f"  │ 近期事件:")
+        for evt in reversal["all_events"][-3:]:
+            icon = "🟢" if evt["bias"] == "bullish" else "🔴"
+            print(f"  │   {icon} {evt['date']} {evt['signal']}: {evt['detail']}")
     else:
-        entry = min(resistances[0] if resistances else last * 1.02, upper.iloc[-1])
-        stop = entry + 2 * atr
-        tp1 = supports[-1] if supports else last * 0.95
-        tp2 = supports[-2] if len(supports) > 1 else last * 0.90
-        rr = (entry - tp1) / (stop - entry + 1e-12)
-        print(f"     方向: 做空")
-        print(f"     参考入场: {entry:.0f} (阻力位/布林上轨附近)")
-        print(f"     止损位:   {stop:.0f} (入场价 + 2*ATR)")
-        print(f"     止盈1:    {tp1:.0f} (第一支撑位)")
-        print(f"     止盈2:    {tp2:.0f} (第二支撑位)")
-        print(f"     盈亏比:   {rr:.2f}")
+        print(f"  │ 近期无相关反转事件")
+    print(f"  └────────────────────────────────────────────┘")
 
-    # 是否可操作：评分方向一致 且 |总分| > 20 且 盈亏比 > 1
-    score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
-    rr_ok = rr >= 1.0
-    actionable = score_ok and rr_ok
-    if score_ok and not rr_ok:
-        print(f"  ⚠️ 评分达标但盈亏比({rr:.2f})不足1.0，暂不建议入场")
-
-    # 构建评分原因摘要
+    # --- 构建评分原因摘要 ---
     classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量"]
     wyckoff_keys = ["Wyckoff阶段", "量价关系", "VSA信号"]
     oi_keys = ["持仓信号"]
     classical_total = sum(scores.get(k, 0) for k in classical_keys)
     wyckoff_total = sum(scores.get(k, 0) for k in wyckoff_keys)
     oi_total = sum(scores.get(k, 0) for k in oi_keys)
-
     top_factors = sorted(scores.items(), key=lambda x: abs(x[1]), reverse=True)
     reason_parts = [f"{k}{v:+.0f}" for k, v in top_factors[:3] if abs(v) >= 3]
 
-    # Wyckoff 阶段
     phase_info = wyckoff_phase(df)
     wk_phase = phase_info.phase
+
+    # 斐波那契位（止盈目标计算用）
+    fib_high = df.tail(120)["high"].max()
+    fib_low = df.tail(120)["low"].min()
+    fib_range = fib_high - fib_low
+
+    print(f"\n  💡 交易建议")
+    dir_cn = "做多" if direction == "long" else "做空"
+    print(f"     方向: {dir_cn}")
+
+    # 展示疑似信号（供参考）
+    if reversal.get("suspect_events"):
+        print(f"  │ ⚠️ 疑似信号（未达标，仅供参考）:")
+        for evt in reversal["suspect_events"][-3:]:
+            print(f"  │   ⚪ {evt['date']} {evt['signal']}: {evt['detail']}")
+
+    if reversal["has_signal"]:
+        sig = reversal["signal_type"]
+        sig_bar = reversal["signal_bar"]
+        sig_date = reversal["signal_date"]
+
+        # 入场价 = 当前价（信号新鲜时，当前价离信号K线不远）
+        entry = last
+
+        if direction == "long":
+            stop = sig_bar["low"] - 0.5 * atr
+
+            tp1_sr = next((r for r in resistances if r > entry + 0.5 * atr), None)
+            tp1_fib = fib_low + fib_range * 0.618
+            if tp1_fib is not None and tp1_fib <= entry:
+                tp1_fib = None
+            tp1_candidates = [v for v in [tp1_sr, tp1_fib] if v is not None]
+            tp1 = min(tp1_candidates) if tp1_candidates else (resistances[0] if resistances else last * 1.03)
+
+            tp2_sr = next((r for r in resistances if r > tp1 + 0.5 * atr), None)
+            tp2_fib = fib_low + fib_range * 1.0
+            if tp2_fib is not None and tp2_fib <= tp1:
+                tp2_fib = None
+            tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
+            tp2 = min(tp2_candidates) if tp2_candidates else tp1 * 1.02
+
+            rr = (tp1 - entry) / (entry - stop + 1e-12)
+        else:
+            stop = sig_bar["high"] + 0.5 * atr
+
+            tp1_sr = next((s for s in reversed(supports) if s < entry - 0.5 * atr), None)
+            tp1_fib = fib_high - fib_range * 0.618
+            if tp1_fib is not None and tp1_fib >= entry:
+                tp1_fib = None
+            tp1_candidates = [v for v in [tp1_sr, tp1_fib] if v is not None]
+            tp1 = max(tp1_candidates) if tp1_candidates else (supports[-1] if supports else last * 0.97)
+
+            tp2_sr = next((s for s in reversed(supports) if s < tp1 - 0.5 * atr), None)
+            tp2_fib = fib_high - fib_range * 1.0
+            if tp2_fib is not None and tp2_fib >= tp1:
+                tp2_fib = None
+            tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
+            tp2 = max(tp2_candidates) if tp2_candidates else tp1 * 0.98
+
+            rr = (entry - tp1) / (stop - entry + 1e-12)
+
+        sig_cn = {"Spring": "弹簧", "SOS": "强势突破", "SC": "卖方高潮",
+                  "UT": "上冲回落", "SOW": "弱势跌破", "BC": "买方高潮",
+                  "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)"}.get(sig, sig)
+
+        print(f"     ✅ 入场信号: {sig_cn} ({sig_date})")
+        print(f"     信号详情: {reversal['signal_detail']}")
+        print(f"     参考入场: {entry:.0f} (当前价)")
+        stop_basis = "信号K线最低 - 0.5ATR" if direction == "long" else "信号K线最高 + 0.5ATR"
+        print(f"     止损位:   {stop:.0f} ({stop_basis})")
+        print(f"     止盈1:    {tp1:.0f}")
+        print(f"     止盈2:    {tp2:.0f}")
+        print(f"     盈亏比:   {rr:.2f}")
+        print(f"     置信度:   {reversal['confidence']:.0%}")
+
+        score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
+        rr_ok = rr >= 1.0
+        actionable = score_ok and rr_ok
+        if not rr_ok:
+            print(f"  ⚠️ 有入场信号但盈亏比({rr:.2f})不足1.0，谨慎入场")
+        if not score_ok:
+            print(f"  ⚠️ 有入场信号但评分({total:+.0f})未达标，谨慎入场")
+
+    else:
+        entry, stop, tp1, tp2, rr = last, 0.0, 0.0, 0.0, 0.0
+        actionable = False
+
+        print(f"     ⏳ 尚无有效反转信号，暂不建议入场")
+        print(f"     当前阶段: {reversal['current_stage']}")
+        print(f"     等待信号: {reversal['next_expected']}")
+        if direction == "long":
+            print(f"     入场条件: 出现Spring(假跌破收回)或SOS(放量突破)后再评估")
+        else:
+            print(f"     入场条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
 
     return {
         "symbol": symbol, "name": name, "direction": direction,
@@ -527,6 +645,7 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         "oi_score": float(oi_total),
         "wyckoff_phase": wk_phase,
         "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
+        "reversal_status": reversal,
     }
 
 

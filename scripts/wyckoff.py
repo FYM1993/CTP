@@ -658,3 +658,386 @@ def wyckoff_score(df: pd.DataFrame) -> dict:
 
     result["composite"] = phase_score + vsa_score + oi_score + vp_score
     return result
+
+
+# ============================================================
+#  7. 反转信号评估（入场信号驱动）
+# ============================================================
+
+def _bar_dict(row) -> dict:
+    """将 DataFrame 行转为 K 线 dict"""
+    return {
+        "open": float(row["open"]),
+        "high": float(row["high"]),
+        "low": float(row["low"]),
+        "close": float(row["close"]),
+        "volume": float(row["volume"]),
+    }
+
+
+def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
+    """
+    检测 Wyckoff 事件，携带 K 线数据。
+    每类信号都包含上下文验证（横盘前提、量能、前序事件等），
+    验证不通过的降为疑似信号（priority=0），不作为入场依据。
+    """
+    events = []
+    recent = df.tail(lookback)
+    vol_ma = recent["volume"].rolling(20).mean()
+    sp = spread(recent)
+    sp_ma = sp.rolling(20).mean()
+    closes = recent["close"]
+
+    # 预计算横盘状态（用于 Spring/UT 验证）
+    tr_40 = detect_trading_range(df, lookback=40, threshold=0.15)
+    has_trading_range = tr_40 is not None
+
+    # 收集已出现的事件类型（用于 SOS/SOW 前序事件验证）
+    seen_signals = set()
+
+    for i in range(20, len(recent)):
+        idx = recent.index[i]
+        row = recent.iloc[i]
+        prev = recent.iloc[i - 1]
+        rv = row["volume"] / (vol_ma.iloc[i] + 1e-12)
+        rs = sp.iloc[i] / (sp_ma.iloc[i] + 1e-12)
+        cp = (row["close"] - row["low"]) / (sp.iloc[i] + 1e-12)
+        date_str = str(recent.iloc[i].get("date", idx))[:10]
+        bar = _bar_dict(row)
+
+        prev_low = float(recent["low"].iloc[max(0, i - 20):i].min())
+        prev_high = float(recent["high"].iloc[max(0, i - 20):i].max())
+
+        # 近10日收益率（判断趋势是否放缓）
+        ret_10d = (row["close"] / float(closes.iloc[max(0, i - 10)]) - 1) if i >= 10 else 0
+
+        # 当日跌幅在近20日中的排名（用于 SC/BC 验证）
+        ret_1d = row["close"] / prev["close"] - 1
+        recent_rets = closes.iloc[max(0, i - 20):i + 1].pct_change().dropna()
+
+        # ====== Selling Climax ======
+        # 条件: 天量 + 大幅度 + 收跌 + 收盘被承接回上半部
+        # 验证: 承接比例 >= 0.5 且当日跌幅在近20日排名前3
+        if rv >= 2.5 and rs >= 1.5 and row["close"] < prev["close"]:
+            承接ok = cp >= 0.5
+            rank_ok = True
+            if len(recent_rets) >= 5:
+                rank = (recent_rets < ret_1d).sum()
+                rank_ok = rank <= 2  # 近20日内跌幅排前3
+            if 承接ok and rank_ok:
+                events.append({
+                    "signal": "SC", "date": date_str, "bias": "bullish",
+                    "bar": bar, "detail": f"暴跌天量(量比{rv:.1f}), 收盘承接回{cp:.0%}, 近20日跌幅极端",
+                    "priority": 1,
+                })
+                seen_signals.add("SC")
+            elif cp > 0.35:
+                events.append({
+                    "signal": "SC", "date": date_str, "bias": "bullish",
+                    "bar": bar, "detail": f"疑似SC(量比{rv:.1f}, 承接{cp:.0%}不够强或跌幅不极端)",
+                    "priority": 0,
+                })
+
+        # ====== Buying Climax ======
+        if rv >= 2.5 and rs >= 1.5 and row["close"] > prev["close"]:
+            承接ok = cp <= 0.5
+            rank_ok = True
+            if len(recent_rets) >= 5:
+                rank = (recent_rets > ret_1d).sum()
+                rank_ok = rank <= 2
+            if 承接ok and rank_ok:
+                events.append({
+                    "signal": "BC", "date": date_str, "bias": "bearish",
+                    "bar": bar, "detail": f"暴涨天量(量比{rv:.1f}), 收盘回落至{cp:.0%}, 近20日涨幅极端",
+                    "priority": 1,
+                })
+                seen_signals.add("BC")
+            elif cp < 0.65:
+                events.append({
+                    "signal": "BC", "date": date_str, "bias": "bearish",
+                    "bar": bar, "detail": f"疑似BC(量比{rv:.1f}, 回落{cp:.0%}不够强或涨幅不极端)",
+                    "priority": 0,
+                })
+
+        # ====== Spring ======
+        # 形态: 低点破前低 + 收盘收回前低上方
+        # 验证: 1)横盘前提或趋势放缓 2)缩量(量比<1.5) 3)收盘在上半部
+        if row["low"] < prev_low and row["close"] > prev_low:
+            depth = (prev_low - row["low"]) / (row["close"] + 1e-12) * 100
+            if depth > 0.2:
+                trend_slowed = ret_10d > -0.02  # 近10日跌幅<2%说明下跌放缓
+                context_ok = has_trading_range or trend_slowed
+                vol_ok = rv < 1.5  # 缩量试探
+                close_ok = cp > 0.5  # 收盘偏高，买方承接有力
+
+                if context_ok and vol_ok and close_ok:
+                    events.append({
+                        "signal": "Spring", "date": date_str, "bias": "bullish",
+                        "bar": bar,
+                        "detail": f"跌破前低{prev_low:.0f}后收回{cp:.0%}位, "
+                                  f"缩量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
+                        "ref_level": prev_low, "priority": 3,
+                    })
+                    seen_signals.add("Spring")
+                else:
+                    reasons = []
+                    if not context_ok:
+                        reasons.append("无横盘且下跌未放缓")
+                    if not vol_ok:
+                        reasons.append(f"放量(量比{rv:.1f})非缩量试探")
+                    if not close_ok:
+                        reasons.append(f"收盘偏低({cp:.0%})")
+                    events.append({
+                        "signal": "Spring", "date": date_str, "bias": "bullish",
+                        "bar": bar,
+                        "detail": f"疑似Spring: 跌破前低{prev_low:.0f}后收回, 但{'; '.join(reasons)}",
+                        "ref_level": prev_low, "priority": 0,
+                    })
+
+        # ====== Upthrust ======
+        # 形态: 高点破前高 + 收盘回落前高下方
+        # 验证: 1)横盘前提或上涨趋势放缓 2)缩量 3)收盘在下半部
+        if row["high"] > prev_high and row["close"] < prev_high:
+            depth = (row["high"] - prev_high) / (row["close"] + 1e-12) * 100
+            if depth > 0.2:
+                trend_slowed = ret_10d < 0.02
+                context_ok = has_trading_range or trend_slowed
+                vol_ok = rv < 1.5
+                close_ok = cp < 0.5
+
+                if context_ok and vol_ok and close_ok:
+                    events.append({
+                        "signal": "UT", "date": date_str, "bias": "bearish",
+                        "bar": bar,
+                        "detail": f"突破前高{prev_high:.0f}后回落{cp:.0%}位, "
+                                  f"缩量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
+                        "ref_level": prev_high, "priority": 3,
+                    })
+                    seen_signals.add("UT")
+                else:
+                    reasons = []
+                    if not context_ok:
+                        reasons.append("无横盘且上涨未放缓")
+                    if not vol_ok:
+                        reasons.append(f"放量(量比{rv:.1f})")
+                    if not close_ok:
+                        reasons.append(f"收盘偏高({cp:.0%})")
+                    events.append({
+                        "signal": "UT", "date": date_str, "bias": "bearish",
+                        "bar": bar,
+                        "detail": f"疑似UT: 突破前高{prev_high:.0f}后回落, 但{'; '.join(reasons)}",
+                        "ref_level": prev_high, "priority": 0,
+                    })
+
+        # ====== SOS (Sign of Strength) ======
+        # 形态: 放量收盘突破前高
+        # 验证: 1)前序事件(SC/Spring/StopVol_Bull) 2)突破幅度>0.5%
+        if rv >= 1.5 and row["close"] > prev_high:
+            breakout_pct = (row["close"] - prev_high) / (prev_high + 1e-12) * 100
+            has_precursor = bool(seen_signals & {"SC", "Spring", "StopVol_Bull"})
+            breakout_ok = breakout_pct > 0.5
+
+            if has_precursor and breakout_ok:
+                events.append({
+                    "signal": "SOS", "date": date_str, "bias": "bullish",
+                    "bar": bar,
+                    "detail": f"放量(量比{rv:.1f})突破前高{prev_high:.0f}(+{breakout_pct:.1f}%), 有前序吸筹信号",
+                    "ref_level": prev_high, "priority": 4,
+                })
+                seen_signals.add("SOS")
+            else:
+                reasons = []
+                if not has_precursor:
+                    reasons.append("无前序SC/Spring信号")
+                if not breakout_ok:
+                    reasons.append(f"突破幅度仅{breakout_pct:.1f}%")
+                events.append({
+                    "signal": "SOS", "date": date_str, "bias": "bullish",
+                    "bar": bar,
+                    "detail": f"疑似SOS: 放量突破前高{prev_high:.0f}, 但{'; '.join(reasons)}",
+                    "ref_level": prev_high, "priority": 0,
+                })
+
+        # ====== SOW (Sign of Weakness) ======
+        # 形态: 放量收盘跌破前低
+        # 验证: 1)前序事件(BC/UT/StopVol_Bear) 2)跌破幅度>0.5%
+        if rv >= 1.5 and row["close"] < prev_low:
+            breakdown_pct = (prev_low - row["close"]) / (prev_low + 1e-12) * 100
+            has_precursor = bool(seen_signals & {"BC", "UT", "StopVol_Bear"})
+            breakdown_ok = breakdown_pct > 0.5
+
+            if has_precursor and breakdown_ok:
+                events.append({
+                    "signal": "SOW", "date": date_str, "bias": "bearish",
+                    "bar": bar,
+                    "detail": f"放量(量比{rv:.1f})跌破前低{prev_low:.0f}(-{breakdown_pct:.1f}%), 有前序派发信号",
+                    "ref_level": prev_low, "priority": 4,
+                })
+                seen_signals.add("SOW")
+            else:
+                reasons = []
+                if not has_precursor:
+                    reasons.append("无前序BC/UT信号")
+                if not breakdown_ok:
+                    reasons.append(f"跌破幅度仅{breakdown_pct:.1f}%")
+                events.append({
+                    "signal": "SOW", "date": date_str, "bias": "bearish",
+                    "bar": bar,
+                    "detail": f"疑似SOW: 放量跌破前低{prev_low:.0f}, 但{'; '.join(reasons)}",
+                    "ref_level": prev_low, "priority": 0,
+                })
+
+        # ====== VSA Stopping Volume ======
+        # 这类信号条件本身已经较严（放量窄幅），保持原有逻辑
+        if rv >= 1.8 and rs < 0.8:
+            if row["close"] < prev["close"] and cp > 0.6:
+                events.append({
+                    "signal": "StopVol_Bull", "date": date_str, "bias": "bullish",
+                    "bar": bar, "detail": f"放量窄幅(量比{rv:.1f}幅比{rs:.1f}), 收盘偏高{cp:.0%}, 卖方力竭",
+                    "priority": 2,
+                })
+                seen_signals.add("StopVol_Bull")
+            elif row["close"] > prev["close"] and cp < 0.4:
+                events.append({
+                    "signal": "StopVol_Bear", "date": date_str, "bias": "bearish",
+                    "bar": bar, "detail": f"放量窄幅(量比{rv:.1f}幅比{rs:.1f}), 收盘偏低{cp:.0%}, 买方力竭",
+                    "priority": 2,
+                })
+                seen_signals.add("StopVol_Bear")
+
+    return events
+
+
+def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60) -> dict:
+    """
+    综合评估反转信号状态，决定是否有足够的入场依据。
+
+    信号质量要求:
+      - 只有 priority >= 2 的事件才算有效（疑似信号 priority=0 不算）
+      - 只有最近3个交易日内的信号才算"新鲜"，可作为入场依据
+      - 入场价 = 当前价（不是信号K线价），止损 = 信号K线极端价
+    """
+    events = _find_events_with_bars(df, lookback=lookback)
+
+    if direction == "long":
+        target_signals = {"SC", "StopVol_Bull", "Spring", "SOS"}
+        entry_signals = {"Spring", "SOS"}
+        prepare_signals = {"SC", "StopVol_Bull"}
+    else:
+        target_signals = {"BC", "StopVol_Bear", "UT", "SOW"}
+        entry_signals = {"UT", "SOW"}
+        prepare_signals = {"BC", "StopVol_Bear"}
+
+    # 只看有效信号（priority >= 1），排除疑似信号
+    relevant = [e for e in events if e["signal"] in target_signals and e["priority"] >= 1]
+    # 疑似信号也收集，供报告展示
+    suspect = [e for e in events if e["signal"] in target_signals and e["priority"] == 0]
+
+    # 只有 priority >= 2 的入场类信号才可能触发入场
+    entry_events = [e for e in relevant if e["signal"] in entry_signals and e["priority"] >= 2]
+    prep_events = [e for e in relevant if e["signal"] in prepare_signals and e["priority"] >= 1]
+
+    current_price = float(df["close"].iloc[-1])
+
+    # --- 信号时效性: 只有近3天内的信号才算新鲜 ---
+    fresh_entry = None
+    if entry_events:
+        last_date_str = str(df.iloc[-1].get("date", df.index[-1]))[:10]
+        try:
+            from datetime import datetime as _dt
+            last_date = _dt.strptime(last_date_str, "%Y-%m-%d")
+            for evt in reversed(entry_events):
+                try:
+                    evt_date = _dt.strptime(evt["date"], "%Y-%m-%d")
+                    days_ago = (last_date - evt_date).days
+                    if days_ago <= 3:
+                        fresh_entry = evt
+                        fresh_entry["days_ago"] = days_ago
+                        break
+                except (ValueError, TypeError):
+                    continue
+        except (ValueError, TypeError):
+            pass
+
+    _no_signal = {
+        "has_signal": False,
+        "signal_type": None, "signal_date": None,
+        "signal_bar": None, "signal_detail": None,
+        "current_stage": "", "next_expected": "",
+        "confidence": 0.0,
+        "all_events": relevant, "suspect_events": suspect,
+    }
+
+    if fresh_entry is not None:
+        confidence = 0.7 if fresh_entry["signal"] in ("SOS", "SOW") else 0.55
+        if prep_events:
+            confidence = min(confidence + 0.15, 0.95)
+
+        days_ago = fresh_entry.get("days_ago", 0)
+        freshness = "今日" if days_ago == 0 else f"{days_ago}天前"
+
+        if direction == "long":
+            stage = "反转确认" if fresh_entry["signal"] == "SOS" else "反转信号出现"
+            next_exp = f"信号新鲜({freshness})，可考虑入场"
+        else:
+            stage = "反转确认" if fresh_entry["signal"] == "SOW" else "反转信号出现"
+            next_exp = f"信号新鲜({freshness})，可考虑入场"
+
+        return {
+            "has_signal": True,
+            "signal_type": fresh_entry["signal"],
+            "signal_date": fresh_entry["date"],
+            "signal_bar": fresh_entry["bar"],
+            "signal_detail": fresh_entry["detail"],
+            "current_stage": stage,
+            "next_expected": next_exp,
+            "confidence": confidence,
+            "all_events": relevant,
+            "suspect_events": suspect,
+        }
+
+    # 有老的入场信号但不新鲜
+    if entry_events:
+        old = entry_events[-1]
+        if direction == "long":
+            stage = "有信号但已过入场窗口"
+            next_exp = "等新的Spring或SOS出现"
+        else:
+            stage = "有信号但已过入场窗口"
+            next_exp = "等新的UT或SOW出现"
+
+        result = dict(_no_signal)
+        result["current_stage"] = stage
+        result["next_expected"] = next_exp
+        result["all_events"] = relevant
+        result["suspect_events"] = suspect
+        return result
+
+    if prep_events:
+        best_prep = max(prep_events, key=lambda e: e["priority"])
+        if direction == "long":
+            stage = "已见底迹象" if best_prep["signal"] == "SC" else "卖方力竭"
+            next_exp = "等Spring(假跌破收回)或SOS(放量突破)"
+        else:
+            stage = "已见顶迹象" if best_prep["signal"] == "BC" else "买方力竭"
+            next_exp = "等UT(假突破回落)或SOW(放量跌破)"
+
+        result = dict(_no_signal)
+        result["current_stage"] = stage
+        result["next_expected"] = next_exp
+        return result
+
+    if direction == "long":
+        stage = "下跌中，未见底"
+        next_exp = "等SC(放量暴跌被承接)或停止量(放量窄幅收高)"
+    else:
+        stage = "上涨中，未见顶"
+        next_exp = "等BC(放量暴涨回落)或停止量(放量窄幅收低)"
+
+    if suspect:
+        stage += f"（有{len(suspect)}个疑似信号未达标）"
+
+    result = dict(_no_signal)
+    result["current_stage"] = stage
+    result["next_expected"] = next_exp
+    return result

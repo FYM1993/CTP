@@ -201,6 +201,46 @@ def get_minute(symbol: str, period: str = "5") -> pd.DataFrame | None:
         return None
 
 
+def get_daily_with_live_bar(symbol: str, period: str = "5") -> pd.DataFrame | None:
+    """
+    获取历史日线 + 当日实时模拟日线。
+    从分钟线合成当天的 OHLCV，追加到历史日线末尾，
+    用于盘中实时检测日线级别的 Wyckoff 信号。
+    """
+    daily = get_daily(symbol)
+    if daily is None or daily.empty:
+        return None
+
+    minute = get_minute(symbol, period)
+    if minute is None or minute.empty:
+        return daily
+
+    today = pd.Timestamp.now().normalize()
+    today_bars = minute[minute["datetime"].dt.normalize() == today]
+    if today_bars.empty:
+        return daily
+
+    live_bar = pd.DataFrame([{
+        "date": today,
+        "open": float(today_bars["open"].iloc[0]),
+        "high": float(today_bars["high"].max()),
+        "low": float(today_bars["low"].min()),
+        "close": float(today_bars["close"].iloc[-1]),
+        "volume": float(today_bars["volume"].sum()),
+        "oi": float(today_bars["hold"].iloc[-1]) if "hold" in today_bars.columns else 0.0,
+    }])
+
+    daily = daily.copy()
+    if "date" in daily.columns:
+        daily["date"] = pd.to_datetime(daily["date"])
+        last_date = daily["date"].iloc[-1]
+        if last_date.normalize() == today:
+            daily = daily.iloc[:-1]
+
+    result = pd.concat([daily, live_bar], ignore_index=True)
+    return result
+
+
 # ============================================================
 #  库存数据（每日缓存）
 # ============================================================
@@ -286,44 +326,70 @@ SHFE_RECEIPT_MAP = {
     "RB0": "螺纹钢", "HC0": "热轧卷板",
     "RU0": "天然橡胶", "FU0": "燃料油", "BU0": "沥青", "SP0": "纸浆",
     "SS0": "不锈钢", "AO0": "氧化铝",
+    "SC0": "中质含硫原油", "NR0": "20号胶",
+}
+
+GFEX_RECEIPT_MAP = {
+    "LC0": "LC", "SI0": "SI",
 }
 
 _shfe_receipt_cache: dict | None = None
+_gfex_receipt_cache: dict | None = None
 
 
 def get_warehouse_receipt(symbol: str) -> dict | None:
     """
-    获取上期所仓单数据。
+    获取仓单数据（支持上期所 + 广期所）。
 
     返回:
       receipt_total: 仓单总量
       receipt_change: 仓单增减
+      exchange: 交易所来源
     """
-    global _shfe_receipt_cache
-    name = SHFE_RECEIPT_MAP.get(symbol)
-    if not name:
-        return None
+    global _shfe_receipt_cache, _gfex_receipt_cache
 
-    if _shfe_receipt_cache is None:
-        try:
-            _shfe_receipt_cache = aks.futures_shfe_warehouse_receipt()
-        except Exception:
-            _shfe_receipt_cache = {}
-            return None
+    # SHFE
+    shfe_name = SHFE_RECEIPT_MAP.get(symbol)
+    if shfe_name:
+        if _shfe_receipt_cache is None:
+            try:
+                _shfe_receipt_cache = aks.futures_shfe_warehouse_receipt()
+            except Exception:
+                _shfe_receipt_cache = {}
 
-    df = _shfe_receipt_cache.get(name)
-    if df is None or not hasattr(df, "empty") or df.empty:
-        return None
+        df = _shfe_receipt_cache.get(shfe_name)
+        if df is not None and hasattr(df, "empty") and not df.empty:
+            try:
+                total = pd.to_numeric(df["WRTWGHTS"], errors="coerce").sum()
+                change = pd.to_numeric(df["WRTCHANGE"], errors="coerce").sum()
+                return {"receipt_total": float(total), "receipt_change": float(change),
+                        "exchange": "SHFE"}
+            except Exception:
+                pass
 
-    try:
-        total = pd.to_numeric(df["WRTWGHTS"], errors="coerce").sum()
-        change = pd.to_numeric(df["WRTCHANGE"], errors="coerce").sum()
-        return {
-            "receipt_total": float(total),
-            "receipt_change": float(change),
-        }
-    except Exception:
-        return None
+    # GFEX
+    gfex_key = GFEX_RECEIPT_MAP.get(symbol)
+    if gfex_key:
+        if _gfex_receipt_cache is None:
+            try:
+                _gfex_receipt_cache = aks.futures_gfex_warehouse_receipt()
+            except Exception:
+                _gfex_receipt_cache = {}
+
+        df = _gfex_receipt_cache.get(gfex_key)
+        if df is not None and hasattr(df, "empty") and not df.empty:
+            try:
+                today_col = "今日仓单量"
+                yesterday_col = "昨日仓单量"
+                change_col = "增减"
+                total = pd.to_numeric(df[today_col], errors="coerce").sum()
+                change = pd.to_numeric(df[change_col], errors="coerce").sum()
+                return {"receipt_total": float(total), "receipt_change": float(change),
+                        "exchange": "GFEX"}
+            except Exception:
+                pass
+
+    return None
 
 
 # ============================================================
