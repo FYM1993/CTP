@@ -346,15 +346,13 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
                 fund_parts.append(f"库存分位{cand['inv_percentile']:.0f}%")
             if cand.get("receipt_change") is not None:
                 fund_parts.append(f"仓单{cand['receipt_change']:+.0f}")
-            if cand.get("oi_vs_price"):
-                fund_parts.append(cand["oi_vs_price"])
             if cand.get("fund_details"):
                 fund_parts.append(cand["fund_details"])
             fund_reason = ", ".join(fund_parts) if fund_parts else ""
 
             merged_cfg = {
                 **pre_cfg,
-                "reason": f"筛选评分{cand['score']:+.0f}(技术{cand.get('tech_score',0):+.0f}/基本面{cand.get('fund_score',0):+.0f}), {fund_reason}",
+                "reason": f"基本面筛选{cand['score']:+.0f}, {fund_reason}",
             }
             result = analyze_one(
                 symbol=cand["symbol"],
@@ -368,13 +366,11 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
                 result["fund_inv_change"] = cand.get("inv_change_4wk")
                 result["fund_inv_percentile"] = cand.get("inv_percentile")
                 result["fund_receipt_change"] = cand.get("receipt_change")
-                result["fund_oi_vs_price"] = cand.get("oi_vs_price")
                 result["fund_seasonal"] = cand.get("seasonal_signal")
                 result["fund_hog_profit"] = cand.get("hog_profit")
                 result["fund_screen_score"] = cand.get("score", 0)
-                result["fund_tech_score"] = cand.get("tech_score", 0)
-                result["fund_fund_score"] = cand.get("fund_score", 0)
                 result["fund_details"] = cand.get("fund_details", "")
+                result["signal_strength"] = result.get("reversal_status", {}).get("signal_strength", 0.0)
 
                 if result["actionable"]:
                     actionable.append(result)
@@ -410,8 +406,8 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
     print(f"{'='*60}")
 
     if actionable:
-        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'P1分':>6s} {'P2分':>6s} {'信号':>6s} {'入场':>8s} {'盈亏比':>6s}")
-        print(f"  {'─'*82}")
+        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'信号':>6s} {'强度':>5s} {'入场':>8s} {'盈亏比':>6s}")
+        print(f"  {'─'*88}")
         for a in actionable:
             rev = a.get("reversal_status", {})
             sig = rev.get("signal_type", "")
@@ -423,12 +419,13 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             r1 = a.get("rank_p1", 0)
             r2 = a.get("rank_p2", 0)
             p1 = a.get("fund_screen_score", 0)
+            ss = a.get("signal_strength", 0)
             print(f"  🟢{a['name']:8s} {a['symbol']:6s} {dir_str:4s} "
                   f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {a['score']:>+5.0f} "
-                  f"{sig_cn:6s} {a['entry']:>8.0f} {a['rr']:>5.1f}")
+                  f"{sig_cn:6s} {ss:>4.2f} {a['entry']:>8.0f} {a['rr']:>5.1f}")
     if watchlist:
-        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'P1分':>6s} {'P2分':>6s} {'等待信号'}")
-        print(f"  {'─'*78}")
+        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'强度':>5s} {'等待信号'}")
+        print(f"  {'─'*88}")
         top_watch = watchlist[:max(3, max_picks - act_count)]
         for w in top_watch:
             rev = w.get("reversal_status", {})
@@ -438,8 +435,10 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             r1 = w.get("rank_p1", 0)
             r2 = w.get("rank_p2", 0)
             p1 = w.get("fund_screen_score", 0)
+            ss = w.get("signal_strength", 0)
             print(f"  👀{w['name']:8s} {w['symbol']:6s} {dir_str:4s} "
-                  f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {w['score']:>+5.0f}  {next_exp}")
+                  f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {w['score']:>+5.0f} "
+                  f"{ss:>4.2f}  {next_exp}")
     if not actionable and not watchlist:
         print("\n  ⚠️ 没有品种通过深度分析")
 
@@ -674,8 +673,6 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             fp.append(f"库存分位{t['fund_inv_percentile']:.0f}%")
         if t.get("fund_receipt_change") is not None:
             fp.append(f"仓单{t['fund_receipt_change']:+.0f}")
-        if t.get("fund_oi_vs_price"):
-            fp.append(t["fund_oi_vs_price"])
         if t.get("fund_seasonal") is not None and abs(t["fund_seasonal"]) > 0.5:
             fp.append(f"季节性{'偏多' if t['fund_seasonal'] > 0 else '偏空'}")
         if t.get("fund_hog_profit") is not None:
@@ -687,8 +684,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
 
     if targets:
         lines.append("")
-        lines.append("| 状态 | 合约 | 方向 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | P1分 | P2分 | 基本面 |")
-        lines.append("| :---: | :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
+        lines.append("| 状态 | 合约 | 方向 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 基本面详情 |")
+        lines.append("| :---: | :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
         for t in targets:
             rev = t.get("reversal_status", {})
             sig_cn = {"Spring": "弹簧", "SOS": "强势突破", "SC": "卖方高潮",
@@ -700,19 +697,20 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             rrf = t.get("rrf_score", 0)
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
+            ss = t.get("signal_strength", 0)
             lines.append(
                 f"| ✅入场 | {t['name']}(主力) | {dir_icon} "
                 f"| {t['price']:.0f} | {signal_str} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| **{rrf:.4f}** | {r1} | {r2} "
                 f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {_build_fund_str(t)} |"
+                f"| {ss:.2f} | {_build_fund_str(t)} |"
             )
 
     if watchlist:
         lines.append("")
-        lines.append("| 合约 | 方向 | 当前价 | 等待信号 | RRF | #P1 | #P2 | P1分 | P2分 | 基本面 |")
-        lines.append("| :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | :--- |")
+        lines.append("| 合约 | 方向 | 当前价 | 等待信号 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 基本面详情 |")
+        lines.append("| :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
         for t in watchlist:
             rev = t.get("reversal_status", {})
             next_exp = rev.get("next_expected", "等待反转信号")
@@ -720,38 +718,29 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             rrf = t.get("rrf_score", 0)
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
+            ss = t.get("signal_strength", 0)
             lines.append(
                 f"| {t['name']}(主力) | {dir_icon} "
                 f"| {t['price']:.0f} | ⏳{next_exp} "
                 f"| **{rrf:.4f}** | {r1} | {r2} "
                 f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {_build_fund_str(t)} |"
+                f"| {ss:.2f} | {_build_fund_str(t)} |"
             )
 
     lines.append("")
     lines.append("## 评分说明")
     lines.append("")
-    lines.append("### Phase 1 筛选评分体系")
+    lines.append("### Phase 1 基本面筛选评分体系")
     lines.append("")
     lines.append("所有评分统一约定：**正分=偏多(做多机会)，负分=偏空(做空机会)**。分值越大信号越强。")
     lines.append("")
-    lines.append("#### 技术面维度 (±80)")
-    lines.append("")
-    lines.append("| 指标 | 满分 | 含义 |")
-    lines.append("| :--- | ---: | :--- |")
-    lines.append("| 价格区间位 | ±30 | 价格在近300日高低点间的位置。<10%极低位=+30(超跌做多), >90%极高位=-30(超涨做空) |")
-    lines.append("| RSI(14) | ±15 | 超卖(<25)=+15(做多机会), 超买(>75)=-15(做空机会) |")
-    lines.append("| 均线趋势 | ±10 | MA5/MA60比值。空头排列=+10(做多), 多头排列=-10(做空) |")
-    lines.append("| Wyckoff量价 | ±25 | 综合阶段判定、量价关系、VSA信号 |")
-    lines.append("")
-    lines.append("#### 基本面维度 (±80)")
+    lines.append("Phase 1 为纯基本面筛选，通过阈值 ≥ 10 或极端价格位（<5% 或 >95%）进入候选池。")
     lines.append("")
     lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
     lines.append("| :--- | ---: | :--- | :--- |")
     lines.append("| 库存变化 | ±20 | 东方财富(~30品种) | 去库=供不应求=+分(做多), 累库=供过于求=-分(做空) |")
     lines.append("| 库存分位 | ±10 | 东方财富 | 当前库存在52周范围内的位置。库存低位=+分(做多), 库存高位=-分(做空) |")
     lines.append("| 仓单变化 | ±15 | 上期所+广期所仓单 | 仓单减少=供应收紧=+分(做多), 仓单增加=供应压力=-分(做空) |")
-    lines.append("| 持仓结构 | ±10 | 日线OI数据 | OI+价格四象限分析 |")
     lines.append("| 季节性 | ±10 | 历史日线 | 当前月份的历史涨跌概率与平均收益率 |")
     lines.append("| 生猪专项 | ±15 | 卓创资讯 | 仅LH0: 养殖亏损=+分(价格低做多), 养殖盈利=-分(价格高做空) |")
     lines.append("")
@@ -759,7 +748,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("")
     lines.append("| 维度 | 满分 | 说明 |")
     lines.append("| :--- | ---: | :--- |")
-    lines.append("| 技术面 | ±50 | 均线排列、MACD、RSI、布林带、动量 |")
+    lines.append("| 技术面 | ±55 | 均线排列、MACD、RSI、布林带、动量、价格位置 |")
     lines.append("| 量价面 | ±35 | Wyckoff阶段、量价关系、VSA信号 |")
     lines.append("| 持仓面 | ±15 | OI价格四象限、OI背离 |")
     lines.append("")
@@ -867,11 +856,10 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                      f"量价{t.get('wyckoff_score', 0):+.1f} / "
                      f"持仓{t.get('oi_score', 0):+.1f})")
         fs = t.get("fund_screen_score")
-        ft = t.get("fund_tech_score")
-        ff = t.get("fund_fund_score")
         if fs is not None:
-            lines.append(f"- Phase 1 筛选: {fs:+.0f} "
-                         f"(技术{ft:+.0f} / 基本面{ff:+.0f})" if ft is not None else f"- Phase 1 筛选: {fs:+.0f}")
+            lines.append(f"- Phase 1 基本面筛选: {fs:+.0f}")
+        ss = t.get("signal_strength", 0)
+        lines.append(f"- 信号强度: {ss:.2f}")
         if not t.get("actionable", True):
             rev_info = t.get("reversal_status", {})
             reasons = []
@@ -902,9 +890,6 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             has_any = True
         if t.get("fund_receipt_change") is not None:
             lines.append(f"- 仓单日增减: {t['fund_receipt_change']:+.0f}")
-            has_any = True
-        if t.get("fund_oi_vs_price"):
-            lines.append(f"- 持仓-价格关系: {t['fund_oi_vs_price']}")
             has_any = True
         if t.get("fund_seasonal") is not None:
             sig = t["fund_seasonal"]
