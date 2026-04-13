@@ -771,6 +771,7 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                 close_ok = cp > 0.5  # 收盘偏高，买方承接有力
 
                 if context_ok and vol_ok and close_ok:
+                    # 经典 Spring: 缩量试探 + 收盘偏高
                     events.append({
                         "signal": "Spring", "date": date_str, "bias": "bullish",
                         "bar": bar,
@@ -779,13 +780,25 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                         "ref_level": prev_low, "priority": 3,
                     })
                     seen_signals.add("Spring")
+                elif context_ok and rv >= 1.5 and cp > 0.6:
+                    # 带力弹簧: 放量但强力收回（主力底部吸筹）
+                    events.append({
+                        "signal": "Spring", "date": date_str, "bias": "bullish",
+                        "bar": bar,
+                        "detail": f"带力弹簧: 跌破前低{prev_low:.0f}后强力收回{cp:.0%}位, "
+                                  f"放量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
+                        "ref_level": prev_low, "priority": 2,
+                    })
+                    seen_signals.add("Spring")
                 else:
                     reasons = []
                     if not context_ok:
                         reasons.append("无横盘且下跌未放缓")
-                    if not vol_ok:
+                    if not vol_ok and cp <= 0.6:
+                        reasons.append(f"放量(量比{rv:.1f})且收盘不够强({cp:.0%})")
+                    elif not vol_ok:
                         reasons.append(f"放量(量比{rv:.1f})非缩量试探")
-                    if not close_ok:
+                    if not close_ok and rv < 1.5:
                         reasons.append(f"收盘偏低({cp:.0%})")
                     events.append({
                         "signal": "Spring", "date": date_str, "bias": "bullish",
@@ -814,13 +827,25 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                         "ref_level": prev_high, "priority": 3,
                     })
                     seen_signals.add("UT")
+                elif context_ok and rv >= 1.5 and cp < 0.4:
+                    # 带力上冲回落: 放量但强力回落（主力顶部派发）
+                    events.append({
+                        "signal": "UT", "date": date_str, "bias": "bearish",
+                        "bar": bar,
+                        "detail": f"带力UT: 突破前高{prev_high:.0f}后强力回落{cp:.0%}位, "
+                                  f"放量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
+                        "ref_level": prev_high, "priority": 2,
+                    })
+                    seen_signals.add("UT")
                 else:
                     reasons = []
                     if not context_ok:
                         reasons.append("无横盘且上涨未放缓")
-                    if not vol_ok:
+                    if not vol_ok and cp >= 0.4:
+                        reasons.append(f"放量(量比{rv:.1f})且回落不够深({cp:.0%})")
+                    elif not vol_ok:
                         reasons.append(f"放量(量比{rv:.1f})")
-                    if not close_ok:
+                    if not close_ok and rv < 1.5:
                         reasons.append(f"收盘偏高({cp:.0%})")
                     events.append({
                         "signal": "UT", "date": date_str, "bias": "bearish",
