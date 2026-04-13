@@ -38,13 +38,13 @@ import pandas as pd
 from data_cache import (
     get_all_symbols, get_daily, get_minute, get_inventory,
     get_warehouse_receipt, get_hog_fundamentals,
-    get_seasonality, get_oi_structure,
+    get_seasonality,
     prefetch_all, get_request_count,
     get_daily_with_live_bar,
 )
 from pre_market import analyze_one, score_signals
 from intraday import print_dashboard
-from wyckoff import wyckoff_score, assess_reversal_status
+from wyckoff import assess_reversal_status
 
 
 def load_config() -> dict:
@@ -108,9 +108,9 @@ def phase_0_prefetch() -> dict[str, pd.DataFrame]:
 #  Phase 1: 全市场筛选（纯本地计算）
 # ============================================================
 
-def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 25) -> list[dict]:
+def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 10) -> list[dict]:
     print("\n" + "▓" * 60)
-    print("▓  Phase 1: 全市场筛选")
+    print("▓  Phase 1: 全市场基本面筛选")
     print("▓" * 60)
 
     symbols = get_all_symbols()
@@ -123,22 +123,33 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 25) -> 
             continue
 
         result = _score_symbol(sym, info["name"], info["exchange"], df)
-        if result and abs(result["score"]) >= threshold:
-            result["direction"] = "long" if result["score"] > 0 else "short"
+        if result is None:
+            continue
+
+        fund_pass = abs(result["score"]) >= threshold
+        extreme_price = result["range_pct"] < 5 or result["range_pct"] > 95
+
+        if fund_pass or extreme_price:
+            if fund_pass:
+                result["direction"] = "long" if result["score"] > 0 else "short"
+            else:
+                result["direction"] = "long" if result["range_pct"] < 50 else "short"
+                result["score"] = 1.0 if result["direction"] == "long" else -1.0
             candidates.append(result)
 
     candidates.sort(key=lambda x: abs(x["score"]), reverse=True)
 
-    print(f"\n  ✅ 通过筛选 (|评分| ≥ {threshold}): {len(candidates)} 个品种\n")
+    print(f"\n  ✅ 通过筛选 (|基本面| ≥ {threshold} 或极端价格): {len(candidates)} 个品种\n")
 
     long_cands = [c for c in candidates if c["direction"] == "long"]
     short_cands = [c for c in candidates if c["direction"] == "short"]
 
     def _print_cand(c):
+        extreme = " ⚡极端价格" if (c["range_pct"] < 5 or c["range_pct"] > 95) else ""
         line = (f"     {c['name']:6s} ({c['symbol']:5s})  "
-                f"区间位{c['range_pct']:3.0f}%  RSI={c['rsi']:.0f}  "
-                f"技术={c.get('tech_score', 0):+.0f}  基本面={c.get('fund_score', 0):+.0f}  "
-                f"总分={c['score']:+.0f}")
+                f"区间位{c['range_pct']:3.0f}%  "
+                f"基本面={c.get('fund_score', 0):+.0f}  "
+                f"总分={c['score']:+.0f}{extreme}")
         fd = c.get("fund_details", "")
         if fd:
             line += f"  [{fd}]"
@@ -158,12 +169,11 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 25) -> 
 
 def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict | None:
     """
-    对单品种计算筛选评分。
+    对单品种计算筛选评分（纯基本面）。
 
     评分维度:
-      技术面: 价格位置(±30), RSI(±15), 均线趋势(±10), Wyckoff量价(±25)
       基本面: 库存水平(±20), 库存分位(±10), 仓单变化(±15),
-              持仓结构(±10), 季节性(±10), 生猪专项(±15)
+              季节性(±10), 生猪专项(±15)
     """
     try:
         close = df["close"]
@@ -187,44 +197,17 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
         ret_5d = (last / float(close.iloc[-6]) - 1) * 100 if len(close) > 6 else 0
         ret_20d = (last / float(close.iloc[-21]) - 1) * 100 if len(close) > 21 else 0
 
-        wk = wyckoff_score(df) if len(df) > 60 else {}
-        wk_phase = wk.get("phase", "")
-        wk_composite = wk.get("composite", 0)
-
         # ---- 基本面数据采集 ----
         inv = get_inventory(sym)
         receipt = get_warehouse_receipt(sym)
-        oi_struct = get_oi_structure(df)
         seasonal = get_seasonality(df)
         hog = get_hog_fundamentals() if sym == "LH0" else None
-
-        # ---- 技术面评分 ----
-        tech_score = 0.0
-
-        if range_pct < 10: tech_score -= 30
-        elif range_pct < 20: tech_score -= 20
-        elif range_pct < 30: tech_score -= 10
-        elif range_pct > 90: tech_score += 30
-        elif range_pct > 80: tech_score += 20
-        elif range_pct > 70: tech_score += 10
-
-        if rsi < 25: tech_score -= 15
-        elif rsi < 35: tech_score -= 8
-        elif rsi > 75: tech_score += 15
-        elif rsi > 65: tech_score += 8
-
-        if ma_trend < -5: tech_score -= 10
-        elif ma_trend < -2: tech_score -= 5
-        elif ma_trend > 5: tech_score += 10
-        elif ma_trend > 2: tech_score += 5
-
-        tech_score += np.clip(wk_composite, -25, 25)
 
         # ---- 基本面评分 ----
         fund_score = 0.0
         fund_details = []
 
-        # 库存变化 (±20)
+        # 库存变化 (±20) — same logic as before
         inv_4wk = None
         inv_pct = None
         if inv:
@@ -242,7 +225,7 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
 
             fund_details.append(f"库存{trend}({inv_4wk:+.1f}%)")
 
-        # 库存分位 (±10): 库存极高=做空信号，库存极低=做多信号
+        # 库存分位 (±10) — same logic
         if inv_pct is not None:
             if inv_pct > 85:
                 fund_score += 10
@@ -255,7 +238,7 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
             elif inv_pct < 30:
                 fund_score -= 5
 
-        # 仓单 (±15): 仓单增加=供应压力=价格下行信号
+        # 仓单 (±15) — same logic
         receipt_change = None
         if receipt:
             rc = receipt["receipt_change"]
@@ -276,28 +259,7 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
                 elif change_ratio > 0.01:
                     fund_score -= 8
 
-        # 持仓结构 (±10)
-        oi_pct = None
-        oi_vs_price = None
-        if oi_struct:
-            oi_pct = oi_struct["oi_percentile"]
-            oi_vs_price = oi_struct["oi_vs_price"]
-            if oi_vs_price == "增仓上涨":
-                fund_score += 5
-            elif oi_vs_price == "增仓下跌":
-                fund_score += 5
-            elif oi_vs_price == "减仓上涨":
-                fund_score -= 5
-            elif oi_vs_price == "减仓下跌":
-                fund_score -= 5
-
-            if oi_pct > 80:
-                fund_score += 5
-                fund_details.append(f"持仓高位{oi_pct:.0f}%")
-            elif oi_pct < 20:
-                fund_score -= 5
-
-        # 季节性 (±10)
+        # 季节性 (±10) — same logic
         seasonal_sig = None
         if seasonal:
             sig = seasonal["seasonal_signal"]
@@ -309,7 +271,7 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
                 direction = "上涨" if sig > 0 else "下跌"
                 fund_details.append(f"季节性偏{direction}(历史{avg_ret:+.1f}%)")
 
-        # 生猪专项 (±15)
+        # 生猪专项 (±15) — same logic
         hog_profit = None
         if hog:
             if "profit_margin" in hog:
@@ -332,26 +294,20 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
                 elif pt > 3:
                     fund_score += 5
 
-        # 翻转符号统一约定: 正分=看多(做多), 负分=看空(做空)
-        # 内部计算中: 价格低位→负分, 库存高→正分 (即"当前状态"的描述)
-        # 翻转后:     价格低位→正分(应买), 库存高→负分(应卖)
-        score = -(tech_score + fund_score)
+        score = -fund_score
 
         return {
             "symbol": sym, "name": name, "exchange": exchange,
             "price": last, "range_pct": range_pct,
             "rsi": rsi, "ma_trend": ma_trend,
             "ret_5d": ret_5d, "ret_20d": ret_20d,
-            "wyckoff_phase": wk_phase,
+            "wyckoff_phase": "",
             "score": score,
-            "tech_score": -tech_score,
             "fund_score": -fund_score,
             "fund_details": ", ".join(fund_details) if fund_details else "",
             "inv_change_4wk": inv_4wk,
             "inv_percentile": inv_pct,
             "receipt_change": receipt_change,
-            "oi_percentile": oi_pct,
-            "oi_vs_price": oi_vs_price,
             "seasonal_signal": seasonal_sig,
             "hog_profit": hog_profit,
         }
@@ -1012,7 +968,7 @@ def main():
     parser.add_argument("--no-monitor", action="store_true", help="跳过盘中监控")
     parser.add_argument("--skip-screen", action="store_true", help="跳过筛选，用config.yaml品种")
     parser.add_argument("--resume", action="store_true", help="恢复今日分析，直接监控")
-    parser.add_argument("--threshold", type=float, default=25, help="筛选阈值 (默认25)")
+    parser.add_argument("--threshold", type=float, default=10, help="筛选阈值 (默认10)")
     parser.add_argument("--max-picks", type=int, default=6, help="最多跟踪品种数")
     parser.add_argument("--period", default="5", choices=["1", "5", "15", "30", "60"], help="K线周期")
     parser.add_argument("--interval", type=int, default=60, help="监控刷新间隔(秒)")
