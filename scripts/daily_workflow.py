@@ -304,16 +304,17 @@ def _score_symbol(
         if hog:
             if "profit_margin" in hog:
                 pm = hog["profit_margin"]
-                hog_profit = pm
-                if pm < -15:
-                    fund_score += 15
-                    fund_details.append(f"养殖亏损{pm:.0f}%")
-                elif pm < -5:
-                    fund_score += 8
-                elif pm > 20:
-                    fund_score -= 10
-                elif pm > 10:
-                    fund_score -= 5
+                if pm is not None:
+                    hog_profit = pm
+                    if pm < -15:
+                        fund_score += 15
+                        fund_details.append(f"养殖亏损{pm:.0f}%")
+                    elif pm < -5:
+                        fund_score += 8
+                    elif pm > 20:
+                        fund_score -= 10
+                    elif pm > 10:
+                        fund_score -= 5
 
             if "price_trend" in hog:
                 pt = hog["price_trend"]
@@ -845,8 +846,10 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 tag_cells.append("逆势")
             tag_str = "/".join(tag_cells) if tag_cells else "-"
             epr = _md_cell(t.get("entry_pool_reason") or "-")
+            name_cell = _md_cell(f"{t['name']}(主力)")
+            dir_cell = _md_cell(dir_icon)
             lines.append(
-                f"| ✅入场 | {t['name']}(主力) | {dir_icon} "
+                f"| {_md_cell('✅入场')} | {name_cell} | {dir_cell} "
                 f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| **{rrf:.4f}** | {r1} | {r2} "
@@ -877,9 +880,11 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             epr = _md_cell(t.get("entry_pool_reason") or "-")
             wtag_cell = "/".join(wtags) if wtags else "-"
             rrf_cell = _md_cell(f"**{rrf:.4f}**{conflict_tag}")
+            name_cell = _md_cell(f"{t['name']}(主力)")
+            dir_cell = _md_cell(dir_icon)
             lines.append(
-                f"| {t['name']}(主力) | {dir_icon} "
-                f"| {epr} | {t['price']:.0f} | ⏳{_md_cell(next_exp)} "
+                f"| {name_cell} | {dir_cell} "
+                f"| {epr} | {t['price']:.0f} | {_md_cell(f'⏳{next_exp}')} "
                 f"| {rrf_cell} | {r1} | {r2} "
                 f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
                 f"| {ss:.2f} | {_md_cell(wtag_cell)} | {_md_cell(_build_fund_str(t))} |"
@@ -1128,23 +1133,23 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     print(f"     📊 {json_path}")
 
 
-def load_targets() -> tuple[list[dict] | None, list[dict]]:
+def load_targets() -> tuple[list[dict], list[dict]] | None:
     """
-    读取当日 ``_targets.json``。成功且日期为今天时返回 ``(targets, watchlist)``；
-    失败或日期不符时返回 ``(None, [])``。
+    读取当日 ``_targets.json``。成功且日期为今天时返回 ``(targets, watchlist)``（可为空列表）；
+    文件缺失、解析失败或日期不符时返回 ``None``。
     """
     json_path = _today_json_path()
     if not json_path.exists():
-        return None, []
+        return None
     try:
         payload = json.loads(json_path.read_text())
         if payload.get("date") == datetime.now().strftime("%Y-%m-%d"):
             targets = payload.get("targets") or []
             watchlist = payload.get("watchlist") or []
-            return targets, watchlist
+            return (targets, watchlist)
     except Exception:
         pass
-    return None, []
+    return None
 
 
 # ============================================================
@@ -1172,17 +1177,19 @@ def main():
 
     # --- 恢复模式 ---
     if args.resume:
-        targets, watchlist_resumed = load_targets()
-        if targets:
+        snapshot = load_targets()
+        if snapshot is not None:
+            targets, watchlist_resumed = snapshot
             print(f"\n  📂 恢复今日目标: {len(targets)} 个可操作, "
                   f"{len(watchlist_resumed)} 个观望")
+            if not targets and not watchlist_resumed:
+                print("     （当日缓存无品种条目；仍将进入监控流程或按无标的退出）")
             for t in targets:
                 dir_str = "做多" if t["direction"] == "long" else "做空"
                 print(f"     {t['name']} ({t['symbol']}) {dir_str}  评分{t['score']:+.0f}")
-            if watchlist_resumed:
-                for w in watchlist_resumed:
-                    dir_str = "做多" if w["direction"] == "long" else "做空"
-                    print(f"     👀 {w['name']} ({w['symbol']}) {dir_str}  评分{w['score']:+.0f} [观望]")
+            for w in watchlist_resumed:
+                dir_str = "做多" if w["direction"] == "long" else "做空"
+                print(f"     👀 {w['name']} ({w['symbol']}) {dir_str}  评分{w['score']:+.0f} [观望]")
             if not args.no_monitor:
                 phase_3_intraday(
                     targets,
