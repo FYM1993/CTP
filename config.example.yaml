@@ -3,9 +3,14 @@
 
 # 数据源配置
 data:
-  source: "akshare"
+  source: "tqsdk"
   start_date: "20200101"
   output_dir: "./data/futures"
+
+# TqSdk 配置
+tqsdk:
+  account: ""    # 快期账户
+  password: ""   # 账户密码
 
 # ==================== 交易品种 ====================
 # 基于基本面筛选的品种及策略方向
