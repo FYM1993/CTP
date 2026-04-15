@@ -53,6 +53,20 @@ pre_market:
   # 目标价位
   fib_levels: [0.236, 0.382, 0.5, 0.618, 0.786]
 
+# 基本面筛选门槛与分类
+fundamental_screening:
+  default_threshold: 10
+  categories:
+    high_sensitivity:  # 高敏感度 (微小变化即信号)
+      threshold: 3
+      symbols: ["LH0"]
+    agricultural:      # 农产品
+      threshold: 8
+      symbols: ["A0", "M0", "RM0", "C0", "CS0", "CF0", "SR0"]
+    low_sensitivity:   # 低敏感度/高波动 (需极端数据)
+      threshold: 15
+      symbols: ["AU0", "AG0", "LC0", "SI0"]
+
 # ==================== 日内策略参数 ====================
 intraday:
   # 突破策略
