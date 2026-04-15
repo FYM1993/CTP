@@ -113,6 +113,23 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 10) -> 
     print("▓  Phase 1: 全市场基本面筛选")
     print("▓" * 60)
 
+    cfg = load_config()
+    fs = cfg.get("fundamental_screening") or {}
+    default_thr = (
+        float(fs["default_threshold"])
+        if fs.get("default_threshold") is not None
+        else float(threshold)
+    )
+    sym_to_threshold: dict[str, float] = {}
+    for cat_cfg in (fs.get("categories") or {}).values():
+        if not isinstance(cat_cfg, dict):
+            continue
+        if cat_cfg.get("threshold") is None:
+            continue
+        t = float(cat_cfg["threshold"])
+        for s in cat_cfg.get("symbols") or []:
+            sym_to_threshold[str(s)] = t
+
     symbols = get_all_symbols()
     candidates = []
 
@@ -122,24 +139,41 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 10) -> 
         if df is None or len(df) < 60:
             continue
 
-        result = _score_symbol(sym, info["name"], info["exchange"], df)
+        eff_threshold = sym_to_threshold.get(sym, default_thr)
+        result = _score_symbol(
+            sym, info["name"], info["exchange"], df, threshold=eff_threshold
+        )
         if result is None:
             continue
 
-        fund_pass = abs(result["score"]) >= threshold
+        fund_pass = abs(result["score"]) >= eff_threshold
         extreme_price = result["range_pct"] < 5 or result["range_pct"] > 95
 
         if fund_pass or extreme_price:
+            pool_parts = []
+            if fund_pass:
+                # 避免字符串含 ASCII |，否则 Markdown 表格列会错位
+                pool_parts.append(
+                    f"基本面达标(绝对值≥{eff_threshold:g}，当前{result['score']:+.0f})"
+                )
+            if extreme_price:
+                pool_parts.append(f"极端价位(区间位{result['range_pct']:.0f}%)")
+            result["entry_pool_reason"] = "；".join(pool_parts)
+
             if fund_pass:
                 result["direction"] = "long" if result["score"] > 0 else "short"
             else:
                 result["direction"] = "long" if result["range_pct"] < 50 else "short"
-                result["score"] = 1.0 if result["direction"] == "long" else -1.0
+                if result["score"] == 0:
+                    result["score"] = 1.0 if result["direction"] == "long" else -1.0
             candidates.append(result)
 
     candidates.sort(key=lambda x: abs(x["score"]), reverse=True)
 
-    print(f"\n  ✅ 通过筛选 (|基本面| ≥ {threshold} 或极端价格): {len(candidates)} 个品种\n")
+    print(
+        f"\n  ✅ 通过筛选 (|基本面| 达各品种门槛，默认{default_thr:g}；或极端价格): "
+        f"{len(candidates)} 个品种\n"
+    )
 
     long_cands = [c for c in candidates if c["direction"] == "long"]
     short_cands = [c for c in candidates if c["direction"] == "short"]
@@ -167,7 +201,13 @@ def phase_1_screen(all_data: dict[str, pd.DataFrame], threshold: float = 10) -> 
     return candidates
 
 
-def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict | None:
+def _score_symbol(
+    sym: str,
+    name: str,
+    exchange: str,
+    df: pd.DataFrame,
+    threshold: float = 10.0,
+) -> dict | None:
     """
     对单品种计算筛选评分（纯基本面）。
 
@@ -184,18 +224,6 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
         high_all = float(recent["close"].max())
         low_all = float(recent["close"].min())
         range_pct = (last - low_all) / (high_all - low_all + 1e-12) * 100
-
-        delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = float((100 - 100 / (1 + gain / (loss + 1e-12))).iloc[-1])
-
-        ma5 = float(close.rolling(5).mean().iloc[-1])
-        ma60 = float(close.rolling(min(60, len(close))).mean().iloc[-1])
-        ma_trend = (ma5 / ma60 - 1) * 100
-
-        ret_5d = (last / float(close.iloc[-6]) - 1) * 100 if len(close) > 6 else 0
-        ret_20d = (last / float(close.iloc[-21]) - 1) * 100 if len(close) > 21 else 0
 
         # ---- 基本面数据采集 ----
         inv = get_inventory(sym)
@@ -216,26 +244,26 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
             cum = inv.get("inv_cumulating_weeks", 4)
             trend = inv.get("inv_trend", "持平")
 
-            if inv_4wk > 10: fund_score += 10
-            elif inv_4wk > 3: fund_score += 5
-            elif inv_4wk < -10: fund_score -= 10
-            elif inv_4wk < -3: fund_score -= 5
-            if cum >= 6: fund_score += 10
-            elif cum <= 2: fund_score -= 10
+            if inv_4wk < -10: fund_score += 10
+            elif inv_4wk < -3: fund_score += 5
+            elif inv_4wk > 10: fund_score -= 10
+            elif inv_4wk > 3: fund_score -= 5
+            if cum <= 2: fund_score += 10
+            elif cum >= 6: fund_score -= 10
 
             fund_details.append(f"库存{trend}({inv_4wk:+.1f}%)")
 
         # 库存分位 (±10) — same logic
         if inv_pct is not None:
-            if inv_pct > 85:
+            if inv_pct < 15:
                 fund_score += 10
-                fund_details.append(f"库存高位{inv_pct:.0f}%")
-            elif inv_pct > 70:
-                fund_score += 5
-            elif inv_pct < 15:
-                fund_score -= 10
                 fund_details.append(f"库存低位{inv_pct:.0f}%")
             elif inv_pct < 30:
+                fund_score += 5
+            elif inv_pct > 85:
+                fund_score -= 10
+                fund_details.append(f"库存高位{inv_pct:.0f}%")
+            elif inv_pct > 70:
                 fund_score -= 5
 
         # 仓单 (±15) — same logic
@@ -244,18 +272,18 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
             rc = receipt["receipt_change"]
             receipt_change = rc
             rt = receipt["receipt_total"]
-            if rc > 0 and rt > 0:
-                change_ratio = rc / (rt + 1e-12)
-                if change_ratio > 0.05:
-                    fund_score += 15
-                    fund_details.append(f"仓单大增{rc:+.0f}")
-                elif change_ratio > 0.01:
-                    fund_score += 8
-            elif rc < 0 and rt > 0:
+            if rc < 0 and rt > 0:
                 change_ratio = abs(rc) / (rt + 1e-12)
                 if change_ratio > 0.05:
-                    fund_score -= 15
+                    fund_score += 15
                     fund_details.append(f"仓单大减{rc:+.0f}")
+                elif change_ratio > 0.01:
+                    fund_score += 8
+            elif rc > 0 and rt > 0:
+                change_ratio = rc / (rt + 1e-12)
+                if change_ratio > 0.05:
+                    fund_score -= 15
+                    fund_details.append(f"仓单大增{rc:+.0f}")
                 elif change_ratio > 0.01:
                     fund_score -= 8
 
@@ -278,38 +306,48 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
                 pm = hog["profit_margin"]
                 hog_profit = pm
                 if pm < -15:
-                    fund_score -= 15
+                    fund_score += 15
                     fund_details.append(f"养殖亏损{pm:.0f}%")
                 elif pm < -5:
-                    fund_score -= 8
+                    fund_score += 8
                 elif pm > 20:
-                    fund_score += 10
+                    fund_score -= 10
                 elif pm > 10:
-                    fund_score += 5
+                    fund_score -= 5
 
             if "price_trend" in hog:
                 pt = hog["price_trend"]
                 if pt < -3:
-                    fund_score -= 5
-                elif pt > 3:
                     fund_score += 5
+                elif pt > 3:
+                    fund_score -= 5
 
-        score = -fund_score
+        # LH0：成本/利润率数据缺失时按价格区间位补偿 (Option B)
+        hog_margin_missing = sym == "LH0" and (
+            hog is None or "profit_margin" not in hog
+        )
+        if hog_margin_missing:
+            if range_pct < 5:
+                fund_score += 10
+                fund_details.append("数据缺失但处于历史极低位(补偿+10)")
+            elif range_pct < 15:
+                fund_score += 5
+                fund_details.append("数据缺失但处于历史低位(补偿+5)")
+
+        score = fund_score
 
         return {
             "symbol": sym, "name": name, "exchange": exchange,
             "price": last, "range_pct": range_pct,
-            "rsi": rsi, "ma_trend": ma_trend,
-            "ret_5d": ret_5d, "ret_20d": ret_20d,
-            "wyckoff_phase": "",
             "score": score,
-            "fund_score": -fund_score,
+            "fund_score": fund_score,
             "fund_details": ", ".join(fund_details) if fund_details else "",
             "inv_change_4wk": inv_4wk,
             "inv_percentile": inv_pct,
             "receipt_change": receipt_change,
             "seasonal_signal": seasonal_sig,
             "hog_profit": hog_profit,
+            "fund_threshold": threshold,
         }
     except Exception as e:
         return None
@@ -318,6 +356,18 @@ def _score_symbol(sym: str, name: str, exchange: str, df: pd.DataFrame) -> dict 
 # ============================================================
 #  Phase 2: 盘前深度分析（读缓存）
 # ============================================================
+
+def _phase_scores_support_direction(direction: str, fund: float, p2: float) -> bool:
+    """
+    约定：正分=偏多、负分=偏空。P1/P2 符号是否均支持计划交易方向（共振）。
+    仅用于报告/标签「逆势」，**不**再作为可操作门槛（选项：允许逆势参与但须明示）。
+    """
+    if direction == "long":
+        return fund > 0 and p2 > 0
+    if direction == "short":
+        return fund < 0 and p2 < 0
+    return False
+
 
 def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) -> tuple[list[dict], list[dict]]:
     """
@@ -338,8 +388,6 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             fund_parts = []
             if "range_pct" in cand:
                 fund_parts.append(f"区间位{cand['range_pct']:.0f}%")
-            if "rsi" in cand:
-                fund_parts.append(f"RSI={cand['rsi']:.0f}")
             if cand.get("inv_change_4wk") is not None:
                 fund_parts.append(f"库存4周{cand['inv_change_4wk']:+.1f}%")
             if cand.get("inv_percentile") is not None:
@@ -353,6 +401,7 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             merged_cfg = {
                 **pre_cfg,
                 "reason": f"基本面筛选{cand['score']:+.0f}, {fund_reason}",
+                "fund_screen_score": cand.get("score", 0),
             }
             result = analyze_one(
                 symbol=cand["symbol"],
@@ -362,7 +411,6 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             )
             if result:
                 result["fund_range_pct"] = cand.get("range_pct", 0)
-                result["fund_rsi"] = cand.get("rsi", 50)
                 result["fund_inv_change"] = cand.get("inv_change_4wk")
                 result["fund_inv_percentile"] = cand.get("inv_percentile")
                 result["fund_receipt_change"] = cand.get("receipt_change")
@@ -371,6 +419,12 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
                 result["fund_screen_score"] = cand.get("score", 0)
                 result["fund_details"] = cand.get("fund_details", "")
                 result["signal_strength"] = result.get("reversal_status", {}).get("signal_strength", 0.0)
+                result["score_signs_support_direction"] = _phase_scores_support_direction(
+                    cand["direction"],
+                    float(result.get("fund_screen_score", 0)),
+                    float(result.get("score", 0)),
+                )
+                result["entry_pool_reason"] = cand.get("entry_pool_reason", "")
 
                 if result["actionable"]:
                     actionable.append(result)
@@ -382,6 +436,7 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
     # RRF (Reciprocal Rank Fusion): 按排名融合 P1 和 P2
     # k=10 适合候选数 10~30 的场景，让 top 排名拉开差距
     RRF_K = 10
+    DIRECTION_PENALTY = 0.5  # P1/P2 方向冲突时 RRF 打五折
     all_results = actionable + watchlist
     if all_results:
         p1_ranked = sorted(all_results, key=lambda x: abs(x.get("fund_screen_score", 0)), reverse=True)
@@ -391,7 +446,15 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
         for r in all_results:
             r1 = p1_rank[id(r)]
             r2 = p2_rank[id(r)]
-            r["rrf_score"] = 1.0 / (RRF_K + r1) + 1.0 / (RRF_K + r2)
+            raw_rrf = 1.0 / (RRF_K + r1) + 1.0 / (RRF_K + r2)
+            p1_score = r.get("fund_screen_score", 0)
+            p2_score = r.get("score", 0)
+            if p1_score != 0 and p2_score != 0 and (p1_score > 0) != (p2_score > 0):
+                r["rrf_score"] = raw_rrf * DIRECTION_PENALTY
+                r["direction_conflict"] = True
+            else:
+                r["rrf_score"] = raw_rrf
+                r["direction_conflict"] = False
             r["rank_p1"] = r1
             r["rank_p2"] = r2
 
@@ -413,7 +476,8 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             sig = rev.get("signal_type", "")
             sig_cn = {"Spring": "弹簧", "SOS": "SOS", "SC": "SC",
                       "UT": "UT", "SOW": "SOW", "BC": "BC",
-                      "StopVol_Bull": "停止量", "StopVol_Bear": "停止量"}.get(sig, sig)
+                      "StopVol_Bull": "停止量", "StopVol_Bear": "停止量",
+                      "Pullback": "回撤", "TrendBreak": "突破"}.get(sig, sig)
             dir_str = "做多" if a["direction"] == "long" else "做空"
             rrf = a.get("rrf_score", 0)
             r1 = a.get("rank_p1", 0)
@@ -424,7 +488,7 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
                   f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {a['score']:>+5.0f} "
                   f"{sig_cn:6s} {ss:>4.2f} {a['entry']:>8.0f} {a['rr']:>5.1f}")
     if watchlist:
-        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'强度':>5s} {'等待信号'}")
+        print(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'强度':>5s} {'系统提示'}")
         print(f"  {'─'*88}")
         top_watch = watchlist[:max(3, max_picks - act_count)]
         for w in top_watch:
@@ -436,9 +500,17 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
             r2 = w.get("rank_p2", 0)
             p1 = w.get("fund_screen_score", 0)
             ss = w.get("signal_strength", 0)
+            tags = []
+            if w.get("direction_conflict"):
+                tags.append("P1P2异号")
+            if not w.get("score_signs_support_direction", True):
+                tags.append("逆势")
+            conflict = f" ⚠️{'/'.join(tags)}" if tags else ""
+            pool_hint = (w.get("entry_pool_reason") or "")[:28]
+            pool_suffix = f" | {pool_hint}" if pool_hint else ""
             print(f"  👀{w['name']:8s} {w['symbol']:6s} {dir_str:4s} "
                   f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {w['score']:>+5.0f} "
-                  f"{ss:>4.2f}  {next_exp}")
+                  f"{ss:>4.2f}  {next_exp}{conflict}{pool_suffix}")
     if not actionable and not watchlist:
         print("\n  ⚠️ 没有品种通过深度分析")
 
@@ -479,7 +551,8 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
     print(f"\n  🚀 监控启动！按 Ctrl+C 停止\n")
 
     SIG_CN = {"Spring": "弹簧", "SOS": "强势突破", "UT": "上冲回落", "SOW": "弱势跌破",
-              "SC": "卖方高潮", "BC": "买方高潮", "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)"}
+              "SC": "卖方高潮", "BC": "买方高潮", "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)",
+              "Pullback": "顺势回撤", "TrendBreak": "顺势突破"}
 
     # 记录上轮每个品种的信号状态，用于检测信号出现/消失
     prev_signals: dict[str, bool] = {}
@@ -530,7 +603,7 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
                                      f"C:{live_row['close']:.0f}")
 
                         if has_signal and not had_signal:
-                            # 信号刚出现
+                            # 信号刚出现（观望品种：形态层与综合分可能不一致）
                             sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
                             sig_bar = rev.get("signal_bar", {})
                             dir_cn = "做多" if w["direction"] == "long" else "做空"
@@ -540,16 +613,32 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
                             else:
                                 confirm = f"收盘维持在 {sig_bar.get('high', 0):.0f} 以下"
 
-                            print(f"  🔔🔔 {w['name']} 出现反转信号！")
-                            print(f"       信号: {sig_cn} | 方向: {dir_cn}")
-                            print(f"       {live_info}")
-                            print(f"       确认条件: {confirm}")
-                            print(f"       置信度: {rev['confidence']:.0%}")
+                            aligned = w.get("score_signs_support_direction", True)
+                            pool_r = w.get("entry_pool_reason") or ""
+                            pool_line = f"       入池理由: {pool_r}" if pool_r else ""
+                            if aligned:
+                                print(f"  🔔🔔 {w['name']} 出现反转信号（P1/P2 与计划方向共振）")
+                                print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
+                                if pool_line:
+                                    print(pool_line)
+                                print(f"       {live_info}")
+                                print(f"       确认条件: {confirm}")
+                                print(f"       置信度: {rev['confidence']:.0%}")
+                            else:
+                                print(f"  🔔 {w['name']} 出现反转信号（逆势：P1/P2 读数与计划方向未共振，见报告「入池理由/⚠️逆势」）")
+                                print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
+                                if pool_line:
+                                    print(pool_line)
+                                print(f"       {live_info}")
+                                print(f"       确认条件: {confirm}")
+                                print(f"       置信度: {rev['confidence']:.0%}")
 
                         elif has_signal and had_signal:
                             # 信号持续中
                             sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
-                            print(f"  🟢 {w['name']}: {sig_cn}信号持续 | {live_info}")
+                            al = w.get("score_signs_support_direction", True)
+                            tag = "" if al else "（逆势未解除）"
+                            print(f"  🟢 {w['name']}: {sig_cn}信号持续{tag} | {live_info}")
 
                         elif not has_signal and had_signal:
                             # 信号消失
@@ -655,13 +744,26 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     if has_actionable:
         lines.append("## 可操作品种一览")
     elif has_watchlist:
-        lines.append("## 今日观望（无品种满足入场条件）")
+        lines.append("## 今日观望（尚无可操作品种）")
         lines.append("")
-        lines.append("> 以下品种基本面有信号，但尚无有效反转信号或技术面未确认方向，暂不建议入场。")
+        lines.append(
+            "> **未满足可操作三要件**：① 有效入场信号 ② Phase 2 达标（做多>+20 / 做空<-20）③ 盈亏比≥1。"
+        )
+        lines.append(
+            "> **方向**由 Phase 1 **入池理由**决定（基本面达标或极端价位），**不是** P1+P2 分数的合成结果。"
+            "若 RRF 旁有 **⚠️逆势**，表示 P1/P2 读数与计划方向未共振（常见于摸顶/抄底），"
+            "可在有确认信号时参与，但须自行加权风控。"
+        )
     else:
         lines.append("## 今日无信号")
         lines.append("")
         lines.append("> 全市场无极端品种，今日无操作/观望机会。")
+
+    def _md_cell(val) -> str:
+        """Markdown 表格单元格内若含 | 会拆列，统一换成全角竖线。"""
+        if val is None:
+            return "-"
+        return str(val).replace("|", "｜")
 
     def _build_fund_str(t):
         fp = []
@@ -684,33 +786,48 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
 
     if targets:
         lines.append("")
-        lines.append("| 状态 | 合约 | 方向 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 基本面详情 |")
-        lines.append("| :---: | :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
+        lines.append(
+            "| 状态 | 合约 | 方向 | 入池理由 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 标签 | 基本面详情 |"
+        )
+        lines.append(
+            "| :---: | :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |"
+        )
         for t in targets:
             rev = t.get("reversal_status", {})
             sig_cn = {"Spring": "弹簧", "SOS": "强势突破", "SC": "卖方高潮",
                       "UT": "上冲回落", "SOW": "弱势跌破", "BC": "买方高潮",
-                      "StopVol_Bull": "停止量", "StopVol_Bear": "停止量"}.get(
+                      "StopVol_Bull": "停止量", "StopVol_Bear": "停止量",
+                      "Pullback": "回撤", "TrendBreak": "突破"}.get(
                 rev.get("signal_type", ""), rev.get("signal_type", ""))
-            signal_str = f"{sig_cn} {rev['signal_date'][-5:]}" if rev.get("has_signal") else "⏳"
+            mode_tag = "🔄" if rev.get("entry_mode") == "trend" else ""
+            signal_str = f"{mode_tag}{sig_cn} {rev['signal_date'][-5:]}" if rev.get("has_signal") else "⏳"
             dir_icon = "🟢 做多" if t["direction"] == "long" else "🔴 做空"
             rrf = t.get("rrf_score", 0)
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
             ss = t.get("signal_strength", 0)
+            tag_cells = []
+            if t.get("direction_conflict"):
+                tag_cells.append("P1P2异号")
+            if not t.get("score_signs_support_direction", True):
+                tag_cells.append("逆势")
+            tag_str = "/".join(tag_cells) if tag_cells else "-"
+            epr = _md_cell(t.get("entry_pool_reason") or "-")
             lines.append(
                 f"| ✅入场 | {t['name']}(主力) | {dir_icon} "
-                f"| {t['price']:.0f} | {signal_str} | {t['entry']:.0f} | {t['stop']:.0f} "
+                f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| **{rrf:.4f}** | {r1} | {r2} "
                 f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {ss:.2f} | {_build_fund_str(t)} |"
+                f"| {ss:.2f} | {_md_cell(tag_str)} | {_md_cell(_build_fund_str(t))} |"
             )
 
     if watchlist:
         lines.append("")
-        lines.append("| 合约 | 方向 | 当前价 | 等待信号 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 基本面详情 |")
-        lines.append("| :--- | :---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
+        lines.append(
+            "| 合约 | 方向 | 入池理由 | 当前价 | 系统提示 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 标签 | 基本面详情 |"
+        )
+        lines.append("| :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
         for t in watchlist:
             rev = t.get("reversal_status", {})
             next_exp = rev.get("next_expected", "等待反转信号")
@@ -719,12 +836,21 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
             ss = t.get("signal_strength", 0)
+            wtags = []
+            if t.get("direction_conflict"):
+                wtags.append("P1P2异号")
+            if not t.get("score_signs_support_direction", True):
+                wtags.append("逆势")
+            conflict_tag = f" ⚠️{'/'.join(wtags)}" if wtags else ""
+            epr = _md_cell(t.get("entry_pool_reason") or "-")
+            wtag_cell = "/".join(wtags) if wtags else "-"
+            rrf_cell = _md_cell(f"**{rrf:.4f}**{conflict_tag}")
             lines.append(
                 f"| {t['name']}(主力) | {dir_icon} "
-                f"| {t['price']:.0f} | ⏳{next_exp} "
-                f"| **{rrf:.4f}** | {r1} | {r2} "
+                f"| {epr} | {t['price']:.0f} | ⏳{_md_cell(next_exp)} "
+                f"| {rrf_cell} | {r1} | {r2} "
                 f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {ss:.2f} | {_build_fund_str(t)} |"
+                f"| {ss:.2f} | {_md_cell(wtag_cell)} | {_md_cell(_build_fund_str(t))} |"
             )
 
     lines.append("")
@@ -752,10 +878,15 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("| 量价面 | ±35 | Wyckoff阶段、量价关系、VSA信号 |")
     lines.append("| 持仓面 | ±15 | OI价格四象限、OI背离 |")
     lines.append("")
-    lines.append("可操作条件：① 有新鲜反转信号（3日内） ② Phase 2 总分达标(做多>+20/做空<-20) ③ 盈亏比>=1.0。")
-    lines.append("三者缺一不可，无信号时不给入场参数。")
+    lines.append(
+        "可操作条件：① 有新鲜反转/顺势入场信号 ② Phase 2 总分达标(做多>+20/做空<-20) ③ 盈亏比≥1.0。"
+    )
+    lines.append(
+        "**计划方向**来自 Phase 1 入池规则（见「入池理由」），与 P1/P2 分数符号可以不一致；"
+        "若标签含 **逆势**，表示 P1/P2 未与计划方向共振，属反转/摸顶情境，须额外风控。"
+    )
     lines.append("")
-    lines.append("**两阶段评分符号一致**：正分=看多, 负分=看空。Phase 1 和 Phase 2 方向一致时信号更可靠。")
+    lines.append("**两阶段评分**：正分=看多, 负分=看空。P1 与 P2 同号时通常更可靠；RRF 对 P1/P2 异号有惩罚。")
     lines.append("")
     lines.append("### RRF 综合排名 (Reciprocal Rank Fusion)")
     lines.append("")
@@ -767,10 +898,15 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("- RRF 不依赖评分的绝对值或尺度，只看排名位次")
     lines.append("- 两个 Phase 都排名靠前的品种，RRF 得分最高")
     lines.append("- 只有一个 Phase 排名高的品种，也能保留但排名靠后")
+    lines.append("- **方向一致性惩罚**: 若 P1(基本面)与 P2(技术面)方向冲突(一正一负)，RRF 得分×0.5")
     lines.append("")
-    lines.append("### 入场信号说明 (Wyckoff反转序列)")
+    lines.append("### 入场信号说明")
     lines.append("")
-    lines.append("入场不再基于固定价位，而是等待 Wyckoff 反转信号触发：")
+    lines.append("系统支持两种入场模式，反转信号优先级高于顺势信号：")
+    lines.append("")
+    lines.append("#### 模式一：Wyckoff 反转入场（抓顶抄底）")
+    lines.append("")
+    lines.append("适用于横盘/筑底/筑顶阶段，等待极端事件确认反转：")
     lines.append("")
     lines.append("**做多反转序列**: 下跌 → SC(卖方高潮) → 停止量 → Spring(弹簧) → SOS(强势突破)")
     lines.append("**做空反转序列**: 上涨 → BC(买方高潮) → 停止量 → UT(上冲回落) → SOW(弱势跌破)")
@@ -783,6 +919,19 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("| SOS/SOW | 放量突破确认趋势反转 | **确认信号** |")
     lines.append("")
     lines.append("入场价 = 当前价（信号新鲜时入场） | 止损 = 信号K线极端价 ± 0.5ATR")
+    lines.append("")
+    lines.append("#### 模式二：顺势入场（趋势延续）")
+    lines.append("")
+    lines.append("适用于趋势已确立（Wyckoff=markup/markdown）且基本面+技术面一致时：")
+    lines.append("")
+    lines.append("| 信号 | 条件 | 信号强度 |")
+    lines.append("| :--- | :--- | :--- |")
+    lines.append("| 回撤入场(Pullback) | 价格回到MA20附近 + 缩量反弹/回踩 + 未能站稳MA20 | 0.70 |")
+    lines.append("| 突破入场(TrendBreak) | 放量(量比≥1.3)突破20日新高/新低 | 0.60 |")
+    lines.append("")
+    lines.append("前提条件：Wyckoff阶段匹配方向 + |P2评分|≥25 + P1方向一致")
+    lines.append("")
+    lines.append("止损 = 近5日极值 ± 0.5ATR | 回撤优先于突破（盈亏比更好）")
     lines.append("")
     lines.append("### 关键术语")
     lines.append("")
@@ -801,16 +950,26 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         status_text = f" — {status}" if status else ""
         lines.append(f"### {name}(主力) — {direction_cn}{status_text}")
         lines.append("")
+        epr = t.get("entry_pool_reason")
+        if epr:
+            lines.append(f"**入池理由（Phase 1）**: {epr}")
+            lines.append("")
+        aln = t.get("score_signs_support_direction", True)
+        if not aln:
+            lines.append("**⚠️ 逆势**: P1/P2 综合分符号与计划方向未共振；表内「方向」来自入池规则，非分数投票。")
+            lines.append("")
 
-        # --- 反转信号状态 ---
+        # --- 入场信号状态 ---
         rev = t.get("reversal_status", {})
         if rev.get("has_signal"):
             sig_cn = {"Spring": "弹簧(Spring)", "SOS": "强势突破(SOS)",
                       "SC": "卖方高潮(SC)", "UT": "上冲回落(UT)",
                       "SOW": "弱势跌破(SOW)", "BC": "买方高潮(BC)",
                       "StopVol_Bull": "停止量(多方力竭)", "StopVol_Bear": "停止量(空方力竭)",
+                      "Pullback": "顺势回撤(Pullback)", "TrendBreak": "顺势突破(TrendBreak)",
                       }.get(rev["signal_type"], rev["signal_type"])
-            lines.append(f"**入场信号**: {sig_cn} ({rev['signal_date']})")
+            mode_label = "[顺势]" if rev.get("entry_mode") == "trend" else "[反转]"
+            lines.append(f"**入场信号**: {mode_label} {sig_cn} ({rev['signal_date']})")
             lines.append(f"- 信号详情: {rev.get('signal_detail', '')}")
             lines.append(f"- 阶段判断: {rev['current_stage']}")
             lines.append(f"- 置信度: {rev['confidence']:.0%}")
@@ -828,18 +987,20 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             else:
                 lines.append(f"- 止损依据: 信号K线最高点 + 0.5×ATR")
         else:
-            lines.append(f"**入场信号**: ⏳ 尚无有效反转信号")
+            lines.append(f"**入场信号**: ⏳ 尚无有效入场信号")
             lines.append(f"- 当前阶段: {rev.get('current_stage', '未知')}")
-            lines.append(f"- 等待条件: {rev.get('next_expected', '等待反转信号')}")
+            lines.append(f"- 等待条件: {rev.get('next_expected', '等待入场信号')}")
             suspect = rev.get("suspect_events", [])
             if suspect:
                 lines.append(f"- ⚠️ 有{len(suspect)}个疑似信号（未通过上下文验证）:")
                 for se in suspect[-3:]:
                     lines.append(f"  - {se['date']} {se['signal']}: {se['detail']}")
             if t["direction"] == "long":
-                lines.append(f"- 触发特征: 价格跌破近期低点后当日收回(Spring)，或放量突破近期高点(SOS)")
+                lines.append(f"- 反转入场: Spring(假跌破收回) 或 SOS(放量突破)")
+                lines.append(f"- 顺势入场: 缩量回踩MA20企稳 或 放量突破前高")
             else:
-                lines.append(f"- 触发特征: 价格突破近期高点后当日回落(UT)，或放量跌破近期低点(SOW)")
+                lines.append(f"- 反转入场: UT(假突破回落) 或 SOW(放量跌破)")
+                lines.append(f"- 顺势入场: 缩量反弹MA20失败 或 放量跌破前低")
             lines.append("")
             lines.append("**交易参数**: 无（需等待信号触发后计算）")
 
@@ -850,7 +1011,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         rrf = t.get("rrf_score", 0)
         r1 = t.get("rank_p1", "-")
         r2 = t.get("rank_p2", "-")
-        lines.append(f"- **RRF 综合: {rrf:.4f}** (P1排名#{r1} + P2排名#{r2})")
+        conflict_note = " ⚠️ 方向冲突(已惩罚×0.5)" if t.get("direction_conflict") else ""
+        lines.append(f"- **RRF 综合: {rrf:.4f}** (P1排名#{r1} + P2排名#{r2}){conflict_note}")
         lines.append(f"- Phase 2 综合: {t.get('score', 0):+.1f} "
                      f"(技术{t.get('classical_score', 0):+.1f} / "
                      f"量价{t.get('wyckoff_score', 0):+.1f} / "
@@ -864,14 +1026,17 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             rev_info = t.get("reversal_status", {})
             reasons = []
             if not rev_info.get("has_signal"):
-                reasons.append("无反转信号")
+                reasons.append("无有效入场信号")
             else:
                 rr = t.get("rr", 0)
                 score_val = t.get("score", 0)
+                ddir = t.get("direction")
                 if rr < 1.0:
                     reasons.append(f"盈亏比{rr:.2f}<1.0")
-                if abs(score_val) < 20:
-                    reasons.append(f"|评分|={abs(score_val):.0f}<20")
+                if ddir == "long" and score_val <= 20:
+                    reasons.append(f"P2={score_val:+.0f}未达做多阈值(>+20)")
+                elif ddir == "short" and score_val >= -20:
+                    reasons.append(f"P2={score_val:+.0f}未达做空阈值(<-20)")
             if reasons:
                 lines.append(f"- ⚠️ 未达入场条件: {', '.join(reasons)}")
         lines.append("")
@@ -1001,8 +1166,8 @@ def main():
                 "symbol": sym, "name": pos["name"],
                 "direction": pos["direction"],
                 "score": 50 if pos["direction"] == "long" else -50,
-                "range_pct": 0, "rsi": 50,
-                "wyckoff_phase": "",
+                "range_pct": 0,
+                "entry_pool_reason": "配置文件(--skip-screen)",
             })
     else:
         candidates = phase_1_screen(all_data, threshold=args.threshold)
