@@ -442,9 +442,10 @@ def wyckoff_phase(df: pd.DataFrame, lookback: int = 120) -> WyckoffPhase:
             # 价格在高位横盘
             if vp["up_down_ratio"] < 0.9:
                 confidence = min(0.5 + bearish_events * 0.1, 0.95)
+                down_up_ratio = 1.0 / (vp["up_down_ratio"] + 1e-12)
                 return WyckoffPhase(
                     "distribution", confidence, event_names,
-                    f"高位横盘(区间{tr['range_pct']:.1%}), 下跌日成交量>上涨日({1/vp['up_down_ratio']:.2f}), "
+                    f"高位横盘(区间{tr['range_pct']:.1%}), 下跌日成交量>上涨日({down_up_ratio:.2f}), "
                     f"主力可能在派发"
                 )
             else:
@@ -462,8 +463,10 @@ def wyckoff_phase(df: pd.DataFrame, lookback: int = 120) -> WyckoffPhase:
         # 不在横盘区间 → 判断 markup 或 markdown
         # 综合三个维度: MA交叉(滞后)、价格动量(实时)、成交量趋势
         price_below_ma20 = last < ma20
-        ret_10d = last / float(close.iloc[-11]) - 1 if len(close) > 11 else 0
-        ret_20d = last / float(close.iloc[-21]) - 1 if len(close) > 21 else 0
+        c11 = float(close.iloc[-11]) if len(close) > 11 else 0
+        c21 = float(close.iloc[-21]) if len(close) > 21 else 0
+        ret_10d = (last / c11 - 1) if c11 > 0 else 0
+        ret_20d = (last / c21 - 1) if c21 > 0 else 0
         vol_declining = vp["vol_trend"] < 0.85
 
         # MA交叉说上涨，但价格已跌破MA20且近期动量为负 → 趋势已转
@@ -692,8 +695,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
     tr_40 = detect_trading_range(df, lookback=40, threshold=0.15)
     has_trading_range = tr_40 is not None
 
-    # 收集已出现的事件类型（用于 SOS/SOW 前序事件验证）
-    seen_signals = set()
+    # 收集已出现的事件类型及最高优先级（用于 SOS/SOW 前序事件验证）
+    precursor_priority = {}
     suspect_signals = set()
 
     for i in range(20, len(recent)):
@@ -731,7 +734,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "bar": bar, "detail": f"暴跌天量(量比{rv:.1f}), 收盘承接回{cp:.0%}, 近20日跌幅极端",
                     "priority": 1,
                 })
-                seen_signals.add("SC")
+                priority = 1
+                precursor_priority["SC"] = max(precursor_priority.get("SC", 0), priority)
             elif cp > 0.35:
                 events.append({
                     "signal": "SC", "date": date_str, "bias": "bullish",
@@ -753,7 +757,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "bar": bar, "detail": f"暴涨天量(量比{rv:.1f}), 收盘回落至{cp:.0%}, 近20日涨幅极端",
                     "priority": 1,
                 })
-                seen_signals.add("BC")
+                priority = 1
+                precursor_priority["BC"] = max(precursor_priority.get("BC", 0), priority)
             elif cp < 0.65:
                 events.append({
                     "signal": "BC", "date": date_str, "bias": "bearish",
@@ -782,7 +787,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                                   f"缩量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
                         "ref_level": prev_low, "priority": 3,
                     })
-                    seen_signals.add("Spring")
+                    priority = 3
+                    precursor_priority["Spring"] = max(precursor_priority.get("Spring", 0), priority)
                 elif context_ok and rv >= 1.5 and cp > 0.6:
                     # 带力弹簧: 放量但强力收回（主力底部吸筹）
                     events.append({
@@ -792,7 +798,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                                   f"放量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
                         "ref_level": prev_low, "priority": 2,
                     })
-                    seen_signals.add("Spring")
+                    priority = 2
+                    precursor_priority["Spring"] = max(precursor_priority.get("Spring", 0), priority)
                 else:
                     reasons = []
                     if not context_ok:
@@ -830,7 +837,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                                   f"缩量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
                         "ref_level": prev_high, "priority": 3,
                     })
-                    seen_signals.add("UT")
+                    priority = 3
+                    precursor_priority["UT"] = max(precursor_priority.get("UT", 0), priority)
                 elif context_ok and rv >= 1.5 and cp < 0.4:
                     # 带力上冲回落: 放量但强力回落（主力顶部派发）
                     events.append({
@@ -840,7 +848,8 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                                   f"放量(量比{rv:.1f}), {'横盘中' if has_trading_range else '趋势放缓'}",
                         "ref_level": prev_high, "priority": 2,
                     })
-                    seen_signals.add("UT")
+                    priority = 2
+                    precursor_priority["UT"] = max(precursor_priority.get("UT", 0), priority)
                 else:
                     reasons = []
                     if not context_ok:
@@ -862,10 +871,16 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
         # ====== SOS (Sign of Strength) ======
         # 形态: 放量收盘突破前高
         # 验证: 1)前序事件(SC/Spring/StopVol_Bull) 2)突破幅度>0.5%
+        # 前序分级: Spring/StopVol(pri>=2)=强前序 → SOS pri4
+        #          确认SC(pri=1)=弱前序 → SOS pri2
+        #          疑似信号=弱前序 → SOS pri2
         if rv >= 1.5 and row["close"] > prev_high:
             breakout_pct = (row["close"] - prev_high) / (prev_high + 1e-12) * 100
-            has_strong_precursor = bool(seen_signals & {"SC", "Spring", "StopVol_Bull"})
-            has_weak_precursor = bool(suspect_signals & {"SC", "Spring", "StopVol_Bull"})
+            bullish_keys = {"SC", "Spring", "StopVol_Bull"}
+            max_pre_pri = max((precursor_priority.get(k, -1) for k in bullish_keys), default=-1)
+            has_strong_precursor = max_pre_pri >= 2
+            has_confirmed_precursor = max_pre_pri >= 1
+            has_weak_precursor = bool(suspect_signals & bullish_keys)
             breakout_ok = breakout_pct > 0.5
 
             if has_strong_precursor and breakout_ok:
@@ -875,18 +890,21 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "detail": f"放量(量比{rv:.1f})突破前高{prev_high:.0f}(+{breakout_pct:.1f}%), 有前序吸筹信号",
                     "ref_level": prev_high, "priority": 4,
                 })
-                seen_signals.add("SOS")
-            elif has_weak_precursor and breakout_ok:
+                priority = 4
+                precursor_priority["SOS"] = max(precursor_priority.get("SOS", 0), priority)
+            elif (has_confirmed_precursor or has_weak_precursor) and breakout_ok:
+                label = "确认SC前序(弱确认)" if has_confirmed_precursor else "疑似前序信号(弱确认)"
                 events.append({
                     "signal": "SOS", "date": date_str, "bias": "bullish",
                     "bar": bar,
-                    "detail": f"放量(量比{rv:.1f})突破前高{prev_high:.0f}(+{breakout_pct:.1f}%), 有疑似前序信号(弱确认)",
+                    "detail": f"放量(量比{rv:.1f})突破前高{prev_high:.0f}(+{breakout_pct:.1f}%), {label}",
                     "ref_level": prev_high, "priority": 2,
                 })
-                seen_signals.add("SOS")
+                priority = 2
+                precursor_priority["SOS"] = max(precursor_priority.get("SOS", 0), priority)
             else:
                 reasons = []
-                if not has_strong_precursor and not has_weak_precursor:
+                if not has_strong_precursor and not has_confirmed_precursor and not has_weak_precursor:
                     reasons.append("无前序SC/Spring信号")
                 if not breakout_ok:
                     reasons.append(f"突破幅度仅{breakout_pct:.1f}%")
@@ -900,10 +918,16 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
         # ====== SOW (Sign of Weakness) ======
         # 形态: 放量收盘跌破前低
         # 验证: 1)前序事件(BC/UT/StopVol_Bear) 2)跌破幅度>0.5%
+        # 前序分级: UT/StopVol(pri>=2)=强前序 → SOW pri4
+        #          确认BC(pri=1)=弱前序 → SOW pri2
+        #          疑似信号=弱前序 → SOW pri2
         if rv >= 1.5 and row["close"] < prev_low:
             breakdown_pct = (prev_low - row["close"]) / (prev_low + 1e-12) * 100
-            has_strong_precursor = bool(seen_signals & {"BC", "UT", "StopVol_Bear"})
-            has_weak_precursor = bool(suspect_signals & {"BC", "UT", "StopVol_Bear"})
+            bearish_keys = {"BC", "UT", "StopVol_Bear"}
+            max_pre_pri = max((precursor_priority.get(k, -1) for k in bearish_keys), default=-1)
+            has_strong_precursor = max_pre_pri >= 2
+            has_confirmed_precursor = max_pre_pri >= 1
+            has_weak_precursor = bool(suspect_signals & bearish_keys)
             breakdown_ok = breakdown_pct > 0.5
 
             if has_strong_precursor and breakdown_ok:
@@ -913,18 +937,21 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "detail": f"放量(量比{rv:.1f})跌破前低{prev_low:.0f}(-{breakdown_pct:.1f}%), 有前序派发信号",
                     "ref_level": prev_low, "priority": 4,
                 })
-                seen_signals.add("SOW")
-            elif has_weak_precursor and breakdown_ok:
+                priority = 4
+                precursor_priority["SOW"] = max(precursor_priority.get("SOW", 0), priority)
+            elif (has_confirmed_precursor or has_weak_precursor) and breakdown_ok:
+                label = "确认BC前序(弱确认)" if has_confirmed_precursor else "疑似前序信号(弱确认)"
                 events.append({
                     "signal": "SOW", "date": date_str, "bias": "bearish",
                     "bar": bar,
-                    "detail": f"放量(量比{rv:.1f})跌破前低{prev_low:.0f}(-{breakdown_pct:.1f}%), 有疑似前序信号(弱确认)",
+                    "detail": f"放量(量比{rv:.1f})跌破前低{prev_low:.0f}(-{breakdown_pct:.1f}%), {label}",
                     "ref_level": prev_low, "priority": 2,
                 })
-                seen_signals.add("SOW")
+                priority = 2
+                precursor_priority["SOW"] = max(precursor_priority.get("SOW", 0), priority)
             else:
                 reasons = []
-                if not has_strong_precursor and not has_weak_precursor:
+                if not has_strong_precursor and not has_confirmed_precursor and not has_weak_precursor:
                     reasons.append("无前序BC/UT信号")
                 if not breakdown_ok:
                     reasons.append(f"跌破幅度仅{breakdown_pct:.1f}%")
@@ -944,14 +971,16 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
                     "bar": bar, "detail": f"放量窄幅(量比{rv:.1f}幅比{rs:.1f}), 收盘偏高{cp:.0%}, 卖方力竭",
                     "priority": 2,
                 })
-                seen_signals.add("StopVol_Bull")
+                priority = 2
+                precursor_priority["StopVol_Bull"] = max(precursor_priority.get("StopVol_Bull", 0), priority)
             elif row["close"] > prev["close"] and cp < 0.4:
                 events.append({
                     "signal": "StopVol_Bear", "date": date_str, "bias": "bearish",
                     "bar": bar, "detail": f"放量窄幅(量比{rv:.1f}幅比{rs:.1f}), 收盘偏低{cp:.0%}, 买方力竭",
                     "priority": 2,
                 })
-                seen_signals.add("StopVol_Bear")
+                priority = 2
+                precursor_priority["StopVol_Bear"] = max(precursor_priority.get("StopVol_Bear", 0), priority)
 
     return events
 
@@ -965,6 +994,16 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
       - 只有最近3个交易日内的信号才算"新鲜"，可作为入场依据
       - 入场价 = 当前价（不是信号K线价），止损 = 信号K线极端价
     """
+    if len(df) < 21:
+        return {
+            "has_signal": False, "signal_strength": 0.0,
+            "signal_type": "", "signal_date": "",
+            "signal_bar": {}, "signal_detail": "",
+            "current_stage": "数据不足", "next_expected": "",
+            "confidence": 0.0,
+            "all_events": [], "suspect_events": [],
+        }
+
     events = _find_events_with_bars(df, lookback=lookback)
 
     if direction == "long":
@@ -1010,7 +1049,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
     _no_signal = {
         "has_signal": False,
         "signal_type": None, "signal_date": None,
-        "signal_bar": None, "signal_detail": None,
+        "signal_bar": {}, "signal_detail": None,
         "current_stage": "", "next_expected": "",
         "confidence": 0.0,
         "signal_strength": 0.0,
@@ -1032,7 +1071,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             strength = 0.65
         else:
             strength = 0.5
-        if prep_events:
+        if prep_events and fresh_entry["signal"] in ("SOS", "SOW"):
             strength = min(strength + 0.1, 0.95)
 
         days_ago = fresh_entry.get("days_ago", 0)
@@ -1040,13 +1079,13 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
 
         if direction == "long":
             stage = "反转确认" if fresh_entry["signal"] == "SOS" else "反转信号出现"
-            next_exp = f"信号新鲜({freshness})，可考虑入场"
+            next_exp = f"Wyckoff信号新鲜({freshness})；可操作须评分达标+盈亏比≥1（与P1/P2是否共振见报告）"
         else:
             stage = "反转确认" if fresh_entry["signal"] == "SOW" else "反转信号出现"
-            next_exp = f"信号新鲜({freshness})，可考虑入场"
+            next_exp = f"Wyckoff信号新鲜({freshness})；可操作须评分达标+盈亏比≥1（与P1/P2是否共振见报告）"
 
         return {
-            "has_signal": True,
+            "has_signal": strength >= 0.5,
             "signal_strength": strength,
             "signal_type": fresh_entry["signal"],
             "signal_date": fresh_entry["date"],
@@ -1110,3 +1149,259 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
     result["current_stage"] = stage
     result["next_expected"] = next_exp
     return result
+
+
+# ============================================================
+#  8. 顺势入场评估（趋势确立后的回撤/突破入场）
+# ============================================================
+
+def assess_trend_entry(
+    df: pd.DataFrame,
+    direction: str,
+    p2_score: float,
+    p1_score: float = 0.0,
+    lookback: int = 60,
+) -> dict:
+    """
+    评估顺势入场信号，适用于趋势已确立、基本面和技术面一致的品种。
+
+    与 assess_reversal_status 互补：
+      - 反转入场：在横盘/筑底/筑顶阶段捕捉转折点
+      - 顺势入场：在确立的趋势中寻找回撤或突破入场点
+
+    两种模式:
+      1. 回撤入场 (Pullback): 价格回到 MA20 附近 + 缩量反弹失败
+         → signal_strength = 0.70
+      2. 突破入场 (TrendBreak): 放量突破前低/前高
+         → signal_strength = 0.60
+
+    前提条件（三者缺一不可）:
+      - Wyckoff 阶段匹配方向 (markup+long / markdown+short)
+      - P2 技术面评分 |P2| >= 25 且方向一致
+      - P1 基本面方向一致（同号，或 P1=0 时放宽）
+    """
+    _empty = {
+        "has_signal": False, "signal_strength": 0.0,
+        "signal_type": "", "signal_date": "",
+        "signal_bar": {}, "signal_detail": "",
+        "current_stage": "", "next_expected": "",
+        "confidence": 0.0,
+        "entry_mode": "trend",
+        "all_events": [], "suspect_events": [],
+    }
+
+    if len(df) < 60:
+        return _empty
+
+    close = df["close"]
+    last = float(close.iloc[-1])
+    last_date_str = str(df.iloc[-1].get("date", df.index[-1]))[:10]
+
+    # --- 前提条件检查 ---
+    phase = wyckoff_phase(df, lookback=120)
+
+    if direction == "long":
+        phase_ok = phase.phase in ("markup",)
+        score_ok = p2_score >= 25
+        fund_ok = p1_score >= 0
+    else:
+        phase_ok = phase.phase in ("markdown",)
+        score_ok = p2_score <= -25
+        fund_ok = p1_score <= 0
+
+    if not phase_ok or not score_ok or not fund_ok:
+        if not phase_ok:
+            _empty["current_stage"] = f"趋势阶段不匹配({phase.phase})"
+        elif not score_ok:
+            _empty["current_stage"] = f"技术面评分不足({p2_score:+.0f})"
+        else:
+            _empty["current_stage"] = f"基本面方向不一致({p1_score:+.0f})"
+        _empty["next_expected"] = "等待趋势确立或基本面确认"
+        return _empty
+
+    # --- 计算技术指标 ---
+    ma20 = close.rolling(20).mean()
+    ma20_now = float(ma20.iloc[-1])
+    vol = df["volume"]
+    vol_ma = vol.rolling(20).mean()
+    rv_now = float(vol.iloc[-1]) / (float(vol_ma.iloc[-1]) + 1e-12)
+
+    sp = df["high"] - df["low"]
+    tr = pd.concat([
+        sp,
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+    if atr < 1e-12:
+        return _empty
+
+    recent = df.tail(lookback)
+    last_bar = _bar_dict(df.iloc[-1])
+
+    # --- 回撤入场检测 ---
+    pullback_signal = _check_pullback(
+        df, direction, close, ma20_now, atr, vol, vol_ma, last, last_date_str, last_bar,
+    )
+
+    # --- 突破入场检测 ---
+    breakout_signal = _check_breakout(
+        df, direction, close, atr, vol, vol_ma, rv_now, last, last_date_str, last_bar,
+    )
+
+    # 回撤优先（盈亏比更好）
+    if pullback_signal["has_signal"]:
+        return pullback_signal
+    if breakout_signal["has_signal"]:
+        return breakout_signal
+
+    # 无顺势信号
+    _empty["current_stage"] = "趋势已确立但无入场时机"
+    if direction == "long":
+        _empty["next_expected"] = "等价格回踩MA20或放量突破前高"
+    else:
+        _empty["next_expected"] = "等价格反弹MA20或放量跌破前低"
+    return _empty
+
+
+def _check_pullback(
+    df: pd.DataFrame,
+    direction: str,
+    close: pd.Series,
+    ma20_now: float,
+    atr: float,
+    vol: pd.Series,
+    vol_ma: pd.Series,
+    last: float,
+    last_date_str: str,
+    last_bar: dict,
+) -> dict:
+    """检测回撤入场条件"""
+    _empty = {
+        "has_signal": False, "signal_strength": 0.0,
+        "signal_type": "", "signal_date": "",
+        "signal_bar": {}, "signal_detail": "",
+        "current_stage": "", "next_expected": "",
+        "confidence": 0.0,
+        "entry_mode": "trend",
+        "all_events": [], "suspect_events": [],
+    }
+
+    dist_to_ma20 = abs(last - ma20_now)
+    near_ma20 = dist_to_ma20 < atr
+
+    if not near_ma20:
+        return _empty
+
+    # 近3根反向K线的量比（做空时看上涨K线，做多时看下跌K线）
+    recent_5 = df.tail(5)
+    if direction == "short":
+        up_bars = recent_5[recent_5["close"] > recent_5["open"]]
+        fail_condition = last <= ma20_now * 1.01
+    else:
+        up_bars = recent_5[recent_5["close"] < recent_5["open"]]
+        fail_condition = last >= ma20_now * 0.99
+
+    if len(up_bars) == 0:
+        avg_counter_rv = 0.5
+    else:
+        counter_vols = up_bars["volume"].values
+        counter_vol_ma = float(vol_ma.iloc[-1]) + 1e-12
+        avg_counter_rv = float(np.mean(counter_vols)) / counter_vol_ma
+
+    low_volume_pullback = avg_counter_rv < 0.8
+
+    if not low_volume_pullback or not fail_condition:
+        return _empty
+
+    # 止损：近5根K线极端价
+    recent_5_data = df.tail(5)
+    if direction == "short":
+        stop_ref = float(recent_5_data["high"].max()) + 0.5 * atr
+        detail = (f"缩量反弹至MA20({ma20_now:.0f})附近后回落, "
+                  f"收盘{last:.0f}未站上MA20, "
+                  f"反弹量比{avg_counter_rv:.2f}(缩量)")
+    else:
+        stop_ref = float(recent_5_data["low"].min()) - 0.5 * atr
+        detail = (f"缩量回踩至MA20({ma20_now:.0f})附近后企稳, "
+                  f"收盘{last:.0f}未跌破MA20, "
+                  f"回踩量比{avg_counter_rv:.2f}(缩量)")
+
+    return {
+        "has_signal": True,
+        "signal_strength": 0.70,
+        "signal_type": "Pullback",
+        "signal_date": last_date_str,
+        "signal_bar": last_bar,
+        "signal_detail": detail,
+        "current_stage": "顺势回撤入场",
+        "next_expected": "趋势延续",
+        "confidence": 0.65,
+        "entry_mode": "trend",
+        "stop_ref": stop_ref,
+        "all_events": [], "suspect_events": [],
+    }
+
+
+def _check_breakout(
+    df: pd.DataFrame,
+    direction: str,
+    close: pd.Series,
+    atr: float,
+    vol: pd.Series,
+    vol_ma: pd.Series,
+    rv_now: float,
+    last: float,
+    last_date_str: str,
+    last_bar: dict,
+) -> dict:
+    """检测突破入场条件"""
+    _empty = {
+        "has_signal": False, "signal_strength": 0.0,
+        "signal_type": "", "signal_date": "",
+        "signal_bar": {}, "signal_detail": "",
+        "current_stage": "", "next_expected": "",
+        "confidence": 0.0,
+        "entry_mode": "trend",
+        "all_events": [], "suspect_events": [],
+    }
+
+    if rv_now < 1.3:
+        return _empty
+
+    # 取前20日的高低点（不含当日）
+    if len(df) < 22:
+        return _empty
+    prev_20 = df.iloc[-21:-1]
+
+    if direction == "short":
+        prev_low = float(prev_20["low"].min())
+        if last >= prev_low:
+            return _empty
+        breakdown_pct = (prev_low - last) / (prev_low + 1e-12) * 100
+        stop_ref = float(df.iloc[-1]["high"]) + 0.5 * atr
+        detail = (f"放量(量比{rv_now:.1f})跌破20日低点{prev_low:.0f}"
+                  f"(-{breakdown_pct:.1f}%), 趋势延续确认")
+    else:
+        prev_high = float(prev_20["high"].max())
+        if last <= prev_high:
+            return _empty
+        breakout_pct = (last - prev_high) / (prev_high + 1e-12) * 100
+        stop_ref = float(df.iloc[-1]["low"]) - 0.5 * atr
+        detail = (f"放量(量比{rv_now:.1f})突破20日高点{prev_high:.0f}"
+                  f"(+{breakout_pct:.1f}%), 趋势延续确认")
+
+    return {
+        "has_signal": True,
+        "signal_strength": 0.60,
+        "signal_type": "TrendBreak",
+        "signal_date": last_date_str,
+        "signal_bar": last_bar,
+        "signal_detail": detail,
+        "current_stage": "顺势突破入场",
+        "next_expected": "趋势延续",
+        "confidence": 0.55,
+        "entry_mode": "trend",
+        "stop_ref": stop_ref,
+        "all_events": [], "suspect_events": [],
+    }

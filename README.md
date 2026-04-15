@@ -4,49 +4,72 @@
 
 ## 每日工作流
 
-```
-全市场扫描(76品种) → 盘前深度分析 → 盘中实时监控
-      Phase 1              Phase 2          Phase 3
-```
-
 一条命令完成全流程：
 
 ```bash
+# 标准模式：数据同步 → 筛选 → 深度分析 → 实时监控
 python scripts/daily_workflow.py
+
+# 仅生成报告（不进入实时监控）
+python scripts/daily_workflow.py --skip-monitor
+
+# 恢复今日分析结果并进入监控（无需重新计算）
+python scripts/daily_workflow.py --resume
+
+# 调整基本面筛选阈值
+python scripts/daily_workflow.py --threshold 15.0
 ```
 
 ### 完整流程说明
 
-| 阶段 | 时间 | 做什么 |
-|------|------|--------|
-| Phase 1 | 盘前 | 扫描76个品种，按价格位置+RSI+均线+库存+Wyckoff量价评分，筛出极端品种 |
-| Phase 2 | 盘前 | 对候选品种做9维深度分析，输出入场价/止损/目标位，标记可操作品种 |
-| Phase 3 | 09:00-15:00 | 对可操作品种拉取分钟K线，实时检测交易信号 |
+| 阶段 | 核心逻辑 | 做什么 |
+|------|---------|--------|
+| **Phase 1: 筛选** | **分类动态阈值 + 极端价格** | 扫描全市场品种。根据品种类别（农产品、高/低敏感度）应用不同基本面评分门槛；或检测价格是否处于 300 日极值（<5% 或 >95%）。筛出具有确定性方向的候选池。 |
+| **Phase 2: 深度分析** | **RRF 多维度评分 + 自动分流** | 对候选品种进行 9 维技术面深度评分（Wyckoff、MA、MACD、RSI、Bollinger、仓单、持仓量等）。利用 RRF 算法融合评分，区分“可操作”与“观望”品种，输出入场/止损位。 |
+| **Phase 3: 实时监控** | **分钟级跟踪 + 反转检测** | 实时拉取分钟 K 线。对“可操作”品种检测入场触发；对“观望”品种进行反转信号（Wyckoff Spring/UT 等）捕捉，一旦信号成立即推送提醒。 |
 
-### 常用参数
+### 命令行参数详解
 
-```bash
-# 完整流程
-python scripts/daily_workflow.py
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `--resume` | `False` | **恢复模式**。读取今日已生成的报告数据（JSON），直接进入 Phase 3 监控。 |
+| `--threshold` | `10.0` | 基本面评分门槛。若 `config.yaml` 中定义了品种类别阈值，此参数作为回退默认值。 |
+| `--skip-monitor` | `False` | 跳过 Phase 3 实时监控，仅生成盘前分析报告后退出（适用于非交易时段）。 |
 
-# 只看分析，不进入盘中监控
-python scripts/daily_workflow.py --no-monitor
+---
 
-# 用 config.yaml 已有品种，跳过全市场筛选
-python scripts/daily_workflow.py --skip-screen
+## 核心系统设计
 
-# 恢复今日已有分析，直接进入盘中监控
-python scripts/daily_workflow.py --resume
+### Phase 1: 智能筛选体系
 
-# 调整筛选灵敏度（默认25，越大越严格）
-python scripts/daily_workflow.py --threshold 35
+1.  **分类动态阈值** (`config.yaml`):
+    - **高敏感 (如生猪 LH0)**: 门槛 3 分（微小基本面变化即视为有效）。
+    - **农产品 (A0, M0 等)**: 门槛 8 分。
+    - **低敏感 (AU0, AG0 等)**: 门槛 15 分（需极端基本面支撑）。
+2.  **生猪数据容错 (Option B)**:
+    - 针对生猪数据源不稳定的特性，若利润率缺失但价格处于历史极低位（<5%），自动给予 +10 分保底分。
+3.  **入池依据记录**: 自动记录每个品种进入候选池的原因（如：`基本面达标(绝对值≥8，当前+12)`）。
 
-# 最多跟踪N个品种
-python scripts/daily_workflow.py --max-picks 4
+### Phase 2: 深度评分维度 (±100分)
 
-# 指定K线周期
-python scripts/daily_workflow.py --period 15
-```
+| 维度 | 指标 | 权重 | 核心逻辑 |
+|------|------|------|------|
+| **Wyckoff** | **量价行为** | 25 | 识别吸筹/派发阶段，捕捉 Spring/UT/SOS 等关键事件。 |
+| **均线** | **趋势对齐** | 15 | MA5/10/20 与 MA60/120 的多空排列状态。 |
+| **持仓量** | **OI 信号** | 15 | 价格与持仓量同步增减逻辑（如：价涨量增为强势看多）。 |
+| **仓单** | **交割压力** | 10 | 交易所仓单的异常增减变化。 |
+| **布林带** | **空间位置** | 10 | 价格在带内的百分位及挤压/扩张状态。 |
+| **MACD** | **动能指标** | 10 | DIF/DEA 金叉/死叉及柱状图斜率。 |
+| **RSI** | **强弱指标** | 10 | 超买 (>70) / 超卖 (<30) 状态检测。 |
+| **季节性** | **统计规律** | 5 | 历史同期平均收益率及胜率统计。 |
+
+### Phase 3: 实时监控与逻辑
+
+1.  **一致性检测**: 自动校验 Phase 1 (基本面) 与 Phase 2 (技术面) 的方向是否一致。
+2.  **分类报警**:
+    - **🔔🔔 强信号**: “可操作”品种且方向与大势对齐。
+    - **🔔 逆势信号**: 满足入场条件但属于基本面/技术面冲突的逆势交易。
+3.  **观望品种反转**: 针对“观望”品种，实时监测分钟级别的 Wyckoff 信号，捕捉潜在的“反转点”。
 
 ### 定时任务 (crontab)
 
@@ -54,20 +77,6 @@ python scripts/daily_workflow.py --period 15
 crontab -e
 # 每个交易日 8:30 自动启动
 30 8 * * 1-5 cd /path/to/ctp && python scripts/daily_workflow.py >> logs/$(date +\%Y\%m\%d).log 2>&1
-```
-
-## 单独使用各模块
-
-```bash
-# 全市场筛选
-python scripts/screener.py --top 10
-
-# 盘前分析（config.yaml 中的品种）
-python scripts/pre_market.py
-
-# 盘中监控
-python scripts/intraday.py --once
-python scripts/intraday.py --period 15 --interval 30
 ```
 
 ## 分析体系
@@ -105,26 +114,29 @@ python scripts/intraday.py --period 15 --interval 30
 
 ```
 ctp/
-├── config.yaml                  # 策略配置
+├── config.yaml                  # 策略配置 (含 TqSdk 账号密码)
 ├── requirements.txt             # 依赖
 ├── scripts/
-│   ├── daily_workflow.py        # 每日自动化工作流（主入口）
-│   ├── screener.py              # 全市场品种筛选
-│   ├── pre_market.py            # 盘前深度分析
-│   ├── intraday.py              # 盘中实时监控
-│   ├── wyckoff.py               # Wyckoff量价分析引擎
-│   └── download_futures_data.py # 批量下载历史数据
-├── data/                        # 运行时缓存（.gitignore）
-└── logs/                        # 日志（.gitignore）
+│   ├── daily_workflow.py        # 每日自动化工作流 (主入口, TqSdk 驱动)
+│   ├── data_cache.py            # TqSdk 数据获取 + 基本面数据 (AkShare)
+│   └── wyckoff.py               # Wyckoff 量价分析引擎
+├── data/
+│   └── reports/                 # 每日分析报告 (Markdown + JSON)
+└── logs/                        # 运行日志 (.gitignore)
 ```
 
 ## 配置说明
 
 `config.yaml` 包含：
 
-- **positions** — 手动指定的品种及方向（`--skip-screen` 时使用）
-- **pre_market** — 分析参数：均线窗口、ATR/RSI/MACD/Bollinger、Fibonacci 级别
-- **intraday** — 日内参数：突破窗口、均值回归、量能过滤、风控阈值
+- **tqsdk** — TqSdk 账号配置 (`account`, `password`)
+- **fundamental_screening** — 基本面筛选配置：
+  - `default_threshold`: 默认评分阈值
+  - `categories`: 品种分类（`high_sensitivity`, `agriculture`, `low_sensitivity`）
+  - `category_thresholds`: 每个类别的评分阈值
+- **pre_market** — Phase 2 技术分析参数：
+  - `ma_windows`: 均线窗口列表 (默认 [5, 10, 20, 60, 120])
+  - 其他技术指标参数 (ATR, RSI, MACD, Bollinger 等)
 
 ## 安装
 
