@@ -323,8 +323,9 @@ def _score_symbol(
                     fund_score -= 5
 
         # LH0：成本/利润率数据缺失时按价格区间位补偿 (Option B)
+        # 键缺失或 JSON null（显式 None）均视为缺失
         hog_margin_missing = sym == "LH0" and (
-            hog is None or "profit_margin" not in hog
+            hog is None or hog.get("profit_margin") is None
         )
         if hog_margin_missing:
             if range_pct < 5:
@@ -521,8 +522,38 @@ def phase_2_premarket(candidates: list[dict], config: dict, max_picks: int = 6) 
 #  Phase 3: 盘中监控（分钟数据实时获取）
 # ============================================================
 
-def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", interval: int = 60,
-                     watchlist: list[dict] | None = None):
+def phase_3_intraday(
+    targets: list[dict],
+    config: dict,
+    period: str = "5",
+    interval: int = 60,
+    watchlist: list[dict] | None = None,
+):
+    """
+    盘中实时监控：对「可操作」品种拉分钟 K 并打印仪表盘；对「观望」品种用合成日线检测反转信号。
+
+    Parameters
+    ----------
+    targets
+        Phase 2 判定为可操作的品种列表（分钟级 `get_minute` + `print_dashboard`）。
+    watchlist
+        观望列表（可选）。非空时，对每个品种用 `get_daily_with_live_bar` 合成当日 K 线，
+        调用 `assess_reversal_status` 检测盘中反转信号，并与上一轮 `prev_signals` 对比
+        打印「新出现 / 持续 / 消失 / 无信号」等提示。
+    config
+        全局配置，读取 `intraday` 段传入 `print_dashboard`。
+    period
+        分钟 K 周期字符串，与数据层一致（例如 ``"5"`` 表示 5 分钟）。
+    interval
+        非交易时段结束后退出；交易时段内每轮循环结束后的休眠秒数。
+
+    Behavior
+    --------
+    - 开盘前若不在交易时段，先 `time_to_next_session` 等待。
+    - 每轮：先处理全部 `targets`，再处理 `watchlist`（若有）。
+    - 观望品种每轮结束时在 ``finally`` 中写入 ``prev_signals[sym]``，保证与本轮解析到的
+      ``has_signal`` 一致（含无数据时置为 False），避免异常路径漏更新。
+    """
     all_monitor = targets + (watchlist or [])
     if not all_monitor:
         print("\n  没有可操作/观望品种，跳过盘中监控")
@@ -586,6 +617,7 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
                 print(f"\n  ── 盘中反转检测 ──")
                 for w in watchlist:
                     sym = w["symbol"]
+                    has_signal = False
                     try:
                         live_df = get_daily_with_live_bar(sym, period)
                         if live_df is None or live_df.empty:
@@ -593,8 +625,8 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
                             continue
 
                         rev = assess_reversal_status(live_df, w["direction"], lookback=60)
+                        has_signal = bool(rev.get("has_signal", False))
                         had_signal = prev_signals.get(sym, False)
-                        has_signal = rev.get("has_signal", False)
 
                         # 当日模拟K线信息
                         live_row = live_df.iloc[-1]
@@ -661,10 +693,10 @@ def phase_3_intraday(targets: list[dict], config: dict, period: str = "5", inter
                             else:
                                 print(f"  ⏳ {w['name']}: {stage} | {live_info}")
 
-                        prev_signals[sym] = has_signal
-
                     except Exception as e:
                         print(f"  ⚠️ {w['name']}: {e}")
+                    finally:
+                        prev_signals[sym] = has_signal
 
             if not is_trading_hours():
                 print(f"\n  🔔 交易时段结束")
@@ -1096,17 +1128,23 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     print(f"     📊 {json_path}")
 
 
-def load_targets() -> list[dict] | None:
+def load_targets() -> tuple[list[dict] | None, list[dict]]:
+    """
+    读取当日 ``_targets.json``。成功且日期为今天时返回 ``(targets, watchlist)``；
+    失败或日期不符时返回 ``(None, [])``。
+    """
     json_path = _today_json_path()
     if not json_path.exists():
-        return None
+        return None, []
     try:
         payload = json.loads(json_path.read_text())
         if payload.get("date") == datetime.now().strftime("%Y-%m-%d"):
-            return payload["targets"]
+            targets = payload.get("targets") or []
+            watchlist = payload.get("watchlist") or []
+            return targets, watchlist
     except Exception:
         pass
-    return None
+    return None, []
 
 
 # ============================================================
@@ -1134,14 +1172,25 @@ def main():
 
     # --- 恢复模式 ---
     if args.resume:
-        targets = load_targets()
+        targets, watchlist_resumed = load_targets()
         if targets:
-            print(f"\n  📂 恢复今日目标: {len(targets)} 个品种")
+            print(f"\n  📂 恢复今日目标: {len(targets)} 个可操作, "
+                  f"{len(watchlist_resumed)} 个观望")
             for t in targets:
                 dir_str = "做多" if t["direction"] == "long" else "做空"
                 print(f"     {t['name']} ({t['symbol']}) {dir_str}  评分{t['score']:+.0f}")
+            if watchlist_resumed:
+                for w in watchlist_resumed:
+                    dir_str = "做多" if w["direction"] == "long" else "做空"
+                    print(f"     👀 {w['name']} ({w['symbol']}) {dir_str}  评分{w['score']:+.0f} [观望]")
             if not args.no_monitor:
-                phase_3_intraday(targets, config, args.period, args.interval)
+                phase_3_intraday(
+                    targets,
+                    config,
+                    args.period,
+                    args.interval,
+                    watchlist=watchlist_resumed,
+                )
             return
         print("\n  ⚠️ 无今日缓存，重新筛选")
 
