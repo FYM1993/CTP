@@ -421,11 +421,11 @@ def get_hog_fundamentals() -> dict | None:
 
     返回:
       price: 最新猪价 (元/kg)
-      price_5d_ago: 5天前猪价
+      price_5d_ago: 相对最新值约 5 个数据点之前的猪价；序列不足 6 条时取最早可用值
       price_trend: 价格趋势 (%)
       cost: 养殖成本 (元/头)，仅在成本接口成功时存在
       profit_margin: 利润率估算 (正值=盈利)，仅在与 cost 同时可用时计算
-      supply: 供应指数(最新可得)
+      supply: （可选）供应指数最新值；供应接口失败时不返回该字段
       data_status: "full" 核心价与成本均成功；"partial" 仅核心价成功、成本失败
     """
     global _hog_cache
@@ -434,11 +434,11 @@ def get_hog_fundamentals() -> dict | None:
 
     result: dict = {}
     try:
-        df = aks.futures_hog_core()
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        result["price"] = float(df["value"].iloc[-1])
-        n5 = min(len(df), 6)
-        result["price_5d_ago"] = float(df["value"].iloc[-n5])
+        core_df = aks.futures_hog_core()
+        core_df["value"] = pd.to_numeric(core_df["value"], errors="coerce")
+        result["price"] = float(core_df["value"].iloc[-1])
+        n5 = min(len(core_df), 6)
+        result["price_5d_ago"] = float(core_df["value"].iloc[-n5])
         p5 = result["price_5d_ago"]
         result["price_trend"] = (result["price"] / (p5 + 1e-12) - 1) * 100 if p5 > 0 else 0.0
     except Exception:
@@ -446,9 +446,9 @@ def get_hog_fundamentals() -> dict | None:
 
     cost_ok = False
     try:
-        df = aks.futures_hog_cost()
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        result["cost"] = float(df["value"].iloc[-1])
+        cost_df = aks.futures_hog_cost()
+        cost_df["value"] = pd.to_numeric(cost_df["value"], errors="coerce")
+        result["cost"] = float(cost_df["value"].iloc[-1])
         cost_ok = True
     except Exception:
         pass
@@ -461,9 +461,9 @@ def get_hog_fundamentals() -> dict | None:
         result["profit_margin"] = (est_revenue / cost - 1) * 100
 
     try:
-        df = aks.futures_hog_supply()
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        result["supply"] = float(df["value"].iloc[-1])
+        supply_df = aks.futures_hog_supply()
+        supply_df["value"] = pd.to_numeric(supply_df["value"], errors="coerce")
+        result["supply"] = float(supply_df["value"].iloc[-1])
     except Exception:
         pass
 
