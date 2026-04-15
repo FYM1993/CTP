@@ -22,9 +22,10 @@
 
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
+import numpy as np
 import akshare as aks
 
 CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
@@ -261,6 +262,9 @@ INVENTORY_NAME_MAP = {
     "UR0": "尿素", "SF0": "硅铁", "SM0": "锰硅",
     "AP0": "苹果", "CJ0": "红枣", "PK0": "花生",
     "SI0": "工业硅", "LC0": "碳酸锂",
+    "PS0": "多晶硅", "SH0": "烧碱", "PX0": "对二甲苯",
+    "CY0": "棉纱", "AO0": "氧化铝", "LU0": "低硫燃料油",
+    "NR0": "20号胶",
 }
 
 
@@ -272,7 +276,7 @@ def get_inventory(symbol: str) -> dict | None:
       inv_now: 当前库存
       inv_change_4wk: 4周库存变化 (%)
       inv_cumulating_weeks: 最近8周累库周数
-      inv_percentile: 库存在52周内的分位数 (0~100, 越高库存越高)
+      inv_percentile: 库存在52周高低区间的位置 (0~100, min-max归一化, 越高库存越高)
       inv_trend: 库存趋势方向 ("累库"/"去库"/"持平")
     """
     inv_name = INVENTORY_NAME_MAP.get(symbol)
@@ -330,7 +334,7 @@ SHFE_RECEIPT_MAP = {
 }
 
 GFEX_RECEIPT_MAP = {
-    "LC0": "LC", "SI0": "SI",
+    "LC0": "LC", "SI0": "SI", "PS0": "PS",
 }
 
 _shfe_receipt_cache: dict | None = None
@@ -352,9 +356,15 @@ def get_warehouse_receipt(symbol: str) -> dict | None:
     shfe_name = SHFE_RECEIPT_MAP.get(symbol)
     if shfe_name:
         if _shfe_receipt_cache is None:
-            try:
-                _shfe_receipt_cache = aks.futures_shfe_warehouse_receipt()
-            except Exception:
+            for _shfe_attempt in range(2):
+                try:
+                    _shfe_receipt_cache = aks.futures_shfe_warehouse_receipt()
+                    if _shfe_receipt_cache:
+                        break
+                except Exception:
+                    if _shfe_attempt == 0:
+                        time.sleep(3)
+            if _shfe_receipt_cache is None:
                 _shfe_receipt_cache = {}
 
         df = _shfe_receipt_cache.get(shfe_name)
@@ -371,16 +381,22 @@ def get_warehouse_receipt(symbol: str) -> dict | None:
     gfex_key = GFEX_RECEIPT_MAP.get(symbol)
     if gfex_key:
         if _gfex_receipt_cache is None:
-            try:
-                _gfex_receipt_cache = aks.futures_gfex_warehouse_receipt()
-            except Exception:
+            for _offset in range(4):
+                try:
+                    _d = (datetime.now() - timedelta(days=_offset)).strftime("%Y%m%d")
+                    _cache = aks.futures_gfex_warehouse_receipt(date=_d)
+                    if _cache:
+                        _gfex_receipt_cache = _cache
+                        break
+                except Exception:
+                    continue
+            if _gfex_receipt_cache is None:
                 _gfex_receipt_cache = {}
 
         df = _gfex_receipt_cache.get(gfex_key)
         if df is not None and hasattr(df, "empty") and not df.empty:
             try:
                 today_col = "今日仓单量"
-                yesterday_col = "昨日仓单量"
                 change_col = "增减"
                 total = pd.to_numeric(df[today_col], errors="coerce").sum()
                 change = pd.to_numeric(df[change_col], errors="coerce").sum()
@@ -407,34 +423,42 @@ def get_hog_fundamentals() -> dict | None:
       price: 最新猪价 (元/kg)
       price_5d_ago: 5天前猪价
       price_trend: 价格趋势 (%)
-      cost: 养殖成本 (元/头)
-      profit_margin: 利润率估算 (正值=盈利)
+      cost: 养殖成本 (元/头)，仅在成本接口成功时存在
+      profit_margin: 利润率估算 (正值=盈利)，仅在与 cost 同时可用时计算
       supply: 供应指数(最新可得)
+      data_status: "full" 核心价与成本均成功；"partial" 仅核心价成功、成本失败
     """
     global _hog_cache
     if _hog_cache is not None:
         return _hog_cache
 
-    result = {}
+    result: dict = {}
     try:
         df = aks.futures_hog_core()
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         result["price"] = float(df["value"].iloc[-1])
         n5 = min(len(df), 6)
         result["price_5d_ago"] = float(df["value"].iloc[-n5])
-        result["price_trend"] = (result["price"] / result["price_5d_ago"] - 1) * 100
+        p5 = result["price_5d_ago"]
+        result["price_trend"] = (result["price"] / (p5 + 1e-12) - 1) * 100 if p5 > 0 else 0.0
     except Exception:
-        pass
+        return None
 
+    cost_ok = False
     try:
         df = aks.futures_hog_cost()
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         result["cost"] = float(df["value"].iloc[-1])
-        if "price" in result and result["cost"] > 0:
-            est_revenue = result["price"] * 120
-            result["profit_margin"] = (est_revenue / result["cost"] - 1) * 100
+        cost_ok = True
     except Exception:
         pass
+
+    result["data_status"] = "full" if cost_ok else "partial"
+    price = result.get("price")
+    cost = result.get("cost")
+    if cost_ok and price is not None and cost is not None and cost > 0:
+        est_revenue = price * 120
+        result["profit_margin"] = (est_revenue / cost - 1) * 100
 
     try:
         df = aks.futures_hog_supply()
@@ -443,10 +467,8 @@ def get_hog_fundamentals() -> dict | None:
     except Exception:
         pass
 
-    if result:
-        _hog_cache = result
-        return result
-    return None
+    _hog_cache = result
+    return result
 
 
 # ============================================================
@@ -476,7 +498,9 @@ def get_seasonality(df: pd.DataFrame) -> dict | None:
         d["year"] = d["date"].dt.year
 
         monthly = d.groupby(["year", "month"])["close"].agg(["first", "last"])
+        monthly["first"] = monthly["first"].replace(0, np.nan)
         monthly["ret"] = (monthly["last"] / monthly["first"] - 1) * 100
+        monthly = monthly.dropna(subset=["ret"])
 
         now = datetime.now()
         cur_month = now.month
@@ -493,7 +517,11 @@ def get_seasonality(df: pd.DataFrame) -> dict | None:
             & (d["date"].dt.year == now.year)
         ]
         if len(cur_data) >= 2:
-            cur_ret = (float(cur_data["close"].iloc[-1]) / float(cur_data["close"].iloc[0]) - 1) * 100
+            first_close = float(cur_data["close"].iloc[0])
+            if first_close > 0:
+                cur_ret = (float(cur_data["close"].iloc[-1]) / first_close - 1) * 100
+            else:
+                cur_ret = 0.0
         else:
             cur_ret = 0.0
 
@@ -696,7 +724,6 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
                 pass
             data[sym] = df
 
-    has_today = api_calls - live_count
     msg = f"\n  📊 加载完成: {len(data)}个品种 (缓存{cache_hits}, API{api_calls}"
     if live_count > 0:
         msg += f", {live_count}个尚无今日数据"
