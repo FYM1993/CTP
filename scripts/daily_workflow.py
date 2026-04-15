@@ -901,8 +901,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("所有评分统一约定：**正分=偏多(做多机会)，负分=偏空(做空机会)**。分值越大信号越强。")
     lines.append("")
     lines.append(
-        "Phase 1 为纯基本面筛选，通过各品种基本面门槛（默认10，部分品种已分类配置）"
-        "或极端价格位（<5% 或 >95%）进入候选池。"
+        "Phase 1 为纯基本面筛选，通过**各品种基本面门槛**或极端价格位（<5% 或 >95%）进入候选池。"
+        "门槛由 config 分层配置（默认与各品种分类），并非单一固定「数值≥10」规则。"
     )
     lines.append("")
     lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
@@ -1169,7 +1169,12 @@ def main():
     parser.add_argument("--no-monitor", action="store_true", help="跳过盘中监控")
     parser.add_argument("--skip-screen", action="store_true", help="跳过筛选，用config.yaml品种")
     parser.add_argument("--resume", action="store_true", help="恢复今日分析，直接监控")
-    parser.add_argument("--threshold", type=float, default=10, help="筛选阈值 (默认10)")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=10,
+        help="基本面筛选分数门槛 (默认10, 仅在 config.yaml 未定义 default_threshold 时生效)",
+    )
     parser.add_argument("--max-picks", type=int, default=6, help="最多跟踪品种数")
     parser.add_argument("--period", default="5", choices=["1", "5", "15", "30", "60"], help="K线周期")
     parser.add_argument("--interval", type=int, default=60, help="监控刷新间隔(秒)")
