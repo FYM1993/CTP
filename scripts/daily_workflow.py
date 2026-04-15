@@ -546,7 +546,8 @@ def phase_3_intraday(
     period
         分钟 K 周期字符串，与数据层一致（例如 ``"5"`` 表示 5 分钟）。
     interval
-        非交易时段结束后退出；交易时段内每轮循环结束后的休眠秒数。
+        交易时段内，每轮监控（打印一轮行情与信号）结束后 ``time.sleep(interval)`` 的休眠秒数，
+        即刷新间隔；与是否退出交易时段无关。
 
     Behavior
     --------
@@ -681,7 +682,6 @@ def phase_3_intraday(
                         else:
                             # 无信号
                             stage = rev.get("current_stage", "")
-                            suspect = rev.get("suspect_events", [])
                             # 检查当日走势是否有形成信号的苗头
                             events = rev.get("all_events", [])
                             today_str = now.strftime("%Y-%m-%d")
@@ -746,6 +746,9 @@ def _clean_numpy(targets: list[dict]) -> list[dict]:
 
 
 def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
+    """
+    将 Phase 2 结果落盘：写入当日 ``_targets.json``（供 ``--resume``）与 ``_targets.md``（表格+说明+分品种详情）。
+    """
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     targets = _clean_numpy(targets)
     if watchlist:
@@ -897,7 +900,10 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     lines.append("")
     lines.append("所有评分统一约定：**正分=偏多(做多机会)，负分=偏空(做空机会)**。分值越大信号越强。")
     lines.append("")
-    lines.append("Phase 1 为纯基本面筛选，通过阈值 ≥ 10 或极端价格位（<5% 或 >95%）进入候选池。")
+    lines.append(
+        "Phase 1 为纯基本面筛选，通过各品种基本面门槛（默认10，部分品种已分类配置）"
+        "或极端价格位（<5% 或 >95%）进入候选池。"
+    )
     lines.append("")
     lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
     lines.append("| :--- | ---: | :--- | :--- |")
@@ -985,11 +991,11 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         name = t["name"]
         direction_cn = "做多" if t["direction"] == "long" else "做空"
         status_text = f" — {status}" if status else ""
-        lines.append(f"### {name}(主力) — {direction_cn}{status_text}")
+        lines.append(f"### {_md_cell(name)}(主力) — {direction_cn}{status_text}")
         lines.append("")
         epr = t.get("entry_pool_reason")
         if epr:
-            lines.append(f"**入池理由（Phase 1）**: {epr}")
+            lines.append(f"**入池理由（Phase 1）**: {_md_cell(epr)}")
             lines.append("")
         aln = t.get("score_signs_support_direction", True)
         if not aln:
@@ -1007,8 +1013,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                       }.get(rev["signal_type"], rev["signal_type"])
             mode_label = "[顺势]" if rev.get("entry_mode") == "trend" else "[反转]"
             lines.append(f"**入场信号**: {mode_label} {sig_cn} ({rev['signal_date']})")
-            lines.append(f"- 信号详情: {rev.get('signal_detail', '')}")
-            lines.append(f"- 阶段判断: {rev['current_stage']}")
+            lines.append(f"- 信号详情: {_md_cell(rev.get('signal_detail', '') or '')}")
+            lines.append(f"- 阶段判断: {_md_cell(rev['current_stage'])}")
             lines.append(f"- 置信度: {rev['confidence']:.0%}")
             lines.append("")
 
@@ -1025,13 +1031,15 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 lines.append(f"- 止损依据: 信号K线最高点 + 0.5×ATR")
         else:
             lines.append(f"**入场信号**: ⏳ 尚无有效入场信号")
-            lines.append(f"- 当前阶段: {rev.get('current_stage', '未知')}")
-            lines.append(f"- 等待条件: {rev.get('next_expected', '等待入场信号')}")
+            lines.append(f"- 当前阶段: {_md_cell(rev.get('current_stage', '未知'))}")
+            lines.append(f"- 等待条件: {_md_cell(rev.get('next_expected', '等待入场信号'))}")
             suspect = rev.get("suspect_events", [])
             if suspect:
                 lines.append(f"- ⚠️ 有{len(suspect)}个疑似信号（未通过上下文验证）:")
                 for se in suspect[-3:]:
-                    lines.append(f"  - {se['date']} {se['signal']}: {se['detail']}")
+                    lines.append(
+                        f"  - {_md_cell(se.get('date', ''))} {_md_cell(se.get('signal', ''))}: {_md_cell(se.get('detail', ''))}"
+                    )
             if t["direction"] == "long":
                 lines.append(f"- 反转入场: Spring(假跌破收回) 或 SOS(放量突破)")
                 lines.append(f"- 顺势入场: 缩量回踩MA20企稳 或 放量突破前高")
@@ -1075,7 +1083,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 elif ddir == "short" and score_val >= -20:
                     reasons.append(f"P2={score_val:+.0f}未达做空阈值(<-20)")
             if reasons:
-                lines.append(f"- ⚠️ 未达入场条件: {', '.join(reasons)}")
+                lines.append(f"- ⚠️ 未达入场条件: {_md_cell(', '.join(reasons))}")
         lines.append("")
 
         lines.append("**基本面数据**")
@@ -1103,7 +1111,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             has_any = True
         fd = t.get("fund_details", "")
         if fd:
-            lines.append(f"- 其他: {fd}")
+            lines.append(f"- 其他: {_md_cell(fd)}")
             has_any = True
         if not has_any:
             lines.append("- 无可用基本面数据（该品种暂无库存/仓单API覆盖）")
@@ -1113,11 +1121,11 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         if phase:
             phase_cn = {"accumulation": "吸筹", "distribution": "派发",
                         "markup": "上涨", "markdown": "下跌"}.get(phase, phase)
-            lines.append(f"**Wyckoff阶段**: {phase_cn}")
+            lines.append(f"**Wyckoff阶段**: {_md_cell(phase_cn)}")
             lines.append("")
         reason = t.get("reason", "")
         if reason:
-            lines.append(f"**主要依据**: {reason}")
+            lines.append(f"**主要依据**: {_md_cell(reason)}")
             lines.append("")
 
     lines.append("## 品种详细建议")
