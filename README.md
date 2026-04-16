@@ -42,7 +42,7 @@ python scripts/daily_workflow.py --skip-screen
 # 恢复今日已有分析，直接进入盘中监控
 python scripts/daily_workflow.py --resume
 
-# 调整筛选灵敏度（默认25，越大越严格）
+# 调整 Phase 1 基本面门槛（默认10；若 config.yaml 已配置则以配置为准）
 python scripts/daily_workflow.py --threshold 25
 
 # 最多跟踪N个品种
@@ -76,53 +76,131 @@ python scripts/daily_workflow.py --resume
 python scripts/daily_workflow.py --max-picks 10 --period 15 --interval 30
 ```
 
-## 分析体系
+## 当前策略
 
-### 评分维度 (盘前分析 ±100分)
+README 这里描述的是当前主入口已经落地的策略行为，不把“设计稿里的目标形态”和“已经接入的真实逻辑”混在一起。
 
-| 层级 | 指标 | 权重 | 来源 |
-|------|------|------|------|
-| 经典指标 | 均线排列 | 15 | MA5/10/20 vs MA60/120 |
-| 经典指标 | MACD | 10 | DIF/DEA/柱状图方向 |
-| 经典指标 | RSI(14) | 10 | 超买>70 / 超卖<30 |
-| 经典指标 | 布林带位置 | 10 | 价格在带内百分位 |
-| 经典指标 | 动量 | 5 | 5日+20日涨跌幅 |
-| **Wyckoff量价** | **市场阶段** | **15** | 吸筹/上涨/派发/下跌 |
-| **Wyckoff量价** | **量价关系** | **10** | 上涨日量 vs 下跌日量 |
-| **Wyckoff量价** | **VSA信号** | **10** | 每根K线的量价行为分类 |
-| **期货持仓** | **OI信号** | **15** | 价格+持仓量四象限 |
+### Phase 1：基本面发现机会
+
+Phase 1 当前不直接给做多/做空结论，只回答“这个品种值不值得进 Phase 2 深挖”。
+
+主入口 `scripts/daily_workflow.py` 目前的 Phase 1 流程是：
+
+1. 先跑基本面引擎，默认以 `legacy` 为主，`LH0` 可切 `regime`。
+2. 候选入池条件满足任一即可：
+   - 基本面绝对分达到该品种门槛
+   - 价格处于极端区间位（`<5%` 或 `>95%`）
+3. 入池后统一生成这些 Phase 1 字段：
+   - `关注分`
+   - `反转机会分`
+   - `趋势机会分`
+   - `机会标签`
+   - `Phase1摘要`
+
+当前桥接规则如下：
+
+| 入池原因 | 机会标签 | 分数字段 |
+|------|------|------|
+| 基本面达标 + 极端价格 | `双标签候选` | `反转机会分` 和 `趋势机会分` 都继承当前 P1 分值 |
+| 仅极端价格 | `反转候选` | 只给 `反转机会分` |
+| 仅基本面达标 | `趋势候选` | 只给 `趋势机会分` |
+
+当前实现里，`关注分 = abs(Phase 1 原始分数)`，用于候选排序和报告展示。
+
+Phase 1 当前主要使用这些信息：
+
+- 价格区间位置
+- 库存4周变化
+- 库存分位
+- 仓单变化
+- 季节性
+- 生猪专项利润/周期逻辑
+
+### Phase 2：技术面定方向和时机
+
+Phase 2 才真正决定 `long / short / watch`。
+
+当前流程是：
+
+1. 先用 `score_signals()` 分别计算技术面多头分和空头分
+2. 再用 `scripts/phase2_direction.py` 解析方向
+3. 最后把解析出的方向交给 `analyze_one()` 生成交易参数
+
+当前方向规则：
+
+- `long_score >= 20` 且 `long_score - short_score >= 12` => `long`
+- `short_score >= 20` 且 `short_score - long_score >= 12` => `short`
+- 否则 => `watch`
+
+Phase 2 当前技术面来自三类信息：
+
+- 经典指标：均线、MACD、RSI、布林带、动量、价格位置
+- Wyckoff / VSA：阶段识别、关键事件、量价关系
+- 持仓结构：价格与 OI 四象限、OI 背离
+
+可操作品种必须同时满足：
+
+- 有新鲜入场信号
+- Phase 2 分数达标
+- 盈亏比 `>= 1`
+
+### 排名、报告与风险提示
+
+当前报告会同时输出：
+
+- 可操作列表
+- 观望列表
+- JSON 报告
+- Markdown 报告
+
+报告里的关键字段包括：
+
+- `关注分`
+- `P2分`
+- `机会标签`
+- `Phase1摘要`
+- `RRF`
+- `#P1 / #P2`
+- 风险提示：`⚠️P1P2异号`、`⚠️逆势`
+
+当前 RRF 仍按 `Phase 1 原始分` 与 `Phase 2 分数` 的排名融合，用于最终展示顺序。
+
+### Phase 3：实时监控
+
+Phase 3 负责两件事：
+
+- 对可操作品种做分钟级监控
+- 对观望品种做日线级反转信号跟踪
+
+若已配置 `tqsdk.account / password`，Phase 3 优先使用 `TqSdk` 实时订阅；否则回退新浪分钟线。
 
 ### 数据源优先级
 
-- 价格、K线和持仓量优先使用 `TqSdk`
-- 非价量类基本面优先使用 `EDB`
-- `EDB` 缺失或覆盖不到时，再回退 `AkShare`
+- 价格、日线、分钟线、持仓量：优先使用 `TqSdk`
+- 非价量类基本面：优先尝试 `EDB`
+- `EDB` 缺失或覆盖不到时：回退 `AkShare`
 
-### Wyckoff 理论
+### 当前落地状态
 
-- **市场阶段**: 自动识别吸筹(Accumulation)/派发(Distribution)/上涨(Markup)/下跌(Markdown)
-- **关键事件**: 卖方高潮(SC)、弹簧(Spring)、上冲回落(UT)、强势信号(SOS)、弱势信号(SOW)
-- **VSA分类**: 停止量、无需求、无供给、上涨受阻、下跌受托、买方/卖方高潮
-
-### 期货持仓量分析
-
-| 价格 | 持仓量 | 信号 | 含义 |
-|------|--------|------|------|
-| 涨 | 增 | 新多入场 | 强势看多 |
-| 涨 | 减 | 空头回补 | 弱势看多 |
-| 跌 | 增 | 新空入场 | 强势看空 |
-| 跌 | 减 | 多头平仓 | 弱势看空(可能见底) |
+`scripts/phase1_models.py`、`scripts/phase1_scoring.py`、`scripts/phase1_pipeline.py`、`scripts/fundamental_data.py`、`scripts/market_data_tq.py` 这些新模块已经落地并有测试，但主入口当前仍处在“现有基本面引擎 + 新机会发现语义 + 新报告字段”的过渡状态。
 
 ## 项目结构
 
-```
+```text
 ctp/
 ├── config.yaml                  # 策略配置（Phase 1 关注优先级 / Phase 2 定方向）
 ├── requirements.txt             # 依赖
 ├── scripts/
-│   ├── daily_workflow.py        # 每日自动化工作流（主入口，含 Phase 1 全市场筛选）
-│   ├── pre_market.py            # 盘前深度分析
-│   ├── intraday.py              # 盘中实时监控
+│   ├── daily_workflow.py        # 每日自动化工作流（主入口）
+│   ├── pre_market.py            # Phase 2 技术面与交易参数分析
+│   ├── intraday.py              # Phase 3 盘中监控
+│   ├── phase2_direction.py      # Phase 2 自主方向判定
+│   ├── phase1_models.py         # Phase 1 结构化类型
+│   ├── phase1_scoring.py        # Phase 1 评分函数
+│   ├── phase1_pipeline.py       # Phase 1 候选排序
+│   ├── market_data_tq.py        # TqSdk 日线/主连映射
+│   ├── fundamental_data.py      # EDB -> AkShare 基本面入口
+│   ├── tqsdk_live.py            # TqSdk 实时订阅封装
 │   ├── wyckoff.py               # Wyckoff量价分析引擎
 │   └── download_futures_data.py # 批量下载历史数据
 ├── data/                        # 运行时缓存（.gitignore）
@@ -136,7 +214,7 @@ ctp/
 - **positions** — 手动指定的品种及方向（`--skip-screen` 时使用）
 - **pre_market** — Phase 2 分析参数：均线窗口、ATR/RSI/MACD/Bollinger、Fibonacci 级别
 - **fundamental_screening** — Phase 1 机会发现门槛和品种分组
-- **phase1** — Phase 1 报告/候选池参数，例如 `top_n`
+- **phase1** — Phase 1 报告摘要和候选池相关参数，例如 `top_n`
 - **intraday** — Phase 3 日内参数：突破窗口、均值回归、量能过滤、风控阈值
 
 ## 安装
