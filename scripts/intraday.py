@@ -38,7 +38,7 @@ import pandas as pd
 
 from pathlib import Path
 
-from ctp_log import get_logger
+from ctp_log import get_log_path, get_logger
 from data_cache import get_minute
 
 log = get_logger("intraday")
@@ -420,7 +420,7 @@ def run_once(period: str = "5"):
 
 def run_loop(period: str = "5", interval: int = 60):
     """持续监控（单连接 TqSdk 时复用同一订阅，避免重复握手）"""
-    print("日内监控详情写入 logs/ctp.log（本终端仅提示启动/停止）。")
+    print(f"日内监控详情写入 {get_log_path()}（本终端仅提示启动/停止）。")
     config = load_config()
     positions = config["positions"]
     intraday_cfg = config.get("intraday", {})

@@ -111,6 +111,19 @@ def test_choose_cache_suffix_keeps_same_day_data_live_before_close(monkeypatch):
     assert data_cache._choose_cache_suffix(df) == "live"
 
 
+def test_choose_cache_suffix_keeps_same_day_data_live_during_night_session(monkeypatch):
+    class FakeDatetime:
+        @classmethod
+        def now(cls):
+            return pd.Timestamp("2026-04-15 22:00:00").to_pydatetime()
+
+    monkeypatch.setattr(data_cache, "datetime", FakeDatetime)
+
+    df = pd.DataFrame({"date": pd.to_datetime(["2026-04-15"])})
+
+    assert data_cache._choose_cache_suffix(df) == "live"
+
+
 def test_get_daily_ignores_stale_live_cache_after_close(monkeypatch, tmp_path):
     today = pd.Timestamp("2026-04-15")
     live_path = tmp_path / f"daily_LH0_{today.strftime('%Y%m%d')}_live.parquet"
@@ -153,6 +166,42 @@ def test_get_daily_ignores_stale_live_cache_after_close(monkeypatch, tmp_path):
     out = data_cache.get_daily("LH0", 30)
 
     assert float(out.iloc[0]["close"]) == 105.0
+
+
+def test_get_daily_keeps_live_cache_during_night_session(monkeypatch, tmp_path):
+    today = pd.Timestamp("2026-04-15")
+    live_path = tmp_path / f"daily_LH0_{today.strftime('%Y%m%d')}_live.parquet"
+    cached_frame = pd.DataFrame(
+        {
+            "date": [today],
+            "open": [90.0],
+            "high": [95.0],
+            "low": [85.0],
+            "close": [92.0],
+            "volume": [100.0],
+            "oi": [50.0],
+        }
+    )
+    live_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_frame.to_parquet(live_path, index=False)
+
+    class FakeDatetime:
+        @classmethod
+        def now(cls):
+            return pd.Timestamp("2026-04-15 22:00:00").to_pydatetime()
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "datetime", FakeDatetime)
+    monkeypatch.setattr(
+        data_cache,
+        "fetch_daily_from_tq",
+        lambda symbol, days: (_ for _ in ()).throw(AssertionError("night session should reuse live cache")),
+    )
+
+    out = data_cache.get_daily("LH0", 30)
+
+    assert float(out.iloc[0]["close"]) == 92.0
 
 
 def test_get_daily_ignores_live_cache_on_weekend(monkeypatch, tmp_path):

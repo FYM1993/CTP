@@ -20,7 +20,7 @@ import yaml
 import numpy as np
 import pandas as pd
 
-from ctp_log import get_logger
+from ctp_log import get_log_path, get_logger
 from data_cache import get_daily
 from phase2_direction import choose_phase2_direction as _choose_phase2_direction
 
@@ -344,7 +344,7 @@ def resolve_phase2_direction(*, long_score: float, short_score: float, delta: fl
 
 def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
     """
-    对单个品种执行完整的盘前分析；长篇输出写入 logs/ctp.log。
+    对单个品种执行完整的盘前分析；长篇输出写入当前运行的日志文件。
 
     返回: {"symbol", "name", "direction", "score", "actionable", "entry", "stop", "tp1"} 或 None
     """
@@ -694,7 +694,7 @@ def main():
     log.info(f"\n{'='*60}")
     log.info("⚠️  以上为技术面分析，需结合基本面判断综合决策")
     log.info(f"{'='*60}")
-    print("盘前分析详情已写入 logs/ctp.log")
+    print(f"盘前分析详情已写入 {get_log_path()}")
 
 
 if __name__ == "__main__":

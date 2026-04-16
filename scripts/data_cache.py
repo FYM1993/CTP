@@ -45,6 +45,10 @@ MIN_REQUEST_INTERVAL = 0.5
 
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
+DAY_SESSION_START = (9, 0)
+DAY_SESSION_END = (15, 30)
+NIGHT_SESSION_START = (21, 0)
+NIGHT_SESSION_END = (23, 30)
 
 _cache_cleaned = False
 
@@ -111,6 +115,25 @@ def _is_after_close() -> bool:
     )
 
 
+def _minutes_since_midnight(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def _is_trading_session_active(now: datetime | None = None) -> bool:
+    if now is None:
+        now = datetime.now()
+
+    t = _minutes_since_midnight(now)
+    day_start = DAY_SESSION_START[0] * 60 + DAY_SESSION_START[1]
+    day_end = DAY_SESSION_END[0] * 60 + DAY_SESSION_END[1]
+    night_start = NIGHT_SESSION_START[0] * 60 + NIGHT_SESSION_START[1]
+    night_end = NIGHT_SESSION_END[0] * 60 + NIGHT_SESSION_END[1]
+
+    is_day_session = now.weekday() <= 4 and day_start <= t <= day_end
+    is_night_session = now.weekday() in {0, 1, 2, 3, 6} and night_start <= t <= night_end
+    return is_day_session or is_night_session
+
+
 def _throttle():
     global _request_count, _last_request_time
     now = time.time()
@@ -151,7 +174,7 @@ def _choose_cache_suffix(df: pd.DataFrame) -> str:
     if df is not None and len(df) > 0:
         latest = pd.Timestamp(df["date"].iloc[-1]).strftime("%Y%m%d")
         if latest == today_str:
-            return "final" if _is_after_close() else "live"
+            return "live" if _is_trading_session_active() else "final"
 
     return "live"
 
@@ -173,13 +196,16 @@ def _ensure_cache_dir():
     for f in CACHE_DIR.glob("*.parquet"):
         if today not in f.name:
             f.unlink()
-    if _is_after_close() and datetime.now().weekday() < 5:
+    if _live_cache_stale():
         for f in CACHE_DIR.glob(f"*_{today}_live.parquet"):
             f.unlink()
 
 
 def _live_cache_stale() -> bool:
-    return datetime.now().weekday() >= 5 or _is_after_close()
+    now = datetime.now()
+    if _is_trading_session_active(now):
+        return False
+    return now.weekday() >= 5 or _is_after_close()
 
 
 # ============================================================

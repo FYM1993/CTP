@@ -34,7 +34,7 @@ import yaml
 import numpy as np
 import pandas as pd
 
-from ctp_log import get_logger
+from ctp_log import get_log_path, get_logger
 
 from data_cache import (
     get_all_symbols, get_daily, get_minute,
@@ -507,7 +507,7 @@ def phase_3_intraday(
 
     intraday_cfg = config.get("intraday", {})
 
-    print("盘中监控：终端仅打印观望品种反转/信号持续/消失；其余见 logs/ctp.log")
+    print(f"盘中监控：终端仅打印观望品种反转/信号持续/消失；其余见 {get_log_path()}")
     log.info("\n" + "▓" * 60)
     log.info("▓  Phase 3: 盘中实时监控")
     log.info("▓" * 60)
@@ -1187,7 +1187,7 @@ def main():
     config = load_config()
     now = datetime.now()
 
-    print("每日工作流：盘前/筛选/深度分析写入 logs/ctp.log；盘中终端仅输出观望反转警报。")
+    print(f"每日工作流：盘前/筛选/深度分析写入 {get_log_path()}；盘中终端仅输出观望反转警报。")
     log.info("╔" + "═" * 58 + "╗")
     log.info("║" + "每日交易工作流".center(48) + "║")
     log.info("║" + f"  {now.strftime('%Y-%m-%d %H:%M')}".ljust(56) + "║")
