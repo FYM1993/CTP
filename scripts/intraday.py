@@ -30,14 +30,20 @@
 import time
 import argparse
 from datetime import datetime
+from typing import Optional
 
 import yaml
 import numpy as np
 import pandas as pd
 
 from pathlib import Path
+
+from ctp_log import get_logger
 from data_cache import get_minute
+
+log = get_logger("intraday")
 from wyckoff import vsa_scan, classify_vsa_bar, relative_volume, close_position
+from tqsdk_live import TqPhase3Monitor, tqsdk_configured
 
 
 def load_config() -> dict:
@@ -322,43 +328,43 @@ def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cf
 
     dir_icon = "🟢多" if direction == "long" else "🔴空"
 
-    print(f"\n┌─── {name}({symbol}) {dir_icon} ── {last_time.strftime('%H:%M')} ───┐")
-    print(f"│ 价格: {last:.0f}  涨跌: {day_change:+.2f}%  高: {day_high:.0f}  低: {day_low:.0f}")
-    print(f"│ BB: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
-    print(f"│ RSI: {rsi:.1f}  KDJ: {k.iloc[-1]:.0f}/{d.iloc[-1]:.0f}/{j.iloc[-1]:.0f}")
-    print(f"│ MACD: {dif.iloc[-1]:.1f}/{dea.iloc[-1]:.1f}  柱:{hist.iloc[-1]:.1f}")
-    print(f"│ ATR: {atr:.1f} ({atr/last*100:.2f}%)")
+    log.info(f"\n┌─── {name}({symbol}) {dir_icon} ── {last_time.strftime('%H:%M')} ───┐")
+    log.info(f"│ 价格: {last:.0f}  涨跌: {day_change:+.2f}%  高: {day_high:.0f}  低: {day_low:.0f}")
+    log.info(f"│ BB: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
+    log.info(f"│ RSI: {rsi:.1f}  KDJ: {k.iloc[-1]:.0f}/{d.iloc[-1]:.0f}/{j.iloc[-1]:.0f}")
+    log.info(f"│ MACD: {dif.iloc[-1]:.1f}/{dea.iloc[-1]:.1f}  柱:{hist.iloc[-1]:.1f}")
+    log.info(f"│ ATR: {atr:.1f} ({atr/last*100:.2f}%)")
 
     # VSA 最近K线分析
     vsa_bars = vsa_scan(df, window=20)
     last_vsa = vsa_bars[-1] if vsa_bars else None
     if last_vsa and last_vsa.strength >= 1:
         bias_icon = "🟢" if last_vsa.bias == "bullish" else "🔴" if last_vsa.bias == "bearish" else "⚪"
-        print(f"│ VSA: {bias_icon} [{last_vsa.bar_type}] {'★' * last_vsa.strength}")
+        log.info(f"│ VSA: {bias_icon} [{last_vsa.bar_type}] {'★' * last_vsa.strength}")
 
     # 相对成交量
     rel_vol = relative_volume(df, 20)
     rv = float(rel_vol.iloc[-1]) if not np.isnan(rel_vol.iloc[-1]) else 1.0
     vol_label = "放量🔥" if rv > 2 else "偏高" if rv > 1.3 else "缩量" if rv < 0.6 else ""
     if vol_label:
-        print(f"│ 量比: {rv:.1f} {vol_label}")
+        log.info(f"│ 量比: {rv:.1f} {vol_label}")
 
     # 生成信号
     signals = generate_signals(df, direction, cfg)
 
     if signals:
-        print(f"│")
-        print(f"│ ⚡ 信号:")
+        log.info(f"│")
+        log.info(f"│ ⚡ 信号:")
         for sig in signals:
             strength_icon = {"强": "🔥", "中": "⚡", "弱": "💡"}.get(sig["strength"], "")
-            print(f"│   {strength_icon} [{sig['type']}] {sig['reason']}")
+            log.info(f"│   {strength_icon} [{sig['type']}] {sig['reason']}")
             if "entry" in sig:
-                print(f"│      入场:{sig['entry']:.0f}  止损:{sig.get('stop', 0):.0f}  目标:{sig.get('target', 0):.0f}")
+                log.info(f"│      入场:{sig['entry']:.0f}  止损:{sig.get('stop', 0):.0f}  目标:{sig.get('target', 0):.0f}")
     else:
-        print(f"│")
-        print(f"│ 🔇 无信号，继续观望")
+        log.info(f"│")
+        log.info(f"│ 🔇 无信号，继续观望")
 
-    print(f"└{'─'*50}┘")
+    log.info(f"└{'─'*50}┘")
 
 
 def run_once(period: str = "5"):
@@ -368,40 +374,116 @@ def run_once(period: str = "5"):
     intraday_cfg = config.get("intraday", {})
 
     now = datetime.now()
-    print(f"\n{'═'*52}")
-    print(f"  日内监控  {now.strftime('%Y-%m-%d %H:%M:%S')}  K线:{period}分钟")
-    print(f"{'═'*52}")
+    log.info(f"\n{'═'*52}")
+    log.info(f"  日内监控  {now.strftime('%Y-%m-%d %H:%M:%S')}  K线:{period}分钟")
+    log.info(f"{'═'*52}")
 
-    for symbol, pos_cfg in positions.items():
+    tq = config.get("tqsdk") or {}
+    mon: Optional[TqPhase3Monitor] = None
+    if tqsdk_configured(config):
         try:
-            df = fetch_minute_data(symbol, period)
-            if df.empty:
-                print(f"\n  {pos_cfg['name']}: 无数据（非交易时段）")
-                continue
-            print_dashboard(symbol, pos_cfg["name"], pos_cfg["direction"], df, intraday_cfg)
+            syms = list(positions.keys())
+            mon = TqPhase3Monitor(
+                account=str(tq["account"]).strip(),
+                password=str(tq["password"]).strip(),
+                symbols=syms,
+                period=period,
+            )
+            mon.connect()
+            mon.warmup()
+            log.info("\n  数据源: TqSdk 实时K线")
         except Exception as e:
-            print(f"\n  {pos_cfg['name']}: ❌ {e}")
+            log.info(f"\n  ⚠️ TqSdk 不可用，使用新浪分钟线: {e}")
+            mon = None
+    else:
+        log.info("\n  数据源: 新浪分钟线（配置 tqsdk 账户可改用 TqSdk）")
+
+    try:
+        for symbol, pos_cfg in positions.items():
+            try:
+                if mon:
+                    df = mon.minute_df(symbol)
+                    if df is None:
+                        df = pd.DataFrame()
+                else:
+                    df = fetch_minute_data(symbol, period)
+                if df is None or df.empty:
+                    log.info(f"\n  {pos_cfg['name']}: 无数据（非交易时段或合约无行情）")
+                    continue
+                print_dashboard(symbol, pos_cfg["name"], pos_cfg["direction"], df, intraday_cfg)
+            except Exception as e:
+                log.info(f"\n  {pos_cfg['name']}: ❌ {e}")
+    finally:
+        if mon:
+            mon.close()
 
 
 def run_loop(period: str = "5", interval: int = 60):
-    """持续监控"""
-    print("🚀 日内策略监控启动")
-    print(f"   K线周期: {period}分钟")
-    print(f"   刷新间隔: {interval}秒")
-    print(f"   按 Ctrl+C 停止\n")
+    """持续监控（单连接 TqSdk 时复用同一订阅，避免重复握手）"""
+    print("日内监控详情写入 logs/ctp.log（本终端仅提示启动/停止）。")
+    config = load_config()
+    positions = config["positions"]
+    intraday_cfg = config.get("intraday", {})
+    tq = config.get("tqsdk") or {}
 
-    while True:
+    log.info("🚀 日内策略监控启动")
+    log.info(f"   K线周期: {period}分钟")
+    log.info(f"   刷新间隔: {interval}秒")
+    log.info(f"   按 Ctrl+C 停止\n")
+
+    mon: Optional[TqPhase3Monitor] = None
+    if tqsdk_configured(config):
         try:
-            run_once(period)
-            print(f"\n⏳ {interval}秒后刷新...", end="", flush=True)
-            time.sleep(interval)
-            print("\033[2J\033[H", end="")  # 清屏
-        except KeyboardInterrupt:
-            print("\n\n🛑 监控已停止")
-            break
+            mon = TqPhase3Monitor(
+                account=str(tq["account"]).strip(),
+                password=str(tq["password"]).strip(),
+                symbols=list(positions.keys()),
+                period=period,
+            )
+            mon.connect()
+            mon.warmup()
+            log.info("   数据源: TqSdk 实时K线\n")
         except Exception as e:
-            print(f"\n❌ 错误: {e}")
-            time.sleep(10)
+            log.info(f"   ⚠️ TqSdk 不可用，使用新浪: {e}\n")
+            mon = None
+    else:
+        log.info("   数据源: 新浪分钟线\n")
+
+    try:
+        while True:
+            try:
+                now = datetime.now()
+                log.info(f"\n{'═'*52}")
+                log.info(f"  日内监控  {now.strftime('%Y-%m-%d %H:%M:%S')}  K线:{period}分钟")
+                log.info(f"{'═'*52}")
+
+                for symbol, pos_cfg in positions.items():
+                    try:
+                        if mon:
+                            df = mon.minute_df(symbol)
+                        else:
+                            df = fetch_minute_data(symbol, period)
+                        if df is None or df.empty:
+                            log.info(f"\n  {pos_cfg['name']}: 无数据")
+                            continue
+                        print_dashboard(symbol, pos_cfg["name"], pos_cfg["direction"], df, intraday_cfg)
+                    except Exception as e:
+                        log.info(f"\n  {pos_cfg['name']}: ❌ {e}")
+
+                log.info("\n⏳ %s秒后刷新...", interval)
+                if mon:
+                    mon.wait_interval(float(interval))
+                else:
+                    time.sleep(interval)
+            except KeyboardInterrupt:
+                print("\n\n🛑 监控已停止")
+                break
+            except Exception as e:
+                log.exception("错误: %s", e)
+                time.sleep(10)
+    finally:
+        if mon:
+            mon.close()
 
 
 def main():

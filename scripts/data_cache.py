@@ -28,6 +28,10 @@ import pandas as pd
 import numpy as np
 import akshare as aks
 
+from ctp_log import get_logger
+
+_log = get_logger("data_cache")
+
 CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 
 _request_count = 0
@@ -690,7 +694,7 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
 
     for i, info in enumerate(symbols):
         sym = info["symbol"]
-        print(f"\r  [{i+1}/{len(symbols)}] {info['name']:8s}", end="", flush=True)
+        _log.info("[%s/%s] 预加载 %s", i + 1, len(symbols), info["name"])
 
         final_path, live_path = _cache_paths(sym, "daily")
 
@@ -724,9 +728,9 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
                 pass
             data[sym] = df
 
-    msg = f"\n  📊 加载完成: {len(data)}个品种 (缓存{cache_hits}, API{api_calls}"
+    msg = f"加载完成: {len(data)}个品种 (缓存{cache_hits}, API{api_calls}"
     if live_count > 0:
         msg += f", {live_count}个尚无今日数据"
     msg += ")"
-    print(msg)
+    _log.info(msg)
     return data

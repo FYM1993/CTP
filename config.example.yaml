@@ -39,6 +39,7 @@ positions:
 pre_market:
   # 均线系统
   ma_windows: [5, 10, 20, 60, 120]
+  direction_delta: 12      # Phase 2 自主判定多空时的最小分差
 
   # 支撑阻力
   sr_lookback: 120          # 支撑阻力回看天数
@@ -71,6 +72,10 @@ fundamental_screening:
     low_sensitivity:   # 低敏感度/高波动 (需极端数据)
       threshold: 15
       symbols: ["AU0", "AG0", "LC0", "SI0"]
+
+phase1:
+  top_n: 6
+  min_candidate_score: 55
 
 # ==================== 日内策略参数 ====================
 intraday:

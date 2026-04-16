@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Program Design"
+  short_description: "Design and review robust Python programs"
+  default_prompt: "Use $python-program-design to design or review a Python program for clarity, maintainability, and testability."

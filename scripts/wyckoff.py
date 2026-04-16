@@ -592,76 +592,7 @@ def oi_divergence(df: pd.DataFrame, window: int = 20) -> str | None:
 
 
 # ============================================================
-#  5. 综合评分 (供 screener 使用)
-# ============================================================
-
-def wyckoff_score(df: pd.DataFrame) -> dict:
-    """
-    输出一个综合的 Wyckoff 量价评分字典
-
-    返回:
-        phase: 当前阶段
-        vsa_bias: 最近VSA信号偏向
-        oi_signal: 持仓信号
-        composite: 综合分 (-100 ~ +100, 负=做多, 正=做空)
-    """
-    result = {"phase": "", "vsa_bias": "", "oi_signal": "", "composite": 0.0}
-
-    # 阶段
-    phase = wyckoff_phase(df, lookback=120)
-    result["phase"] = phase.phase
-    result["phase_confidence"] = phase.confidence
-    result["phase_desc"] = phase.description
-
-    phase_score = 0.0
-    if phase.phase == "accumulation":
-        phase_score = -20 * phase.confidence
-    elif phase.phase == "distribution":
-        phase_score = 20 * phase.confidence
-    elif phase.phase == "markup":
-        phase_score = -10 * phase.confidence
-    elif phase.phase == "markdown":
-        phase_score = 10 * phase.confidence
-
-    # VSA 最近5根K线
-    vsa_bars = vsa_scan(df, window=20)
-    recent_vsa = vsa_bars[-5:] if len(vsa_bars) >= 5 else vsa_bars
-    bullish_vsa = sum(1 for b in recent_vsa if b.bias == "bullish")
-    bearish_vsa = sum(1 for b in recent_vsa if b.bias == "bearish")
-
-    if bullish_vsa > bearish_vsa:
-        result["vsa_bias"] = "bullish"
-    elif bearish_vsa > bullish_vsa:
-        result["vsa_bias"] = "bearish"
-    else:
-        result["vsa_bias"] = "neutral"
-
-    vsa_score = (bearish_vsa - bullish_vsa) * 5
-
-    # OI
-    oi_sig = analyze_oi(df, window=5)
-    oi_score = 0.0
-    if oi_sig:
-        result["oi_signal"] = oi_sig.label
-        if oi_sig.bias == "bearish":
-            oi_score = 10 if oi_sig.strength == "强势" else 5
-        else:
-            oi_score = -10 if oi_sig.strength == "强势" else -5
-
-    # 量价模式
-    vp = analyze_volume_pattern(df, lookback=60)
-    vp_score = 0.0
-    if vp["up_down_ratio"] > 1.3:
-        vp_score = -10
-    elif vp["up_down_ratio"] < 0.7:
-        vp_score = 10
-
-    result["composite"] = phase_score + vsa_score + oi_score + vp_score
-    return result
-
-
-# ============================================================
-#  7. 反转信号评估（入场信号驱动）
+#  5. 反转信号评估（入场信号驱动）
 # ============================================================
 
 def _bar_dict(row) -> dict:

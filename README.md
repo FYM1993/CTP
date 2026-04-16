@@ -39,7 +39,7 @@ python scripts/daily_workflow.py --skip-screen
 python scripts/daily_workflow.py --resume
 
 # 调整筛选灵敏度（默认25，越大越严格）
-python scripts/daily_workflow.py --threshold 35
+python scripts/daily_workflow.py --threshold 25
 
 # 最多跟踪N个品种
 python scripts/daily_workflow.py --max-picks 4
@@ -56,18 +56,20 @@ crontab -e
 30 8 * * 1-5 cd /path/to/ctp && python scripts/daily_workflow.py >> logs/$(date +\%Y\%m\%d).log 2>&1
 ```
 
-## 单独使用各模块
+## 高级用法
 
 ```bash
-# 全市场筛选
-python scripts/screener.py --top 10
+# 只做筛选和分析，不监控（快速查看机会）
+python scripts/daily_workflow.py --no-monitor
 
-# 盘前分析（config.yaml 中的品种）
-python scripts/pre_market.py
+# 只分析 config.yaml 指定品种（跳过全市场扫描）
+python scripts/daily_workflow.py --skip-screen --no-monitor
 
-# 盘中监控
-python scripts/intraday.py --once
-python scripts/intraday.py --period 15 --interval 30
+# 恢复今日分析结果，直接进入监控
+python scripts/daily_workflow.py --resume
+
+# 自定义筛选数量和监控参数
+python scripts/daily_workflow.py --max-picks 10 --period 15 --interval 30
 ```
 
 ## 分析体系
@@ -108,8 +110,7 @@ ctp/
 ├── config.yaml                  # 策略配置
 ├── requirements.txt             # 依赖
 ├── scripts/
-│   ├── daily_workflow.py        # 每日自动化工作流（主入口）
-│   ├── screener.py              # 全市场品种筛选
+│   ├── daily_workflow.py        # 每日自动化工作流（主入口，含 Phase 1 全市场筛选）
 │   ├── pre_market.py            # 盘前深度分析
 │   ├── intraday.py              # 盘中实时监控
 │   ├── wyckoff.py               # Wyckoff量价分析引擎
