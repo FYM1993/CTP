@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import pandas as pd
 
@@ -41,35 +42,62 @@ def klines_to_daily_frame(klines: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["close"]).reset_index(drop=True)
 
 
+def create_tq_api(account: str, password: str):
+    from tqsdk import TqApi, TqAuth
+
+    return TqApi(auth=TqAuth(account, password))
+
+
+def _wait_for_ready_daily_frame(api, klines: pd.DataFrame, wait_timeout: float) -> pd.DataFrame | None:
+    frame = klines_to_daily_frame(klines)
+    if len(frame) > 0:
+        return frame
+
+    wait_update = getattr(api, "wait_update", None)
+    if wait_update is None:
+        return None
+
+    deadline = time.time() + max(wait_timeout, 0.0)
+    while time.time() < deadline:
+        updated = wait_update(deadline=deadline)
+        frame = klines_to_daily_frame(klines)
+        if len(frame) > 0:
+            return frame
+        if not updated:
+            break
+    return None
+
+
 def fetch_daily_from_tq(
     symbol: str,
     exchange: str,
     days: int,
     account: str,
     password: str,
+    api=None,
+    wait_timeout: float = 5.0,
 ) -> pd.DataFrame | None:
-    try:
-        from tqsdk import TqApi, TqAuth
-    except Exception:
-        return None
-
     try:
         tq_symbol = symbol_to_tq_main(symbol.strip(), exchange)
     except Exception:
         return None
 
-    api = None
+    owns_api = api is None
     try:
-        api = TqApi(auth=TqAuth(account, password))
+        if api is None:
+            api = create_tq_api(account, password)
         klines = api.get_kline_serial(tq_symbol, 86400, data_length=max(days, 30))
         if klines is None or len(klines) < 1:
             return None
-        return klines_to_daily_frame(klines).tail(days).reset_index(drop=True)
+        frame = _wait_for_ready_daily_frame(api, klines, wait_timeout)
+        if frame is None or len(frame) < 1:
+            return None
+        return frame.tail(days).reset_index(drop=True)
     except Exception:
         return None
     finally:
         try:
-            if api is not None:
+            if owns_api and api is not None:
                 api.close()
         except Exception:
             pass

@@ -240,3 +240,161 @@ def test_fetch_daily_from_tq_standardizes_oi_from_close_oi(monkeypatch):
 
     assert list(out.columns) == ["date", "open", "high", "low", "close", "volume", "oi"]
     assert float(out.iloc[0]["oi"]) == 888.0
+
+
+def test_fetch_daily_from_tq_waits_for_initial_update(monkeypatch):
+    fake_tqsdk = ModuleType("tqsdk")
+
+    class FakeTqAuth:
+        def __init__(self, account, password):
+            self.account = account
+            self.password = password
+
+    class FakeTqApi:
+        instances = []
+
+        def __init__(self, auth=None):
+            self.auth = auth
+            self.closed = False
+            self.wait_calls = 0
+            self.frame = None
+            FakeTqApi.instances.append(self)
+
+        def get_kline_serial(self, symbol, duration_seconds, data_length=None):
+            assert symbol == "KQ.m@DCE.lh"
+            assert duration_seconds == 86400
+            self.frame = pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(["2026-04-15"]),
+                    "open": [100.0],
+                    "high": [110.0],
+                    "low": [90.0],
+                    "close": [float("nan")],
+                    "volume": [1234.0],
+                    "close_oi": [888.0],
+                }
+            )
+            return self.frame
+
+        def wait_update(self, deadline=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                self.frame.loc[0, "close"] = 105.0
+                return True
+            return False
+
+        def close(self):
+            self.closed = True
+
+    fake_tqsdk.TqAuth = FakeTqAuth
+    fake_tqsdk.TqApi = FakeTqApi
+
+    monkeypatch.setitem(sys.modules, "tqsdk", fake_tqsdk)
+
+    out = market_data_tq.fetch_daily_from_tq("LH0", "dce", 30, "acct", "pwd")
+
+    assert len(out) == 1
+    assert float(out.iloc[0]["close"]) == 105.0
+    assert FakeTqApi.instances[0].wait_calls >= 1
+    assert FakeTqApi.instances[0].closed is True
+
+
+def test_prefetch_all_reuses_single_tq_session(monkeypatch, tmp_path):
+    class FakeApi:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    created_apis = []
+    used_apis = []
+
+    def fake_create_tq_api(account, password):
+        assert account == "acct"
+        assert password == "pwd"
+        api = FakeApi()
+        created_apis.append(api)
+        return api
+
+    def fake_tq_fetch(symbol, exchange, days, account, password, api=None):
+        used_apis.append(api)
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-15"]),
+                "open": [100.0],
+                "high": [110.0],
+                "low": [90.0],
+                "close": [105.0],
+                "volume": [1234.0],
+                "oi": [888.0],
+            }
+        )
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(data_cache, "_create_tq_api", fake_create_tq_api, raising=False)
+    monkeypatch.setattr(data_cache, "_tq_fetch_daily_from_tq", fake_tq_fetch)
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not fallback to AkShare")),
+    )
+
+    out = data_cache.prefetch_all(
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ]
+    )
+
+    assert set(out) == {"LH0", "M0"}
+    assert len(created_apis) == 1
+    assert used_apis == [created_apis[0], created_apis[0]]
+    assert created_apis[0].closed is True
+
+
+def test_prefetch_all_skips_per_symbol_tq_retry_after_session_init_failure(monkeypatch, tmp_path):
+    fallback_calls = []
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(
+        data_cache,
+        "_create_tq_api",
+        lambda account, password: (_ for _ in ()).throw(RuntimeError("boom")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        data_cache,
+        "fetch_daily_from_tq",
+        lambda symbol, days: (_ for _ in ()).throw(AssertionError("should not retry per symbol Tq fetch")),
+    )
+
+    def fake_fallback(symbol, days):
+        fallback_calls.append((symbol, days))
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-15"]),
+                "open": [100.0],
+                "high": [110.0],
+                "low": [90.0],
+                "close": [105.0],
+                "volume": [1234.0],
+                "oi": [888.0],
+            }
+        )
+
+    monkeypatch.setattr(data_cache, "_fetch_daily_from_api", fake_fallback)
+
+    out = data_cache.prefetch_all(
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ]
+    )
+
+    assert set(out) == {"LH0", "M0"}
+    assert fallback_calls == [("LH0", 400), ("M0", 400)]

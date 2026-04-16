@@ -30,7 +30,10 @@ import akshare as aks
 import yaml
 
 from ctp_log import get_logger
-from market_data_tq import fetch_daily_from_tq as _tq_fetch_daily_from_tq
+from market_data_tq import (
+    create_tq_api as _create_tq_api,
+    fetch_daily_from_tq as _tq_fetch_daily_from_tq,
+)
 
 _log = get_logger("data_cache")
 
@@ -63,16 +66,38 @@ def _exchange_for_symbol(symbol: str) -> str | None:
     return None
 
 
-def fetch_daily_from_tq(symbol: str, days: int) -> pd.DataFrame | None:
-    exchange = _exchange_for_symbol(symbol)
-    if not exchange:
-        return None
-    config = _load_config()
+def _tq_credentials(config: dict | None = None) -> tuple[str, str] | None:
+    if config is None:
+        config = _load_config()
     tq_cfg = config.get("tqsdk") or {}
     account = (tq_cfg.get("account") or "").strip()
     password = (tq_cfg.get("password") or "").strip()
     if not account or not password:
         return None
+    return account, password
+
+
+def _fetch_daily_from_tq_with_api(symbol: str, days: int, api, config: dict | None = None) -> pd.DataFrame | None:
+    exchange = _exchange_for_symbol(symbol)
+    credentials = _tq_credentials(config)
+    if not exchange or credentials is None:
+        return None
+    account, password = credentials
+    try:
+        return _tq_fetch_daily_from_tq(symbol, exchange, days, account, password, api=api)
+    except Exception:
+        return None
+
+
+def fetch_daily_from_tq(symbol: str, days: int) -> pd.DataFrame | None:
+    exchange = _exchange_for_symbol(symbol)
+    if not exchange:
+        return None
+    config = _load_config()
+    credentials = _tq_credentials(config)
+    if credentials is None:
+        return None
+    account, password = credentials
     try:
         return _tq_fetch_daily_from_tq(symbol, exchange, days, account, password)
     except Exception:
@@ -735,47 +760,72 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
     api_calls = 0
     cache_hits = 0
     live_count = 0
+    config = _load_config()
+    tq_credentials = _tq_credentials(config)
+    tq_api = None
+    tq_available = tq_credentials is not None
 
-    for i, info in enumerate(symbols):
-        sym = info["symbol"]
-        _log.info("[%s/%s] 预加载 %s", i + 1, len(symbols), info["name"])
+    if tq_available:
+        account, password = tq_credentials
+        try:
+            tq_api = _create_tq_api(account, password)
+        except Exception as e:
+            _log.warning("TqSdk 初始化失败，批量预取改走 AkShare: %s", e)
+            tq_available = False
+            tq_api = None
 
-        final_path, live_path = _cache_paths(sym, "daily")
+    try:
+        for i, info in enumerate(symbols):
+            sym = info["symbol"]
+            _log.info("[%s/%s] 预加载 %s", i + 1, len(symbols), info["name"])
 
-        cached_df = None
-        for p in (final_path, live_path):
-            if p == live_path and _live_cache_stale():
-                p.unlink(missing_ok=True)
-                continue
-            if p.exists():
-                try:
-                    cached_df = pd.read_parquet(p)
-                    if len(cached_df) > 0:
-                        break
-                    cached_df = None
-                except Exception:
+            final_path, live_path = _cache_paths(sym, "daily")
+
+            cached_df = None
+            for p in (final_path, live_path):
+                if p == live_path and _live_cache_stale():
                     p.unlink(missing_ok=True)
-                    cached_df = None
+                    continue
+                if p.exists():
+                    try:
+                        cached_df = pd.read_parquet(p)
+                        if len(cached_df) > 0:
+                            break
+                        cached_df = None
+                    except Exception:
+                        p.unlink(missing_ok=True)
+                        cached_df = None
 
-        if cached_df is not None:
-            data[sym] = cached_df
-            cache_hits += 1
-            continue
+            if cached_df is not None:
+                data[sym] = cached_df
+                cache_hits += 1
+                continue
 
-        df = fetch_daily_from_tq(sym, days=400)
-        if df is None or len(df) == 0:
-            df = _fetch_daily_from_api(sym, days=400)
-            api_calls += 1
-        if df is not None and len(df) > 0:
-            suffix = _choose_cache_suffix(df)
-            save_path = final_path if suffix == "final" else live_path
-            if suffix == "live":
-                live_count += 1
+            if tq_api is not None:
+                df = _fetch_daily_from_tq_with_api(sym, days=400, api=tq_api, config=config)
+            elif tq_available:
+                df = fetch_daily_from_tq(sym, days=400)
+            else:
+                df = None
+            if df is None or len(df) == 0:
+                df = _fetch_daily_from_api(sym, days=400)
+                api_calls += 1
+            if df is not None and len(df) > 0:
+                suffix = _choose_cache_suffix(df)
+                save_path = final_path if suffix == "final" else live_path
+                if suffix == "live":
+                    live_count += 1
+                try:
+                    df.to_parquet(save_path, index=False)
+                except Exception:
+                    pass
+                data[sym] = df
+    finally:
+        if tq_api is not None:
             try:
-                df.to_parquet(save_path, index=False)
+                tq_api.close()
             except Exception:
                 pass
-            data[sym] = df
 
     msg = f"加载完成: {len(data)}个品种 (缓存{cache_hits}, API{api_calls}"
     if live_count > 0:
