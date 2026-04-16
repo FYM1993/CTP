@@ -259,6 +259,27 @@ def _phase_scores_support_direction(direction: str, fund: float, p2: float) -> b
     return False
 
 
+def build_phase1_summary(
+    top_n: int,
+    sort_field: str = "attention_score",
+    label_field: str = "labels",
+) -> dict[str, object]:
+    """返回 Phase 1 机会发现摘要，供报告和 JSON payload 使用。"""
+    field_cn = {
+        "attention_score": "关注分",
+        "reversal_score": "反转分",
+        "trend_score": "趋势分",
+        "labels": "机会标签",
+        "state_labels": "状态标签",
+    }
+    return {
+        "阶段": "Phase 1 发现机会",
+        "Top N": int(top_n),
+        "排序字段": f"{sort_field}（{field_cn.get(sort_field, sort_field)}）",
+        "标签字段": f"{label_field}（{field_cn.get(label_field, label_field)}）",
+    }
+
+
 def phase_2_premarket(
     candidates: list[dict],
     config: dict,
@@ -318,6 +339,17 @@ def phase_2_premarket(
             )
             if result:
                 result["direction"] = analysis_direction
+                result["attention_score"] = float(cand.get("attention_score", abs(cand.get("score", 0))))
+                result["reversal_score"] = float(cand.get("reversal_score", 0.0))
+                result["trend_score"] = float(cand.get("trend_score", 0.0))
+                result["phase1_labels"] = list(cand.get("labels") or [])
+                result["phase1_state_labels"] = list(cand.get("state_labels") or [])
+                result["phase1_data_coverage"] = float(cand.get("data_coverage", 0.0))
+                result["phase1_reason_summary"] = cand.get("reason_summary") or cand.get("entry_pool_reason", "")
+                result.setdefault("labels", result["phase1_labels"])
+                result.setdefault("state_labels", result["phase1_state_labels"])
+                result.setdefault("data_coverage", result["phase1_data_coverage"])
+                result.setdefault("reason_summary", result["phase1_reason_summary"])
                 result["fund_range_pct"] = cand.get("range_pct", 0)
                 result["fund_inv_change"] = cand.get("inv_change_4wk")
                 result["fund_inv_percentile"] = cand.get("inv_percentile")
@@ -699,7 +731,11 @@ def _clean_numpy(targets: list[dict]) -> list[dict]:
     return clean
 
 
-def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
+def save_targets(
+    targets: list[dict],
+    watchlist: list[dict] | None = None,
+    phase1_summary: dict | None = None,
+):
     """
     将 Phase 2 结果落盘：写入当日 ``_targets.json``（供 ``--resume``）与 ``_targets.md``（表格+说明+分品种详情）。
     """
@@ -709,12 +745,15 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         watchlist = _clean_numpy(watchlist)
     else:
         watchlist = []
+    if phase1_summary is None:
+        phase1_summary = build_phase1_summary(top_n=len(targets))
 
     json_path = _today_json_path()
     payload = {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "targets": targets,
         "watchlist": watchlist,
+        "phase1_summary": phase1_summary,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -740,7 +779,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
             "> **未满足可操作三要件**：① 有效入场信号 ② Phase 2 达标（做多>+20 / 做空<-20）③ 盈亏比≥1。"
         )
         lines.append(
-            "> **方向**由 Phase 2 技术面总分解析得到；Phase 1 只负责给出关注候选与入池理由。"
+            "> **方向**由 Phase 2 技术面总分解析得到；Phase 1 只负责给出关注候选、关注分与机会标签。"
             "若 RRF 旁有 **⚠️逆势**，表示 P1/P2 读数与计划方向未共振（常见于摸顶/抄底），"
             "可在有确认信号时参与，但须自行加权风控。"
         )
@@ -777,7 +816,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
     if targets:
         lines.append("")
         lines.append(
-            "| 状态 | 合约 | 方向 | 入池理由 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 标签 | 基本面详情 |"
+            "| 状态 | 合约 | 方向 | 关注理由 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
         )
         lines.append(
             "| :---: | :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |"
@@ -803,6 +842,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 tag_cells.append("逆势")
             tag_str = "/".join(tag_cells) if tag_cells else "-"
             epr = _md_cell(t.get("entry_pool_reason") or "-")
+            phase1_labels = "/".join(t.get("phase1_labels") or t.get("labels") or []) or "-"
+            phase1_summary = _md_cell(t.get("phase1_reason_summary") or t.get("reason_summary") or "-")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
             lines.append(
@@ -810,14 +851,14 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| **{rrf:.4f}** | {r1} | {r2} "
-                f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {ss:.2f} | {_md_cell(tag_str)} | {_md_cell(_build_fund_str(t))} |"
+                f"| {t.get('attention_score', t.get('fund_screen_score', 0)):+.1f} | {t.get('score', 0):+.1f} "
+                f"| {ss:.2f} | {_md_cell(phase1_labels)} | {phase1_summary} |"
             )
 
     if watchlist:
         lines.append("")
         lines.append(
-            "| 合约 | 方向 | 入池理由 | 当前价 | 系统提示 | RRF | #P1 | #P2 | 基本面 | 技术面 | 信号强度 | 标签 | 基本面详情 |"
+            "| 合约 | 方向 | 关注理由 | 当前价 | 系统提示 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
         )
         lines.append("| :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
         for t in watchlist:
@@ -835,7 +876,8 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 wtags.append("逆势")
             conflict_tag = f" ⚠️{'/'.join(wtags)}" if wtags else ""
             epr = _md_cell(t.get("entry_pool_reason") or "-")
-            wtag_cell = "/".join(wtags) if wtags else "-"
+            phase1_labels = "/".join(t.get("phase1_labels") or t.get("labels") or []) or "-"
+            phase1_summary = _md_cell(t.get("phase1_reason_summary") or t.get("reason_summary") or "-")
             rrf_cell = _md_cell(f"**{rrf:.4f}**{conflict_tag}")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
@@ -843,31 +885,31 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                 f"| {name_cell} | {dir_cell} "
                 f"| {epr} | {t['price']:.0f} | {_md_cell(f'⏳{next_exp}')} "
                 f"| {rrf_cell} | {r1} | {r2} "
-                f"| {t.get('fund_screen_score', 0):+.1f} | {t.get('score', 0):+.1f} "
-                f"| {ss:.2f} | {_md_cell(wtag_cell)} | {_md_cell(_build_fund_str(t))} |"
+                f"| {t.get('attention_score', t.get('fund_screen_score', 0)):+.1f} | {t.get('score', 0):+.1f} "
+                f"| {ss:.2f} | {_md_cell(phase1_labels)} | {phase1_summary} |"
             )
 
     lines.append("")
     lines.append("## 评分说明")
     lines.append("")
-    lines.append("### Phase 1 基本面筛选评分体系")
+    lines.append("### Phase 1 机会发现评分体系")
     lines.append("")
-    lines.append("所有评分统一约定：**正分=偏多(做多机会)，负分=偏空(做空机会)**。分值越大信号越强。")
+    lines.append("所有评分统一约定：**正分=偏多机会，负分=偏空机会**。分值越大代表关注优先级越高。")
     lines.append("")
     lines.append(
-        "Phase 1 为纯基本面筛选，通过**各品种基本面门槛**或极端价格位（<5% 或 >95%）进入候选池。"
-        "门槛由 config 分层配置（默认与各品种分类），并非单一固定「数值≥10」规则。"
+        "Phase 1 负责发现机会并输出关注优先级，通过**各品种基本面门槛**或极端价格位（<5% 或 >95%）进入候选池。"
+        "它不直接定方向，方向由 Phase 2 结合技术面与信号时机决定。门槛由 config 分层配置（默认与各品种分类），并非单一固定「数值≥10」规则。"
     )
     lines.append("")
     lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
     lines.append("| :--- | ---: | :--- | :--- |")
-    lines.append("| 库存变化 | ±20 | 东方财富(~30品种) | 去库=供不应求=+分(做多), 累库=供过于求=-分(做空) |")
-    lines.append("| 库存分位 | ±10 | 东方财富 | 当前库存在52周范围内的位置。库存低位=+分(做多), 库存高位=-分(做空) |")
-    lines.append("| 仓单变化 | ±15 | 上期所+广期所仓单 | 仓单减少=供应收紧=+分(做多), 仓单增加=供应压力=-分(做空) |")
+    lines.append("| 库存变化 | ±20 | 东方财富(~30品种) | 去库=供不应求=+关注分, 累库=供过于求=-关注分 |")
+    lines.append("| 库存分位 | ±10 | 东方财富 | 当前库存在52周范围内的位置。库存低位=更高关注优先级, 库存高位=更高空头关注优先级 |")
+    lines.append("| 仓单变化 | ±15 | 上期所+广期所仓单 | 仓单减少=供应收紧=+关注分, 仓单增加=供应压力=-关注分 |")
     lines.append("| 季节性 | ±10 | 历史日线 | 当前月份的历史涨跌概率与平均收益率 |")
-    lines.append("| 生猪专项 | ±15 | 卓创资讯 | 仅LH0: 养殖亏损=+分(价格低做多), 养殖盈利=-分(价格高做空) |")
+    lines.append("| 生猪专项 | ±15 | 卓创资讯 | 仅LH0: 养殖亏损抬升低位关注，养殖盈利抬升高位关注 |")
     lines.append("")
-    lines.append("### Phase 2 深度分析评分体系")
+    lines.append("### Phase 2 定方向和时机评分体系")
     lines.append("")
     lines.append("| 维度 | 满分 | 说明 |")
     lines.append("| :--- | ---: | :--- |")
@@ -879,11 +921,11 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         "可操作条件：① 有新鲜反转/顺势入场信号 ② Phase 2 总分达标(做多>+20/做空<-20) ③ 盈亏比≥1.0。"
     )
     lines.append(
-        "**计划方向**来自 Phase 2 对技术面总分的解析；Phase 1 仅提供关注候选与入池理由。"
+        "**计划方向**来自 Phase 2 对技术面总分的解析；Phase 1 仅提供关注候选、关注分与机会标签。"
         "若标签含 **逆势**，表示 P1/P2 未与计划方向共振，属反转/摸顶情境，须额外风控。"
     )
     lines.append("")
-    lines.append("**两阶段评分**：正分=看多, 负分=看空。P1 与 P2 同号时通常更可靠；RRF 对 P1/P2 异号有惩罚。")
+    lines.append("**两阶段评分**：正分=偏多机会, 负分=偏空机会。P1 与 P2 同号时通常更可靠；RRF 对 P1/P2 异号有惩罚。")
     lines.append("")
     lines.append("### RRF 综合排名 (Reciprocal Rank Fusion)")
     lines.append("")
@@ -949,7 +991,11 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
         lines.append("")
         epr = t.get("entry_pool_reason")
         if epr:
-            lines.append(f"**入池理由（Phase 1）**: {_md_cell(epr)}")
+            lines.append(f"**关注理由（Phase 1）**: {_md_cell(epr)}")
+            lines.append("")
+        phase1_labels = t.get("phase1_labels") or t.get("labels") or []
+        if phase1_labels:
+            lines.append(f"**机会标签（Phase 1）**: {_md_cell('/'.join(phase1_labels))}")
             lines.append("")
         aln = t.get("score_signs_support_direction", True)
         if not aln:
@@ -1018,7 +1064,7 @@ def save_targets(targets: list[dict], watchlist: list[dict] | None = None):
                      f"持仓{t.get('oi_score', 0):+.1f})")
         fs = t.get("fund_screen_score")
         if fs is not None:
-            lines.append(f"- Phase 1 基本面筛选: {fs:+.0f}")
+            lines.append(f"- Phase 1 关注分: {t.get('attention_score', fs):+.0f}")
         ss = t.get("signal_strength", 0)
         lines.append(f"- 信号强度: {ss:.2f}")
         if not t.get("actionable", True):
@@ -1216,6 +1262,10 @@ def main():
                 "data_coverage": 1.0,
                 "reason_summary": "配置文件(--skip-screen)",
                 "entry_pool_reason": "配置文件(--skip-screen)",
+                "phase1_labels": ["趋势候选"],
+                "phase1_state_labels": [],
+                "phase1_data_coverage": 1.0,
+                "phase1_reason_summary": "配置文件(--skip-screen)",
             })
     else:
         candidates = phase_1_screen(all_data, threshold=args.threshold)
@@ -1230,7 +1280,12 @@ def main():
     )
 
     top_watch = watchlist_result[:max(3, args.max_picks - len(actionable))]
-    save_targets(actionable, top_watch)
+    phase1_summary = build_phase1_summary(
+        top_n=config.get("phase1", {}).get("top_n", args.max_picks),
+        sort_field="attention_score",
+        label_field="labels",
+    )
+    save_targets(actionable, top_watch, phase1_summary=phase1_summary)
 
     # --- Phase 3: 盘中监控 ---
     if args.no_monitor:

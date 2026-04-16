@@ -1,6 +1,10 @@
 # 期货 CTA 策略系统
 
-基于基本面筛选 + Wyckoff量价分析 + 技术面择时的期货交易辅助系统。
+基于「机会发现 + 方向/时机判断 + 实时监控」的期货交易辅助系统。
+
+- Phase 1：发现机会，输出关注优先级和机会标签，不直接定方向
+- Phase 2：定方向和入场时机，给出可操作/观望结果
+- Phase 3：盘中实时监控，跟踪已选目标和观望信号
 
 ## 每日工作流
 
@@ -19,9 +23,9 @@ python scripts/daily_workflow.py
 
 | 阶段 | 时间 | 做什么 |
 |------|------|--------|
-| Phase 1 | 盘前 | 扫描76个品种，按价格位置+RSI+均线+库存+Wyckoff量价评分，筛出极端品种 |
-| Phase 2 | 盘前 | 对候选品种做9维深度分析，输出入场价/止损/目标位，标记可操作品种 |
-| Phase 3 | 09:00-15:00 | 对可操作品种拉取分钟K线，实时检测交易信号 |
+| Phase 1 | 盘前 | 扫描76个品种，按关注分、极端价位和基本面条件发现机会，输出机会标签 |
+| Phase 2 | 盘前 | 对候选品种做方向与时机分析，输出入场价/止损/目标位，标记可操作或观望 |
+| Phase 3 | 09:00-15:00 | 对可操作品种拉取分钟K线，并对观望品种做实时反转提示 |
 
 ### 常用参数
 
@@ -88,6 +92,12 @@ python scripts/daily_workflow.py --max-picks 10 --period 15 --interval 30
 | **Wyckoff量价** | **VSA信号** | **10** | 每根K线的量价行为分类 |
 | **期货持仓** | **OI信号** | **15** | 价格+持仓量四象限 |
 
+### 数据源优先级
+
+- 价格、K线和持仓量优先使用 `TqSdk`
+- 非价量类基本面优先使用 `EDB`
+- `EDB` 缺失或覆盖不到时，再回退 `AkShare`
+
 ### Wyckoff 理论
 
 - **市场阶段**: 自动识别吸筹(Accumulation)/派发(Distribution)/上涨(Markup)/下跌(Markdown)
@@ -107,7 +117,7 @@ python scripts/daily_workflow.py --max-picks 10 --period 15 --interval 30
 
 ```
 ctp/
-├── config.yaml                  # 策略配置
+├── config.yaml                  # 策略配置（Phase 1 关注优先级 / Phase 2 定方向）
 ├── requirements.txt             # 依赖
 ├── scripts/
 │   ├── daily_workflow.py        # 每日自动化工作流（主入口，含 Phase 1 全市场筛选）
@@ -124,8 +134,10 @@ ctp/
 `config.yaml` 包含：
 
 - **positions** — 手动指定的品种及方向（`--skip-screen` 时使用）
-- **pre_market** — 分析参数：均线窗口、ATR/RSI/MACD/Bollinger、Fibonacci 级别
-- **intraday** — 日内参数：突破窗口、均值回归、量能过滤、风控阈值
+- **pre_market** — Phase 2 分析参数：均线窗口、ATR/RSI/MACD/Bollinger、Fibonacci 级别
+- **fundamental_screening** — Phase 1 机会发现门槛和品种分组
+- **phase1** — Phase 1 报告/候选池参数，例如 `top_n`
+- **intraday** — Phase 3 日内参数：突破窗口、均值回归、量能过滤、风控阈值
 
 ## 安装
 

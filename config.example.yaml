@@ -74,8 +74,8 @@ fundamental_screening:
       symbols: ["AU0", "AG0", "LC0", "SI0"]
 
 phase1:
-  top_n: 6
-  min_candidate_score: 55
+  top_n: 6               # Phase 1 机会池 Top N（关注优先级）
+  min_candidate_score: 55  # Phase 1 候选保留参考阈值（不直接定方向）
 
 # ==================== 日内策略参数 ====================
 intraday:
