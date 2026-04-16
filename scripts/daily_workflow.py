@@ -154,7 +154,7 @@ def phase_1_screen(
         df = all_data.get(sym)
         if df is None or len(df) < 60:
             if sym == "LH0":
-                print("[P1] 生猪 LH0: 日线不足 60 根，跳过评分")
+                log.info("[P1] 生猪 LH0: 日线不足 60 根，跳过评分")
             continue
 
         eff_threshold = sym_to_threshold.get(sym, default_thr)
@@ -163,13 +163,13 @@ def phase_1_screen(
         )
         if result is None:
             if sym == "LH0":
-                print("[P1] 生猪 LH0: 评分失败")
+                log.warning("[P1] 生猪 LH0: 评分失败")
             continue
 
         if sym == "LH0":
             reg = result.get("lh_regime")
             reg_s = f" @regime={reg}" if reg else ""
-            print(
+            log.info(
                 f"[P1] 生猪 LH0: {result['score']:+.0f} (门槛{eff_threshold:g}){reg_s}"
             )
 

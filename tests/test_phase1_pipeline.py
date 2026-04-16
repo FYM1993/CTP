@@ -74,7 +74,7 @@ def test_phase1_output_has_attention_not_direction() -> None:
     assert candidate["attention_score"] == 76.0
 
 
-def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch) -> None:
+def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         daily_workflow,
         "load_config",
@@ -102,9 +102,11 @@ def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch) -> Non
         {"LH0": [None] * 60},
         threshold=10,
     )
+    captured = capsys.readouterr()
 
     assert len(rows) == 1
     row = rows[0]
+    assert captured.out == ""
     assert "direction" not in row
     assert row["attention_score"] == 66.0
     assert row["reversal_score"] == 66.0
