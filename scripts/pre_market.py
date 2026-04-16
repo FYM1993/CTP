@@ -20,7 +20,11 @@ import yaml
 import numpy as np
 import pandas as pd
 
+from ctp_log import get_logger
 from data_cache import get_daily
+from phase2_direction import choose_phase2_direction as _choose_phase2_direction
+
+log = get_logger("pre_market")
 from wyckoff import (
     wyckoff_phase, vsa_scan, analyze_oi, oi_divergence,
     analyze_volume_pattern, detect_climax, detect_spring_upthrust,
@@ -333,22 +337,27 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     return scores
 
 
+def resolve_phase2_direction(*, long_score: float, short_score: float, delta: float = 12.0) -> str:
+    """Thin seam for future phase 2 direction selection."""
+    return _choose_phase2_direction(long_score=long_score, short_score=short_score, delta=delta)
+
+
 def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
     """
-    对单个品种执行完整的盘前分析
+    对单个品种执行完整的盘前分析；长篇输出写入 logs/ctp.log。
 
     返回: {"symbol", "name", "direction", "score", "actionable", "entry", "stop", "tp1"} 或 None
     """
-    print(f"\n{'='*60}")
+    log.info(f"\n{'='*60}")
     dir_icon = "🟢 做多" if direction == "long" else "🔴 做空"
-    print(f"  {name} ({symbol})  {dir_icon}")
-    print(f"  基本面判断: {cfg.get('reason', '')}")
-    print(f"{'='*60}")
+    log.info(f"  {name} ({symbol})  {dir_icon}")
+    log.info(f"  基本面判断: {cfg.get('reason', '')}")
+    log.info(f"{'='*60}")
 
     # 拉取数据
     df = fetch_data(symbol, days=400)
     if df.empty:
-        print("  ❌ 数据获取失败")
+        log.info("  ❌ 数据获取失败")
         return None
 
     close = df["close"]
@@ -356,49 +365,49 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     prev = close.iloc[-2]
     change_pct = (last / prev - 1) * 100
 
-    print(f"\n  📊 最新行情 ({df['date'].iloc[-1].date()})")
-    print(f"     收盘价: {last:.0f}  涨跌: {change_pct:+.2f}%")
-    print(f"     成交量: {df['volume'].iloc[-1]:,.0f}  持仓量: {df['oi'].iloc[-1]:,.0f}")
+    log.info(f"\n  📊 最新行情 ({df['date'].iloc[-1].date()})")
+    log.info(f"     收盘价: {last:.0f}  涨跌: {change_pct:+.2f}%")
+    log.info(f"     成交量: {df['volume'].iloc[-1]:,.0f}  持仓量: {df['oi'].iloc[-1]:,.0f}")
 
     pre_cfg = cfg
 
     # ==================== 第一部分: 经典技术指标 ====================
-    print(f"\n  ┌─ 经典技术指标 ─────────────────────────────┐")
+    log.info(f"\n  ┌─ 经典技术指标 ─────────────────────────────┐")
 
     # 均线
     ma_windows = pre_cfg.get("ma_windows", [5, 10, 20, 60, 120])
-    print(f"  │ 均线系统:")
+    log.info(f"  │ 均线系统:")
     for w in ma_windows:
         ma_val = calc_ma(close, w).iloc[-1]
         diff_pct = (last / ma_val - 1) * 100
         above = "▲" if last > ma_val else "▼"
-        print(f"  │   MA{w}: {ma_val:.0f}  ({above} {diff_pct:+.2f}%)")
+        log.info(f"  │   MA{w}: {ma_val:.0f}  ({above} {diff_pct:+.2f}%)")
 
     # MACD
     mcfg = pre_cfg.get("macd", {})
     dif, dea, hist = calc_macd(close, mcfg.get("fast", 12), mcfg.get("slow", 26), mcfg.get("signal", 9))
     hist_status = ("红柱放大 ↑" if hist.iloc[-1] > hist.iloc[-2] else "红柱缩小 ↓") \
         if hist.iloc[-1] > 0 else ("绿柱放大 ↓" if hist.iloc[-1] < hist.iloc[-2] else "绿柱缩小 ↑")
-    print(f"  │ MACD: DIF={dif.iloc[-1]:.2f} DEA={dea.iloc[-1]:.2f} 柱={hist.iloc[-1]:.2f} [{hist_status}]")
+    log.info(f"  │ MACD: DIF={dif.iloc[-1]:.2f} DEA={dea.iloc[-1]:.2f} 柱={hist.iloc[-1]:.2f} [{hist_status}]")
 
     # RSI
     rsi = calc_rsi(close, pre_cfg.get("rsi_window", 14)).iloc[-1]
     rsi_status = "超卖🔥" if rsi < 30 else "超买⚠️" if rsi > 70 else "中性"
-    print(f"  │ RSI(14): {rsi:.1f}  ({rsi_status})")
+    log.info(f"  │ RSI(14): {rsi:.1f}  ({rsi_status})")
 
     # ATR
     atr = calc_atr(df, pre_cfg.get("atr_window", 14)).iloc[-1]
     atr_pct = atr / last * 100
-    print(f"  │ ATR(14): {atr:.1f}  ({atr_pct:.2f}%)")
+    log.info(f"  │ ATR(14): {atr:.1f}  ({atr_pct:.2f}%)")
 
     # 布林带
     bcfg = pre_cfg.get("bollinger", {})
     upper, mid, lower = calc_bollinger(close, bcfg.get("window", 20), bcfg.get("std", 2))
-    print(f"  │ 布林带: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
-    print(f"  └────────────────────────────────────────────┘")
+    log.info(f"  │ 布林带: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
+    log.info(f"  └────────────────────────────────────────────┘")
 
     # ==================== 第二部分: Wyckoff 量价分析 ====================
-    print(f"\n  ┌─ Wyckoff 量价分析 ─────────────────────────┐")
+    log.info(f"\n  ┌─ Wyckoff 量价分析 ─────────────────────────┐")
 
     # 阶段判断
     phase = wyckoff_phase(df, lookback=120)
@@ -406,8 +415,8 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         "accumulation": "🟢吸筹", "markup": "🔵上涨",
         "distribution": "🔴派发", "markdown": "🟡下跌",
     }.get(phase.phase, "⚪")
-    print(f"  │ 市场阶段: {phase_icon} (置信度{phase.confidence:.0%})")
-    print(f"  │   {phase.description}")
+    log.info(f"  │ 市场阶段: {phase_icon} (置信度{phase.confidence:.0%})")
+    log.info(f"  │   {phase.description}")
 
     # 量价关系
     vp = analyze_volume_pattern(df, lookback=60)
@@ -418,56 +427,56 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         vp_label = "空方主导 🔴"
     else:
         vp_label = "均衡"
-    print(f"  │ 量价关系: 上涨日量/下跌日量 = {ratio:.2f} ({vp_label})")
-    print(f"  │   量能趋势(20日/40日): {vp['vol_trend']:.2f}  量价相关性: {vp['price_vol_corr']:+.2f}")
+    log.info(f"  │ 量价关系: 上涨日量/下跌日量 = {ratio:.2f} ({vp_label})")
+    log.info(f"  │   量能趋势(20日/40日): {vp['vol_trend']:.2f}  量价相关性: {vp['price_vol_corr']:+.2f}")
 
     # VSA 最近K线分析
     vsa_bars = vsa_scan(df, window=20)
     recent_notable = [b for b in vsa_bars[-10:] if b.strength >= 1]
     if recent_notable:
-        print(f"  │ VSA信号 (近10日):")
+        log.info(f"  │ VSA信号 (近10日):")
         for bar in recent_notable[-3:]:
             bias_icon = "🟢" if bar.bias == "bullish" else "🔴" if bar.bias == "bearish" else "⚪"
-            print(f"  │   {bias_icon} [{bar.bar_type}] {bar.description}")
+            log.info(f"  │   {bias_icon} [{bar.bar_type}] {bar.description}")
     else:
-        print(f"  │ VSA信号: 近期无显著量价信号")
+        log.info(f"  │ VSA信号: 近期无显著量价信号")
 
     # 关键事件
     events = detect_climax(df, 60) + detect_spring_upthrust(df, 60) + detect_sos_sow(df, 60)
     if events:
-        print(f"  │ Wyckoff事件 (近60日):")
+        log.info(f"  │ Wyckoff事件 (近60日):")
         for evt in events[-3:]:
             evt_icon = "🟢" if evt["bias"] == "bullish" else "🔴"
-            print(f"  │   {evt_icon} {evt['date']} {evt['type']}")
-            print(f"  │     {evt['detail']}")
+            log.info(f"  │   {evt_icon} {evt['date']} {evt['type']}")
+            log.info(f"  │     {evt['detail']}")
 
-    print(f"  └────────────────────────────────────────────┘")
+    log.info(f"  └────────────────────────────────────────────┘")
 
     # ==================== 第三部分: 持仓量分析 ====================
-    print(f"\n  ┌─ 持仓量(OI)分析 ──────────────────────────┐")
+    log.info(f"\n  ┌─ 持仓量(OI)分析 ──────────────────────────┐")
     oi_sig = analyze_oi(df, window=5)
     if oi_sig:
         oi_icon = "🟢" if oi_sig.bias == "bullish" else "🔴"
-        print(f"  │ {oi_icon} {oi_sig.label} ({oi_sig.strength})")
-        print(f"  │   {oi_sig.description}")
+        log.info(f"  │ {oi_icon} {oi_sig.label} ({oi_sig.strength})")
+        log.info(f"  │   {oi_sig.description}")
     else:
-        print(f"  │ 无持仓数据")
+        log.info(f"  │ 无持仓数据")
 
     oi_div = oi_divergence(df, window=20)
     if oi_div:
-        print(f"  │ {oi_div}")
-    print(f"  └────────────────────────────────────────────┘")
+        log.info(f"  │ {oi_div}")
+    log.info(f"  └────────────────────────────────────────────┘")
 
     # ==================== 第四部分: 支撑阻力 & 目标位 ====================
 
     # 支撑阻力
     lookback = pre_cfg.get("sr_lookback", 120)
     supports, resistances = find_support_resistance(df, lookback=lookback)
-    print(f"\n  🔑 关键价位 (近{lookback}日)")
+    log.info(f"\n  🔑 关键价位 (近{lookback}日)")
     if supports:
-        print(f"     支撑位: {', '.join([f'{p:.0f}' for p in reversed(supports)])}")
+        log.info(f"     支撑位: {', '.join([f'{p:.0f}' for p in reversed(supports)])}")
     if resistances:
-        print(f"     阻力位: {', '.join([f'{p:.0f}' for p in resistances])}")
+        log.info(f"     阻力位: {', '.join([f'{p:.0f}' for p in resistances])}")
 
     # 斐波那契目标位
     fib_levels = pre_cfg.get("fib_levels", [0.236, 0.382, 0.5, 0.618, 0.786])
@@ -475,21 +484,21 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     recent_low = df.tail(120)["low"].min()
     fib_targets = calc_fibonacci(recent_high, recent_low, direction, fib_levels)
 
-    print(f"\n  🎯 斐波那契目标位 (近120日 高:{recent_high:.0f} 低:{recent_low:.0f})")
+    log.info(f"\n  🎯 斐波那契目标位 (近120日 高:{recent_high:.0f} 低:{recent_low:.0f})")
     if direction == "long":
         for k, v in sorted(fib_targets.items(), key=lambda x: x[1]):
             marker = " ← 当前" if abs(v - last) / last < 0.01 else ""
-            print(f"     {k}: {v:.0f}{marker}")
+            log.info(f"     {k}: {v:.0f}{marker}")
     else:
         for k, v in sorted(fib_targets.items(), key=lambda x: -x[1]):
             marker = " ← 当前" if abs(v - last) / last < 0.01 else ""
-            print(f"     {k}: {v:.0f}{marker}")
+            log.info(f"     {k}: {v:.0f}{marker}")
 
     # 综合评分
     scores = score_signals(df, direction, pre_cfg)
     total = sum(scores.values())
 
-    print(f"\n  🧮 综合评分 (经典指标55分 + 量价分析35分 + 持仓15分)")
+    log.info(f"\n  🧮 综合评分 (经典指标55分 + 量价分析35分 + 持仓15分)")
     section_labels = {
         "均线排列": "经典", "MACD": "经典", "RSI": "经典", "布林带": "经典", "动量": "经典",
         "价格位置": "经典",
@@ -502,44 +511,43 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         bar = "█" * bar_len + "░" * (15 - bar_len)
         sign = "+" if v > 0 else ""
         icon = "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
-        print(f"     {section:2s} {k:8s}: {sign}{v:5.1f}  {icon} {bar}")
-    print(f"     {'─'*45}")
-    print(f"     总分:   {total:+.1f} / 105  ", end="")
-
+        log.info(f"     {section:2s} {k:8s}: {sign}{v:5.1f}  {icon} {bar}")
+    log.info(f"     {'─'*45}")
     if direction == "long":
         if total > 30:
-            print("→ ✅ 强多信号，可考虑入场")
+            score_hint = "→ ✅ 强多信号，可考虑入场"
         elif total > 10:
-            print("→ 🟡 偏多，等待确认")
+            score_hint = "→ 🟡 偏多，等待确认"
         elif total > -10:
-            print("→ ⚪ 中性，继续观望")
+            score_hint = "→ ⚪ 中性，继续观望"
         else:
-            print("→ ❌ 偏空，不宜做多")
+            score_hint = "→ ❌ 偏空，不宜做多"
     else:
         if total < -30:
-            print("→ ✅ 强空信号，可考虑入场")
+            score_hint = "→ ✅ 强空信号，可考虑入场"
         elif total < -10:
-            print("→ 🟡 偏空，等待确认")
+            score_hint = "→ 🟡 偏空，等待确认"
         elif total < 10:
-            print("→ ⚪ 中性，继续观望")
+            score_hint = "→ ⚪ 中性，继续观望"
         else:
-            print("→ ❌ 偏多，不宜做空")
+            score_hint = "→ ❌ 偏多，不宜做空"
+    log.info("     总分:   %+.1f / 105  %s", total, score_hint)
 
     # ==================== 第五部分: 反转信号评估 & 交易建议 ====================
 
     reversal = assess_reversal_status(df, direction, lookback=60)
 
-    print(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
-    print(f"  │ 当前阶段: {reversal['current_stage']}")
-    print(f"  │ 下一步:   {reversal['next_expected']}")
+    log.info(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
+    log.info(f"  │ 当前阶段: {reversal['current_stage']}")
+    log.info(f"  │ 下一步:   {reversal['next_expected']}")
     if reversal["all_events"]:
-        print(f"  │ 近期事件:")
+        log.info(f"  │ 近期事件:")
         for evt in reversal["all_events"][-3:]:
             icon = "🟢" if evt["bias"] == "bullish" else "🔴"
-            print(f"  │   {icon} {evt['date']} {evt['signal']}: {evt['detail']}")
+            log.info(f"  │   {icon} {evt['date']} {evt['signal']}: {evt['detail']}")
     else:
-        print(f"  │ 近期无相关反转事件")
-    print(f"  └────────────────────────────────────────────┘")
+        log.info(f"  │ 近期无相关反转事件")
+    log.info(f"  └────────────────────────────────────────────┘")
 
     # --- 构建评分原因摘要 ---
     classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量", "价格位置"]
@@ -559,15 +567,15 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     fib_low = df.tail(120)["low"].min()
     fib_range = fib_high - fib_low
 
-    print(f"\n  💡 交易建议")
+    log.info(f"\n  💡 交易建议")
     dir_cn = "做多" if direction == "long" else "做空"
-    print(f"     方向: {dir_cn}")
+    log.info(f"     方向: {dir_cn}")
 
     # 展示疑似信号（供参考）
     if reversal.get("suspect_events"):
-        print(f"  │ ⚠️ 疑似信号（未达标，仅供参考）:")
+        log.info(f"  │ ⚠️ 疑似信号（未达标，仅供参考）:")
         for evt in reversal["suspect_events"][-3:]:
-            print(f"  │   ⚪ {evt['date']} {evt['signal']}: {evt['detail']}")
+            log.info(f"  │   ⚪ {evt['date']} {evt['signal']}: {evt['detail']}")
 
     if reversal["has_signal"]:
         sig = reversal["signal_type"]
@@ -618,35 +626,35 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
                   "UT": "上冲回落", "SOW": "弱势跌破", "BC": "买方高潮",
                   "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)"}.get(sig, sig)
 
-        print(f"     ✅ 入场信号: {sig_cn} ({sig_date})")
-        print(f"     信号详情: {reversal['signal_detail']}")
-        print(f"     参考入场: {entry:.0f} (当前价)")
+        log.info(f"     ✅ 入场信号: {sig_cn} ({sig_date})")
+        log.info(f"     信号详情: {reversal['signal_detail']}")
+        log.info(f"     参考入场: {entry:.0f} (当前价)")
         stop_basis = "信号K线最低 - 0.5ATR" if direction == "long" else "信号K线最高 + 0.5ATR"
-        print(f"     止损位:   {stop:.0f} ({stop_basis})")
-        print(f"     止盈1:    {tp1:.0f}")
-        print(f"     止盈2:    {tp2:.0f}")
-        print(f"     盈亏比:   {rr:.2f}")
-        print(f"     置信度:   {reversal['confidence']:.0%}")
+        log.info(f"     止损位:   {stop:.0f} ({stop_basis})")
+        log.info(f"     止盈1:    {tp1:.0f}")
+        log.info(f"     止盈2:    {tp2:.0f}")
+        log.info(f"     盈亏比:   {rr:.2f}")
+        log.info(f"     置信度:   {reversal['confidence']:.0%}")
 
         score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
         rr_ok = rr >= 1.0
         actionable = score_ok and rr_ok
         if not rr_ok:
-            print(f"  ⚠️ 有入场信号但盈亏比({rr:.2f})不足1.0，谨慎入场")
+            log.info(f"  ⚠️ 有入场信号但盈亏比({rr:.2f})不足1.0，谨慎入场")
         if not score_ok:
-            print(f"  ⚠️ 有入场信号但评分({total:+.0f})未达标，谨慎入场")
+            log.info(f"  ⚠️ 有入场信号但评分({total:+.0f})未达标，谨慎入场")
 
     else:
         entry, stop, tp1, tp2, rr = last, 0.0, 0.0, 0.0, 0.0
         actionable = False
 
-        print(f"     ⏳ 尚无有效反转信号，暂不建议入场")
-        print(f"     当前阶段: {reversal['current_stage']}")
-        print(f"     等待信号: {reversal['next_expected']}")
+        log.info(f"     ⏳ 尚无有效反转信号，暂不建议入场")
+        log.info(f"     当前阶段: {reversal['current_stage']}")
+        log.info(f"     等待信号: {reversal['next_expected']}")
         if direction == "long":
-            print(f"     入场条件: 出现Spring(假跌破收回)或SOS(放量突破)后再评估")
+            log.info(f"     入场条件: 出现Spring(假跌破收回)或SOS(放量突破)后再评估")
         else:
-            print(f"     入场条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
+            log.info(f"     入场条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
 
     return {
         "symbol": symbol, "name": name, "direction": direction,
@@ -669,10 +677,10 @@ def main():
     positions = config["positions"]
     pre_cfg = config["pre_market"]
 
-    print("╔" + "═"*58 + "╗")
-    print("║" + "盘前分析报告".center(50) + "║")
-    print("║" + f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}".ljust(56) + "║")
-    print("╚" + "═"*58 + "╝")
+    log.info("╔" + "═"*58 + "╗")
+    log.info("║" + "盘前分析报告".center(50) + "║")
+    log.info("║" + f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}".ljust(56) + "║")
+    log.info("╚" + "═"*58 + "╝")
 
     for symbol, pos_cfg in positions.items():
         merged_cfg = {**pre_cfg, **pos_cfg}
@@ -683,9 +691,10 @@ def main():
             cfg=merged_cfg,
         )
 
-    print(f"\n{'='*60}")
-    print("⚠️  以上为技术面分析，需结合基本面判断综合决策")
-    print(f"{'='*60}")
+    log.info(f"\n{'='*60}")
+    log.info("⚠️  以上为技术面分析，需结合基本面判断综合决策")
+    log.info(f"{'='*60}")
+    print("盘前分析详情已写入 logs/ctp.log")
 
 
 if __name__ == "__main__":
