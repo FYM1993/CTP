@@ -27,8 +27,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import akshare as aks
+import yaml
 
 from ctp_log import get_logger
+from market_data_tq import fetch_daily_from_tq as _tq_fetch_daily_from_tq
 
 _log = get_logger("data_cache")
 
@@ -42,6 +44,39 @@ MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
 
 _cache_cleaned = False
+
+
+def _load_config() -> dict:
+    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            return data or {}
+    except Exception:
+        return {}
+
+
+def _exchange_for_symbol(symbol: str) -> str | None:
+    for info in BUILTIN_SYMBOLS:
+        if info["symbol"] == symbol:
+            return info["exchange"]
+    return None
+
+
+def fetch_daily_from_tq(symbol: str, days: int) -> pd.DataFrame | None:
+    exchange = _exchange_for_symbol(symbol)
+    if not exchange:
+        return None
+    config = _load_config()
+    tq_cfg = config.get("tqsdk") or {}
+    account = (tq_cfg.get("account") or "").strip()
+    password = (tq_cfg.get("password") or "").strip()
+    if not account or not password:
+        return None
+    try:
+        return _tq_fetch_daily_from_tq(symbol, exchange, days, account, password)
+    except Exception:
+        return None
 
 
 def _is_after_close() -> bool:
@@ -78,9 +113,9 @@ def _choose_cache_suffix(df: pd.DataFrame) -> str:
     """
     根据数据内容决定缓存类型。
 
-    只有当数据包含今天的日期时才标记为 final（永久缓存）。
-    否则标记为 live（临时缓存），下次运行时会被清理并重新拉取。
     周末不是交易日，任何数据都视为 final。
+    工作日收盘前，当天 bar 仍可能未完成，因此即使最新日期是今天也继续记为 live。
+    只有在最新日期是今天且已收盘后，才标记为 final（永久缓存）。
     """
     today_str = datetime.now().strftime("%Y%m%d")
     is_weekend = datetime.now().weekday() >= 5
@@ -91,7 +126,7 @@ def _choose_cache_suffix(df: pd.DataFrame) -> str:
     if df is not None and len(df) > 0:
         latest = pd.Timestamp(df["date"].iloc[-1]).strftime("%Y%m%d")
         if latest == today_str:
-            return "final"
+            return "final" if _is_after_close() else "live"
 
     return "live"
 
@@ -116,6 +151,10 @@ def _ensure_cache_dir():
     if _is_after_close() and datetime.now().weekday() < 5:
         for f in CACHE_DIR.glob(f"*_{today}_live.parquet"):
             f.unlink()
+
+
+def _live_cache_stale() -> bool:
+    return datetime.now().weekday() >= 5 or _is_after_close()
 
 
 # ============================================================
@@ -144,14 +183,19 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
             final_path.unlink(missing_ok=True)
 
     if live_path.exists():
-        try:
-            df = pd.read_parquet(live_path)
-            if len(df) > 0:
-                return df.tail(days)
-        except Exception:
+        if _live_cache_stale():
             live_path.unlink(missing_ok=True)
+        else:
+            try:
+                df = pd.read_parquet(live_path)
+                if len(df) > 0:
+                    return df.tail(days)
+            except Exception:
+                live_path.unlink(missing_ok=True)
 
-    df = _fetch_daily_from_api(symbol, days)
+    df = fetch_daily_from_tq(symbol, days)
+    if df is None or len(df) == 0:
+        df = _fetch_daily_from_api(symbol, days)
     if df is not None and len(df) > 0:
         suffix = _choose_cache_suffix(df)
         save_path = final_path if suffix == "final" else live_path
@@ -700,6 +744,9 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
 
         cached_df = None
         for p in (final_path, live_path):
+            if p == live_path and _live_cache_stale():
+                p.unlink(missing_ok=True)
+                continue
             if p.exists():
                 try:
                     cached_df = pd.read_parquet(p)
@@ -715,8 +762,10 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
             cache_hits += 1
             continue
 
-        df = _fetch_daily_from_api(sym, days=400)
-        api_calls += 1
+        df = fetch_daily_from_tq(sym, days=400)
+        if df is None or len(df) == 0:
+            df = _fetch_daily_from_api(sym, days=400)
+            api_calls += 1
         if df is not None and len(df) > 0:
             suffix = _choose_cache_suffix(df)
             save_path = final_path if suffix == "final" else live_path

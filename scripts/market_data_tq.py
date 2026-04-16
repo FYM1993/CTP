@@ -39,3 +39,37 @@ def klines_to_daily_frame(klines: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return out.dropna(subset=["close"]).reset_index(drop=True)
+
+
+def fetch_daily_from_tq(
+    symbol: str,
+    exchange: str,
+    days: int,
+    account: str,
+    password: str,
+) -> pd.DataFrame | None:
+    try:
+        from tqsdk import TqApi, TqAuth
+    except Exception:
+        return None
+
+    try:
+        tq_symbol = symbol_to_tq_main(symbol.strip(), exchange)
+    except Exception:
+        return None
+
+    api = None
+    try:
+        api = TqApi(auth=TqAuth(account, password))
+        klines = api.get_kline_serial(tq_symbol, 86400, data_length=max(days, 30))
+        if klines is None or len(klines) < 1:
+            return None
+        return klines_to_daily_frame(klines).tail(days).reset_index(drop=True)
+    except Exception:
+        return None
+    finally:
+        try:
+            if api is not None:
+                api.close()
+        except Exception:
+            pass
