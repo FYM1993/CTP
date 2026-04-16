@@ -71,9 +71,9 @@ def test_build_phase1_summary_returns_cn_metadata() -> None:
 
     assert summary == {
         "阶段": "Phase 1 发现机会",
-        "Top N": 6,
-        "排序字段": "attention_score（关注分）",
-        "标签字段": "labels（机会标签）",
+        "关注池上限": 6,
+        "排序字段": "关注优先级分",
+        "标签字段": ["反转候选", "趋势候选", "双标签候选", "数据覆盖不足"],
     }
 
 
@@ -182,6 +182,71 @@ def test_save_targets_writes_phase1_summary_to_payload(monkeypatch, tmp_path) ->
 
     payload = json.loads((tmp_path / "2026-04-16_targets.json").read_text(encoding="utf-8"))
     assert payload["phase1_summary"] == summary
+    assert payload["phase1_summary"]["排序字段"] == "关注优先级分"
+    assert payload["phase1_summary"]["标签字段"] == [
+        "反转候选",
+        "趋势候选",
+        "双标签候选",
+        "数据覆盖不足",
+    ]
+
+
+def test_save_targets_keeps_actionable_risk_flags_visible(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    targets = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 66.0,
+            "price": 100.0,
+            "entry": 101.0,
+            "stop": 95.0,
+            "tp1": 110.0,
+            "tp2": 118.0,
+            "rr": 1.5,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 2,
+            "fund_screen_score": 66.0,
+            "attention_score": 72.0,
+            "signal_strength": 0.7,
+            "direction_conflict": True,
+            "score_signs_support_direction": False,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "库存下降",
+            "reason_summary": "库存下降",
+            "entry_pool_reason": "基本面达标",
+            "actionable": True,
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Spring",
+                "signal_date": "2026-04-15",
+                "entry_mode": "reversal",
+                "signal_strength": 0.7,
+                "current_stage": "accumulation",
+                "confidence": 0.8,
+                "signal_detail": "测试信号",
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(targets, [], phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "⚠️P1P2异号/逆势" in md_text
 
 
 if __name__ == "__main__":

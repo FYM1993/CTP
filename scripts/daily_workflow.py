@@ -265,18 +265,20 @@ def build_phase1_summary(
     label_field: str = "labels",
 ) -> dict[str, object]:
     """返回 Phase 1 机会发现摘要，供报告和 JSON payload 使用。"""
-    field_cn = {
-        "attention_score": "关注分",
-        "reversal_score": "反转分",
-        "trend_score": "趋势分",
-        "labels": "机会标签",
-        "state_labels": "状态标签",
+    sort_field_cn = {
+        "attention_score": "关注优先级分",
+        "reversal_score": "反转机会分",
+        "trend_score": "趋势机会分",
+    }
+    label_values = {
+        "labels": ["反转候选", "趋势候选", "双标签候选", "数据覆盖不足"],
+        "state_labels": ["低位出清", "高位扩产", "紧平衡强化", "过剩深化"],
     }
     return {
         "阶段": "Phase 1 发现机会",
-        "Top N": int(top_n),
-        "排序字段": f"{sort_field}（{field_cn.get(sort_field, sort_field)}）",
-        "标签字段": f"{label_field}（{field_cn.get(label_field, label_field)}）",
+        "关注池上限": int(top_n),
+        "排序字段": sort_field_cn.get(sort_field, "关注优先级分"),
+        "标签字段": list(label_values.get(label_field, label_values["labels"])),
     }
 
 
@@ -746,7 +748,7 @@ def save_targets(
     else:
         watchlist = []
     if phase1_summary is None:
-        phase1_summary = build_phase1_summary(top_n=len(targets))
+        phase1_summary = build_phase1_summary(top_n=max(len(targets), len(watchlist)))
 
     json_path = _today_json_path()
     payload = {
@@ -844,13 +846,15 @@ def save_targets(
             epr = _md_cell(t.get("entry_pool_reason") or "-")
             phase1_labels = "/".join(t.get("phase1_labels") or t.get("labels") or []) or "-"
             phase1_summary = _md_cell(t.get("phase1_reason_summary") or t.get("reason_summary") or "-")
+            risk_suffix = f" ⚠️{tag_str}" if tag_cells else ""
+            rrf_cell = _md_cell(f"**{rrf:.4f}**{risk_suffix}")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
             lines.append(
                 f"| {_md_cell('✅入场')} | {name_cell} | {dir_cell} "
                 f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
-                f"| **{rrf:.4f}** | {r1} | {r2} "
+                f"| {rrf_cell} | {r1} | {r2} "
                 f"| {t.get('attention_score', t.get('fund_screen_score', 0)):+.1f} | {t.get('score', 0):+.1f} "
                 f"| {ss:.2f} | {_md_cell(phase1_labels)} | {phase1_summary} |"
             )
