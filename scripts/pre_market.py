@@ -342,214 +342,24 @@ def resolve_phase2_direction(*, long_score: float, short_score: float, delta: fl
     return _choose_phase2_direction(long_score=long_score, short_score=short_score, delta=delta)
 
 
-def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
-    """
-    对单个品种执行完整的盘前分析；长篇输出写入当前运行的日志文件。
-
-    返回: {"symbol", "name", "direction", "score", "actionable", "entry", "stop", "tp1"} 或 None
-    """
-    log.info(f"\n{'='*60}")
-    dir_icon = "🟢 做多" if direction == "long" else "🔴 做空"
-    log.info(f"  {name} ({symbol})  {dir_icon}")
-    log.info(f"  基本面判断: {cfg.get('reason', '')}")
-    log.info(f"{'='*60}")
-
-    # 拉取数据
-    df = fetch_data(symbol, days=400)
-    if df.empty:
-        log.info("  ❌ 数据获取失败")
+def build_trade_plan_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+) -> dict | None:
+    """Build the Phase 2 trade plan from an already-fetched daily DataFrame."""
+    if df is None or df.empty:
         return None
 
     close = df["close"]
     last = close.iloc[-1]
-    prev = close.iloc[-2]
-    change_pct = (last / prev - 1) * 100
 
-    log.info(f"\n  📊 最新行情 ({df['date'].iloc[-1].date()})")
-    log.info(f"     收盘价: {last:.0f}  涨跌: {change_pct:+.2f}%")
-    log.info(f"     成交量: {df['volume'].iloc[-1]:,.0f}  持仓量: {df['oi'].iloc[-1]:,.0f}")
+    scores = score_signals(df, direction, cfg)
+    total = float(sum(scores.values()))
 
-    pre_cfg = cfg
-
-    # ==================== 第一部分: 经典技术指标 ====================
-    log.info(f"\n  ┌─ 经典技术指标 ─────────────────────────────┐")
-
-    # 均线
-    ma_windows = pre_cfg.get("ma_windows", [5, 10, 20, 60, 120])
-    log.info(f"  │ 均线系统:")
-    for w in ma_windows:
-        ma_val = calc_ma(close, w).iloc[-1]
-        diff_pct = (last / ma_val - 1) * 100
-        above = "▲" if last > ma_val else "▼"
-        log.info(f"  │   MA{w}: {ma_val:.0f}  ({above} {diff_pct:+.2f}%)")
-
-    # MACD
-    mcfg = pre_cfg.get("macd", {})
-    dif, dea, hist = calc_macd(close, mcfg.get("fast", 12), mcfg.get("slow", 26), mcfg.get("signal", 9))
-    hist_status = ("红柱放大 ↑" if hist.iloc[-1] > hist.iloc[-2] else "红柱缩小 ↓") \
-        if hist.iloc[-1] > 0 else ("绿柱放大 ↓" if hist.iloc[-1] < hist.iloc[-2] else "绿柱缩小 ↑")
-    log.info(f"  │ MACD: DIF={dif.iloc[-1]:.2f} DEA={dea.iloc[-1]:.2f} 柱={hist.iloc[-1]:.2f} [{hist_status}]")
-
-    # RSI
-    rsi = calc_rsi(close, pre_cfg.get("rsi_window", 14)).iloc[-1]
-    rsi_status = "超卖🔥" if rsi < 30 else "超买⚠️" if rsi > 70 else "中性"
-    log.info(f"  │ RSI(14): {rsi:.1f}  ({rsi_status})")
-
-    # ATR
-    atr = calc_atr(df, pre_cfg.get("atr_window", 14)).iloc[-1]
-    atr_pct = atr / last * 100
-    log.info(f"  │ ATR(14): {atr:.1f}  ({atr_pct:.2f}%)")
-
-    # 布林带
-    bcfg = pre_cfg.get("bollinger", {})
-    upper, mid, lower = calc_bollinger(close, bcfg.get("window", 20), bcfg.get("std", 2))
-    log.info(f"  │ 布林带: {lower.iloc[-1]:.0f} / {mid.iloc[-1]:.0f} / {upper.iloc[-1]:.0f}")
-    log.info(f"  └────────────────────────────────────────────┘")
-
-    # ==================== 第二部分: Wyckoff 量价分析 ====================
-    log.info(f"\n  ┌─ Wyckoff 量价分析 ─────────────────────────┐")
-
-    # 阶段判断
-    phase = wyckoff_phase(df, lookback=120)
-    phase_icon = {
-        "accumulation": "🟢吸筹", "markup": "🔵上涨",
-        "distribution": "🔴派发", "markdown": "🟡下跌",
-    }.get(phase.phase, "⚪")
-    log.info(f"  │ 市场阶段: {phase_icon} (置信度{phase.confidence:.0%})")
-    log.info(f"  │   {phase.description}")
-
-    # 量价关系
-    vp = analyze_volume_pattern(df, lookback=60)
-    ratio = vp["up_down_ratio"]
-    if ratio > 1.3:
-        vp_label = "多方主导 🟢"
-    elif ratio < 0.77:
-        vp_label = "空方主导 🔴"
-    else:
-        vp_label = "均衡"
-    log.info(f"  │ 量价关系: 上涨日量/下跌日量 = {ratio:.2f} ({vp_label})")
-    log.info(f"  │   量能趋势(20日/40日): {vp['vol_trend']:.2f}  量价相关性: {vp['price_vol_corr']:+.2f}")
-
-    # VSA 最近K线分析
-    vsa_bars = vsa_scan(df, window=20)
-    recent_notable = [b for b in vsa_bars[-10:] if b.strength >= 1]
-    if recent_notable:
-        log.info(f"  │ VSA信号 (近10日):")
-        for bar in recent_notable[-3:]:
-            bias_icon = "🟢" if bar.bias == "bullish" else "🔴" if bar.bias == "bearish" else "⚪"
-            log.info(f"  │   {bias_icon} [{bar.bar_type}] {bar.description}")
-    else:
-        log.info(f"  │ VSA信号: 近期无显著量价信号")
-
-    # 关键事件
-    events = detect_climax(df, 60) + detect_spring_upthrust(df, 60) + detect_sos_sow(df, 60)
-    if events:
-        log.info(f"  │ Wyckoff事件 (近60日):")
-        for evt in events[-3:]:
-            evt_icon = "🟢" if evt["bias"] == "bullish" else "🔴"
-            log.info(f"  │   {evt_icon} {evt['date']} {evt['type']}")
-            log.info(f"  │     {evt['detail']}")
-
-    log.info(f"  └────────────────────────────────────────────┘")
-
-    # ==================== 第三部分: 持仓量分析 ====================
-    log.info(f"\n  ┌─ 持仓量(OI)分析 ──────────────────────────┐")
-    oi_sig = analyze_oi(df, window=5)
-    if oi_sig:
-        oi_icon = "🟢" if oi_sig.bias == "bullish" else "🔴"
-        log.info(f"  │ {oi_icon} {oi_sig.label} ({oi_sig.strength})")
-        log.info(f"  │   {oi_sig.description}")
-    else:
-        log.info(f"  │ 无持仓数据")
-
-    oi_div = oi_divergence(df, window=20)
-    if oi_div:
-        log.info(f"  │ {oi_div}")
-    log.info(f"  └────────────────────────────────────────────┘")
-
-    # ==================== 第四部分: 支撑阻力 & 目标位 ====================
-
-    # 支撑阻力
-    lookback = pre_cfg.get("sr_lookback", 120)
-    supports, resistances = find_support_resistance(df, lookback=lookback)
-    log.info(f"\n  🔑 关键价位 (近{lookback}日)")
-    if supports:
-        log.info(f"     支撑位: {', '.join([f'{p:.0f}' for p in reversed(supports)])}")
-    if resistances:
-        log.info(f"     阻力位: {', '.join([f'{p:.0f}' for p in resistances])}")
-
-    # 斐波那契目标位
-    fib_levels = pre_cfg.get("fib_levels", [0.236, 0.382, 0.5, 0.618, 0.786])
-    recent_high = df.tail(120)["high"].max()
-    recent_low = df.tail(120)["low"].min()
-    fib_targets = calc_fibonacci(recent_high, recent_low, direction, fib_levels)
-
-    log.info(f"\n  🎯 斐波那契目标位 (近120日 高:{recent_high:.0f} 低:{recent_low:.0f})")
-    if direction == "long":
-        for k, v in sorted(fib_targets.items(), key=lambda x: x[1]):
-            marker = " ← 当前" if abs(v - last) / last < 0.01 else ""
-            log.info(f"     {k}: {v:.0f}{marker}")
-    else:
-        for k, v in sorted(fib_targets.items(), key=lambda x: -x[1]):
-            marker = " ← 当前" if abs(v - last) / last < 0.01 else ""
-            log.info(f"     {k}: {v:.0f}{marker}")
-
-    # 综合评分
-    scores = score_signals(df, direction, pre_cfg)
-    total = sum(scores.values())
-
-    log.info(f"\n  🧮 综合评分 (经典指标55分 + 量价分析35分 + 持仓15分)")
-    section_labels = {
-        "均线排列": "经典", "MACD": "经典", "RSI": "经典", "布林带": "经典", "动量": "经典",
-        "价格位置": "经典",
-        "Wyckoff阶段": "量价", "量价关系": "量价", "VSA信号": "量价",
-        "持仓信号": "持仓",
-    }
-    for k, v in scores.items():
-        section = section_labels.get(k, "")
-        bar_len = int(abs(v))
-        bar = "█" * bar_len + "░" * (15 - bar_len)
-        sign = "+" if v > 0 else ""
-        icon = "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
-        log.info(f"     {section:2s} {k:8s}: {sign}{v:5.1f}  {icon} {bar}")
-    log.info(f"     {'─'*45}")
-    if direction == "long":
-        if total > 30:
-            score_hint = "→ ✅ 强多信号，可考虑入场"
-        elif total > 10:
-            score_hint = "→ 🟡 偏多，等待确认"
-        elif total > -10:
-            score_hint = "→ ⚪ 中性，继续观望"
-        else:
-            score_hint = "→ ❌ 偏空，不宜做多"
-    else:
-        if total < -30:
-            score_hint = "→ ✅ 强空信号，可考虑入场"
-        elif total < -10:
-            score_hint = "→ 🟡 偏空，等待确认"
-        elif total < 10:
-            score_hint = "→ ⚪ 中性，继续观望"
-        else:
-            score_hint = "→ ❌ 偏多，不宜做空"
-    log.info("     总分:   %+.1f / 105  %s", total, score_hint)
-
-    # ==================== 第五部分: 反转信号评估 & 交易建议 ====================
-
-    reversal = assess_reversal_status(df, direction, lookback=60)
-
-    log.info(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
-    log.info(f"  │ 当前阶段: {reversal['current_stage']}")
-    log.info(f"  │ 下一步:   {reversal['next_expected']}")
-    if reversal["all_events"]:
-        log.info(f"  │ 近期事件:")
-        for evt in reversal["all_events"][-3:]:
-            icon = "🟢" if evt["bias"] == "bullish" else "🔴"
-            log.info(f"  │   {icon} {evt['date']} {evt['signal']}: {evt['detail']}")
-    else:
-        log.info(f"  │ 近期无相关反转事件")
-    log.info(f"  └────────────────────────────────────────────┘")
-
-    # --- 构建评分原因摘要 ---
     classical_keys = ["均线排列", "MACD", "RSI", "布林带", "动量", "价格位置"]
     wyckoff_keys = ["Wyckoff阶段", "量价关系", "VSA信号"]
     oi_keys = ["持仓信号"]
@@ -562,27 +372,23 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     phase_info = wyckoff_phase(df)
     wk_phase = phase_info.phase
 
-    # 斐波那契位（止盈目标计算用）
     fib_high = df.tail(120)["high"].max()
     fib_low = df.tail(120)["low"].min()
     fib_range = fib_high - fib_low
 
-    log.info(f"\n  💡 交易建议")
-    dir_cn = "做多" if direction == "long" else "做空"
-    log.info(f"     方向: {dir_cn}")
+    lookback = cfg.get("sr_lookback", 120)
+    supports, resistances = find_support_resistance(df, lookback=lookback)
 
-    # 展示疑似信号（供参考）
-    if reversal.get("suspect_events"):
-        log.info(f"  │ ⚠️ 疑似信号（未达标，仅供参考）:")
-        for evt in reversal["suspect_events"][-3:]:
-            log.info(f"  │   ⚪ {evt['date']} {evt['signal']}: {evt['detail']}")
+    fib_levels = cfg.get("fib_levels", [0.236, 0.382, 0.5, 0.618, 0.786])
+    recent_high = df.tail(120)["high"].max()
+    recent_low = df.tail(120)["low"].min()
+    fib_targets = calc_fibonacci(recent_high, recent_low, direction, fib_levels)
+
+    atr = calc_atr(df, cfg.get("atr_window", 14)).iloc[-1]
+    reversal = assess_reversal_status(df, direction, lookback=60)
 
     if reversal["has_signal"]:
-        sig = reversal["signal_type"]
         sig_bar = reversal["signal_bar"]
-        sig_date = reversal["signal_date"]
-
-        # 入场价 = 当前价（信号新鲜时，当前价离信号K线不远）
         entry = last
 
         if direction == "long":
@@ -622,32 +428,121 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
 
             rr = (entry - tp1) / (stop - entry + 1e-12)
 
+        score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
+        rr_ok = rr >= 1.0
+        actionable = score_ok and rr_ok
+    else:
+        entry, stop, tp1, tp2, rr = last, 0.0, 0.0, 0.0, 0.0
+        actionable = False
+
+    return {
+        "symbol": symbol,
+        "name": name,
+        "direction": direction,
+        "score": float(total),
+        "actionable": actionable,
+        "price": float(last),
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "rr": float(rr),
+        "classical_score": float(classical_total),
+        "wyckoff_score": float(wyckoff_total),
+        "oi_score": float(oi_total),
+        "wyckoff_phase": wk_phase,
+        "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
+        "reversal_status": reversal,
+        "support_levels": supports,
+        "resistance_levels": resistances,
+        "fib_targets": fib_targets,
+        "scores": scores,
+    }
+
+
+def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
+    """
+    对单个品种执行完整的盘前分析；长篇输出写入当前运行的日志文件。
+
+    返回: {"symbol", "name", "direction", "score", "actionable", "entry", "stop", "tp1"} 或 None
+    """
+    log.info(f"\n{'='*60}")
+    dir_icon = "🟢 做多" if direction == "long" else "🔴 做空"
+    log.info(f"  {name} ({symbol})  {dir_icon}")
+    log.info(f"  基本面判断: {cfg.get('reason', '')}")
+    log.info(f"{'='*60}")
+
+    # 拉取数据
+    df = fetch_data(symbol, days=400)
+    if df.empty:
+        log.info("  ❌ 数据获取失败")
+        return None
+
+    close = df["close"]
+    last = close.iloc[-1]
+    prev = close.iloc[-2]
+    change_pct = (last / prev - 1) * 100
+
+    log.info(f"\n  📊 最新行情 ({df['date'].iloc[-1].date()})")
+    log.info(f"     收盘价: {last:.0f}  涨跌: {change_pct:+.2f}%")
+    log.info(f"     成交量: {df['volume'].iloc[-1]:,.0f}  持仓量: {df['oi'].iloc[-1]:,.0f}")
+
+    plan = build_trade_plan_from_daily_df(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        df=df,
+        cfg=cfg,
+    )
+    if plan is None:
+        log.info("  ❌ 数据获取失败")
+        return None
+
+    reversal = plan["reversal_status"]
+    log.info(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
+    log.info(f"  │ 当前阶段: {reversal['current_stage']}")
+    log.info(f"  │ 下一步:   {reversal['next_expected']}")
+    if reversal["all_events"]:
+        log.info(f"  │ 近期事件:")
+        for evt in reversal["all_events"][-3:]:
+            icon = "🟢" if evt["bias"] == "bullish" else "🔴"
+            log.info(f"  │   {icon} {evt['date']} {evt['signal']}: {evt['detail']}")
+    else:
+        log.info(f"  │ 近期无相关反转事件")
+    log.info(f"  └────────────────────────────────────────────┘")
+
+    log.info(f"\n  💡 交易建议")
+    dir_cn = "做多" if direction == "long" else "做空"
+    log.info(f"     方向: {dir_cn}")
+
+    if reversal.get("suspect_events"):
+        log.info(f"  │ ⚠️ 疑似信号（未达标，仅供参考）:")
+        for evt in reversal["suspect_events"][-3:]:
+            log.info(f"  │   ⚪ {evt['date']} {evt['signal']}: {evt['detail']}")
+
+    if reversal["has_signal"]:
+        sig = reversal["signal_type"]
+        sig_date = reversal["signal_date"]
         sig_cn = {"Spring": "弹簧", "SOS": "强势突破", "SC": "卖方高潮",
                   "UT": "上冲回落", "SOW": "弱势跌破", "BC": "买方高潮",
                   "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)"}.get(sig, sig)
 
         log.info(f"     ✅ 入场信号: {sig_cn} ({sig_date})")
         log.info(f"     信号详情: {reversal['signal_detail']}")
-        log.info(f"     参考入场: {entry:.0f} (当前价)")
+        log.info(f"     参考入场: {plan['entry']:.0f} (当前价)")
         stop_basis = "信号K线最低 - 0.5ATR" if direction == "long" else "信号K线最高 + 0.5ATR"
-        log.info(f"     止损位:   {stop:.0f} ({stop_basis})")
-        log.info(f"     止盈1:    {tp1:.0f}")
-        log.info(f"     止盈2:    {tp2:.0f}")
-        log.info(f"     盈亏比:   {rr:.2f}")
+        log.info(f"     止损位:   {plan['stop']:.0f} ({stop_basis})")
+        log.info(f"     止盈1:    {plan['tp1']:.0f}")
+        log.info(f"     止盈2:    {plan['tp2']:.0f}")
+        log.info(f"     盈亏比:   {plan['rr']:.2f}")
         log.info(f"     置信度:   {reversal['confidence']:.0%}")
 
-        score_ok = (direction == "long" and total > 20) or (direction == "short" and total < -20)
-        rr_ok = rr >= 1.0
-        actionable = score_ok and rr_ok
-        if not rr_ok:
-            log.info(f"  ⚠️ 有入场信号但盈亏比({rr:.2f})不足1.0，谨慎入场")
-        if not score_ok:
-            log.info(f"  ⚠️ 有入场信号但评分({total:+.0f})未达标，谨慎入场")
-
+        if not plan["actionable"]:
+            if plan["rr"] < 1.0:
+                log.info(f"  ⚠️ 有入场信号但盈亏比({plan['rr']:.2f})不足1.0，谨慎入场")
+            if (direction == "long" and plan["score"] <= 20) or (direction == "short" and plan["score"] >= -20):
+                log.info(f"  ⚠️ 有入场信号但评分({plan['score']:+.0f})未达标，谨慎入场")
     else:
-        entry, stop, tp1, tp2, rr = last, 0.0, 0.0, 0.0, 0.0
-        actionable = False
-
         log.info(f"     ⏳ 尚无有效反转信号，暂不建议入场")
         log.info(f"     当前阶段: {reversal['current_stage']}")
         log.info(f"     等待信号: {reversal['next_expected']}")
@@ -656,20 +551,7 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         else:
             log.info(f"     入场条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
 
-    return {
-        "symbol": symbol, "name": name, "direction": direction,
-        "score": float(total), "actionable": actionable,
-        "price": float(last),
-        "entry": float(entry), "stop": float(stop),
-        "tp1": float(tp1), "tp2": float(tp2),
-        "rr": float(rr),
-        "classical_score": float(classical_total),
-        "wyckoff_score": float(wyckoff_total),
-        "oi_score": float(oi_total),
-        "wyckoff_phase": wk_phase,
-        "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
-        "reversal_status": reversal,
-    }
+    return plan
 
 
 def main():
