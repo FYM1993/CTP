@@ -65,9 +65,11 @@ def make_trade_plan_from_phase2(
 
 
 def _safe_generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
+    if df.empty:
+        return []
     try:
         return generate_signals(df, direction, cfg)
-    except (IndexError, KeyError, ValueError):
+    except IndexError:
         return []
 
 
@@ -147,6 +149,7 @@ def run_case_from_frames(
     entry_price: float | None = None
     bars_held = 0
     tp1_hit = False
+    consumed_trade_ids: set[str] = set()
 
     for trade_date, day_minutes in minute_data.groupby("trade_date", sort=True):
         day_minutes = day_minutes.sort_values("datetime", kind="stable")
@@ -158,6 +161,8 @@ def run_case_from_frames(
                 daily_df=day_visible_daily,
                 pre_market_cfg=pre_market_cfg,
             )
+            if day_plan is not None and day_plan.trade_id in consumed_trade_ids:
+                day_plan = None
         else:
             refreshed_plan = plan_factory(
                 case=case,
@@ -197,6 +202,7 @@ def run_case_from_frames(
                 signals = _safe_generate_signals(partial_5m, case.direction, signal_cfg)
                 open_signal = "开多" if case.direction == "long" else "开空"
                 if any(signal.get("type") == open_signal for signal in signals):
+                    consumed_trade_ids.add(day_plan.trade_id)
                     active_plan = day_plan
                     entry_time = pd.Timestamp(current_minute["datetime"])
                     entry_price = float(current_minute["close"])
@@ -244,6 +250,22 @@ def run_case_from_frames(
             bars_held = 0
             tp1_hit = False
             break
+
+    if active_plan is not None:
+        final_bar = minute_data.iloc[-1]
+        trades.append(
+            _build_trade_record(
+                case=case,
+                plan=active_plan,
+                entry_time=entry_time,
+                entry_price=entry_price,
+                exit_time=final_bar["datetime"],
+                exit_price=float(final_bar["close"]),
+                exit_reason="end_of_data",
+                bars_held=bars_held,
+                tp1_hit=tp1_hit,
+            )
+        )
 
     return BacktestResult(
         case_id=case.case_id,

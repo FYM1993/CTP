@@ -13,6 +13,7 @@ if str(SCRIPTS) not in sys.path:
 
 from backtest_models import BacktestCase, TradePlan  # noqa: E402
 from backtest_phase23 import (  # noqa: E402
+    _safe_generate_signals,
     aggregate_partial_5m_bars,
     make_trade_plan_from_phase2,
     run_case_from_frames,
@@ -27,6 +28,56 @@ def _make_case(direction: str) -> BacktestCase:
         direction=direction,
         start_dt=date(2025, 1, 1),
         end_dt=date(2025, 1, 31),
+    )
+
+
+def _daily_df_for_backtest() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                [
+                    "2025-01-03",
+                    "2025-01-04",
+                    "2025-01-05",
+                    "2025-01-06",
+                    "2025-01-07",
+                ]
+            ),
+            "open": [95.0, 96.0, 97.0, 98.0, 99.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [94.0, 95.0, 96.0, 97.0, 98.0],
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "volume": [1000, 1000, 1000, 1000, 1000],
+            "oi": [5000, 5001, 5002, 5003, 5004],
+        }
+    )
+
+
+def _long_plan(*, trade_id: str = "trade-long", plan_date: str = "2025-01-06") -> TradePlan:
+    return TradePlan(
+        trade_id=trade_id,
+        symbol="LH0",
+        direction="long",
+        plan_date=plan_date,
+        entry_ref=102.0,
+        stop=98.0,
+        tp1=106.0,
+        tp2=109.0,
+        phase2_score=30.0,
+        signal_type="spring",
+    )
+
+
+def _build_minute_df(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "datetime": pd.to_datetime([row[0] for row in rows]),
+            "open": [row[1] for row in rows],
+            "high": [row[2] for row in rows],
+            "low": [row[3] for row in rows],
+            "close": [row[4] for row in rows],
+            "volume": [10] * len(rows),
+        }
     )
 
 
@@ -110,46 +161,16 @@ def test_make_trade_plan_from_phase2_maps_actionable_raw_plan(monkeypatch):
 
 
 def test_run_case_from_frames_opens_long_and_exits_on_tp2(monkeypatch):
-    minute_df = pd.DataFrame(
-        {
-            "datetime": pd.to_datetime(
-                [
-                    "2025-01-06 09:31:00",
-                    "2025-01-06 09:32:00",
-                    "2025-01-06 09:33:00",
-                    "2025-01-06 09:34:00",
-                ]
-            ),
-            "open": [100.0, 101.0, 103.0, 107.0],
-            "high": [101.0, 103.0, 108.0, 111.0],
-            "low": [99.0, 100.0, 102.0, 106.0],
-            "close": [100.0, 103.0, 107.0, 110.0],
-            "volume": [10, 10, 10, 10],
-        }
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 101.0, 103.0, 100.0, 103.0),
+            ("2025-01-06 09:33:00", 103.0, 108.0, 102.0, 107.0),
+            ("2025-01-06 09:34:00", 107.0, 111.0, 106.0, 110.0),
+        ]
     )
-    daily_df = pd.DataFrame(
-        {
-            "date": pd.to_datetime(["2025-01-03", "2025-01-04", "2025-01-05"]),
-            "open": [95.0, 96.0, 97.0],
-            "high": [101.0, 102.0, 103.0],
-            "low": [94.0, 95.0, 96.0],
-            "close": [100.0, 101.0, 102.0],
-            "volume": [1000, 1000, 1000],
-            "oi": [5000, 5001, 5002],
-        }
-    )
-    plan = TradePlan(
-        trade_id="trade-long",
-        symbol="LH0",
-        direction="long",
-        plan_date="2025-01-06",
-        entry_ref=102.0,
-        stop=98.0,
-        tp1=106.0,
-        tp2=109.0,
-        phase2_score=30.0,
-        signal_type="spring",
-    )
+    daily_df = _daily_df_for_backtest().iloc[:3].copy()
+    plan = _long_plan()
 
     monkeypatch.setattr(
         "backtest_phase23.generate_signals",
@@ -181,22 +202,13 @@ def test_run_case_from_frames_opens_long_and_exits_on_tp2(monkeypatch):
 
 
 def test_run_case_from_frames_opens_short_and_exits_on_tp2(monkeypatch):
-    minute_df = pd.DataFrame(
-        {
-            "datetime": pd.to_datetime(
-                [
-                    "2025-01-06 09:31:00",
-                    "2025-01-06 09:32:00",
-                    "2025-01-06 09:33:00",
-                    "2025-01-06 09:34:00",
-                ]
-            ),
-            "open": [200.0, 198.0, 194.0, 190.0],
-            "high": [201.0, 199.0, 195.0, 191.0],
-            "low": [199.0, 197.0, 193.0, 188.0],
-            "close": [200.0, 194.0, 190.0, 188.0],
-            "volume": [10, 10, 10, 10],
-        }
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 200.0, 201.0, 199.0, 200.0),
+            ("2025-01-06 09:32:00", 198.0, 199.0, 197.0, 194.0),
+            ("2025-01-06 09:33:00", 194.0, 195.0, 193.0, 190.0),
+            ("2025-01-06 09:34:00", 190.0, 191.0, 188.0, 188.0),
+        ]
     )
     daily_df = pd.DataFrame(
         {
@@ -249,3 +261,184 @@ def test_run_case_from_frames_opens_short_and_exits_on_tp2(monkeypatch):
     assert trade.exit_reason == "tp2"
     assert trade.tp1_hit is True
     assert trade.pnl_ratio == 0.06
+
+
+def test_safe_generate_signals_returns_empty_list_when_history_is_too_short(monkeypatch):
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: (_ for _ in ()).throw(IndexError("single bar")),
+    )
+
+    signals = _safe_generate_signals(
+        _build_minute_df(
+            [
+                ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ]
+        ),
+        "long",
+        {},
+    )
+
+    assert signals == []
+
+
+def test_safe_generate_signals_propagates_runtime_errors(monkeypatch):
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: (_ for _ in ()).throw(ValueError("boom")),
+    )
+
+    minute_df = _build_minute_df(
+        [
+            (f"2025-01-06 09:{minute:02d}:00", 100.0 + minute, 101.0 + minute, 99.0 + minute, 100.5 + minute)
+            for minute in range(31, 51)
+        ]
+    )
+
+    try:
+        _safe_generate_signals(minute_df, "long", {})
+    except ValueError as exc:
+        assert str(exc) == "boom"
+    else:
+        raise AssertionError("expected ValueError to propagate")
+
+
+def test_run_case_from_frames_force_closes_open_position_at_end_of_data(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 102.0, 99.0, 101.0),
+            ("2025-01-06 09:33:00", 101.0, 103.0, 100.0, 102.0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_time == "2025-01-06 09:33:00"
+    assert trade.exit_price == 102.0
+    assert trade.exit_reason == "end_of_data"
+    assert trade.bars_held == 2
+
+
+def test_run_case_from_frames_exits_active_trade_when_phase2_invalidates_next_day(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 102.0, 99.0, 101.0),
+            ("2025-01-07 09:31:00", 97.0, 98.0, 96.0, 97.5),
+            ("2025-01-07 09:32:00", 97.5, 98.0, 97.0, 97.2),
+        ]
+    )
+    plan = _long_plan()
+
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+    )
+
+    def plan_factory(*, daily_df, **_kwargs):
+        latest_visible = daily_df["trade_date"].max() if not daily_df.empty else None
+        if latest_visible == date(2025, 1, 5):
+            return plan
+        return None
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest(),
+        minute_df=minute_df,
+        plan_factory=plan_factory,
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    trade = result.trades[0]
+    assert trade.exit_time == "2025-01-07 09:31:00"
+    assert trade.exit_price == 97.0
+    assert trade.exit_reason == "phase2_invalidated"
+
+
+def test_run_case_from_frames_plan_factory_sees_only_prior_daily_bars(monkeypatch):
+    seen_daily_dates: list[tuple[date, list[date]]] = []
+    expected_trade_dates = [date(2025, 1, 6), date(2025, 1, 7)]
+
+    monkeypatch.setattr("backtest_phase23.generate_signals", lambda df, direction, cfg: [])
+
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-07 09:31:00", 101.0, 102.0, 100.0, 101.0),
+        ]
+    )
+
+    def plan_factory(*, daily_df, **kwargs):
+        seen_daily_dates.append(
+            (expected_trade_dates[len(seen_daily_dates)], list(daily_df["trade_date"]))
+        )
+        return None
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest(),
+        minute_df=minute_df,
+        plan_factory=plan_factory,
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 0}
+    assert seen_daily_dates == [
+        (date(2025, 1, 6), [date(2025, 1, 3), date(2025, 1, 4), date(2025, 1, 5)]),
+        (
+            date(2025, 1, 7),
+            [date(2025, 1, 3), date(2025, 1, 4), date(2025, 1, 5), date(2025, 1, 6)],
+        ),
+    ]
+
+
+def test_run_case_from_frames_consumes_trade_id_after_completed_trade(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 101.0, 103.0, 100.0, 103.0),
+            ("2025-01-06 09:33:00", 103.0, 108.0, 102.0, 107.0),
+            ("2025-01-06 09:34:00", 107.0, 111.0, 106.0, 110.0),
+            ("2025-01-07 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-07 09:32:00", 101.0, 103.0, 100.0, 103.0),
+            ("2025-01-07 09:33:00", 103.0, 108.0, 102.0, 107.0),
+            ("2025-01-07 09:34:00", 107.0, 111.0, 106.0, 110.0),
+        ]
+    )
+    plan = _long_plan(trade_id="reused-trade-id")
+
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: plan,
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    assert [trade.trade_id for trade in result.trades] == ["reused-trade-id"]
