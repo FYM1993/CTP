@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import ModuleType
+from contextlib import contextmanager
 
 import pandas as pd
 
@@ -447,3 +448,66 @@ def test_prefetch_all_skips_per_symbol_tq_retry_after_session_init_failure(monke
 
     assert set(out) == {"LH0", "M0"}
     assert fallback_calls == [("LH0", 400), ("M0", 400)]
+
+
+def test_fetch_daily_from_api_logs_retry_and_uses_socket_timeout(monkeypatch):
+    warnings = []
+    timeout_values = []
+    sleep_calls = []
+
+    @contextmanager
+    def fake_socket_timeout(timeout):
+        timeout_values.append(timeout)
+        yield
+
+    monkeypatch.setattr(data_cache, "_socket_timeout", fake_socket_timeout, raising=False)
+    monkeypatch.setattr(data_cache, "_throttle", lambda: None)
+    monkeypatch.setattr(data_cache.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_main_sina",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("api down")),
+    )
+    monkeypatch.setattr(data_cache._log, "warning", lambda msg, *args: warnings.append(msg % args))
+
+    out = data_cache._fetch_daily_from_api("PK0", 400, retries=2)
+
+    assert out is None
+    assert timeout_values == [8.0, 8.0]
+    assert sleep_calls == [2]
+    assert len(warnings) == 2
+    assert "PK0" in warnings[0]
+    assert "AkShare日线获取失败" in warnings[0]
+
+
+def test_prefetch_all_logs_when_tq_falls_back_to_akshare(monkeypatch, tmp_path):
+    warnings = []
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(data_cache, "_create_tq_api", lambda account, password: object(), raising=False)
+    monkeypatch.setattr(data_cache, "_fetch_daily_from_tq_with_api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_api",
+        lambda symbol, days: pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-15"]),
+                "open": [100.0],
+                "high": [110.0],
+                "low": [90.0],
+                "close": [105.0],
+                "volume": [1234.0],
+                "oi": [888.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(data_cache._log, "warning", lambda msg, *args: warnings.append(msg % args))
+
+    out = data_cache.prefetch_all(
+        symbols=[{"symbol": "PK0", "name": "花生", "exchange": "czce"}]
+    )
+
+    assert set(out) == {"PK0"}
+    assert any("PK0" in message and "TqSdk无数据，回退AkShare" in message for message in warnings)

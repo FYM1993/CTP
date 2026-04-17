@@ -21,8 +21,10 @@
 """
 
 import time
+import socket
 from pathlib import Path
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 
 import pandas as pd
 import numpy as np
@@ -42,6 +44,7 @@ CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
 _request_count = 0
 _last_request_time = 0.0
 MIN_REQUEST_INTERVAL = 0.5
+API_REQUEST_TIMEOUT = 8.0
 
 MARKET_CLOSE_HOUR = 15
 MARKET_CLOSE_MINUTE = 30
@@ -79,6 +82,16 @@ def _tq_credentials(config: dict | None = None) -> tuple[str, str] | None:
     if not account or not password:
         return None
     return account, password
+
+
+@contextmanager
+def _socket_timeout(timeout: float):
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 def _fetch_daily_from_tq_with_api(symbol: str, days: int, api, config: dict | None = None) -> pd.DataFrame | None:
@@ -261,10 +274,12 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
 def _fetch_daily_from_api(symbol: str, days: int, retries: int = 3) -> pd.DataFrame | None:
     """从新浪API获取日线数据，带重试"""
     for attempt in range(retries):
+        started_at = time.time()
         try:
             _throttle()
             start = pd.Timestamp.now() - pd.Timedelta(days=days * 2)
-            df = aks.futures_main_sina(symbol=symbol, start_date=start.strftime("%Y%m%d"))
+            with _socket_timeout(API_REQUEST_TIMEOUT):
+                df = aks.futures_main_sina(symbol=symbol, start_date=start.strftime("%Y%m%d"))
             df = df.rename(columns={
                 "日期": "date", "开盘价": "open", "最高价": "high",
                 "最低价": "low", "收盘价": "close",
@@ -278,7 +293,16 @@ def _fetch_daily_from_api(symbol: str, days: int, retries: int = 3) -> pd.DataFr
             if len(df) >= 30:
                 return df
             return None
-        except Exception:
+        except Exception as e:
+            elapsed = time.time() - started_at
+            _log.warning(
+                "%s AkShare日线获取失败（第%s/%s次，耗时%.1fs）: %s",
+                symbol,
+                attempt + 1,
+                retries,
+                elapsed,
+                e,
+            )
             if attempt < retries - 1:
                 time.sleep(2 + attempt * 3)
     return None
@@ -834,6 +858,7 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
             else:
                 df = None
             if df is None or len(df) == 0:
+                _log.warning("%s TqSdk无数据，回退AkShare日线接口", sym)
                 df = _fetch_daily_from_api(sym, days=400)
                 api_calls += 1
             if df is not None and len(df) > 0:
