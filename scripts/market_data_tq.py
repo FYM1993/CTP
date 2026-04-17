@@ -70,7 +70,7 @@ def _query_cont_underlying(api, symbol: str, exchange: str) -> str | None:
     return None
 
 
-def _resolve_from_quote(api, fallback_symbol: str, wait_timeout: float) -> str | None:
+def _resolve_from_quote(api, fallback_symbol: str, wait_timeout: float) -> tuple[str, str] | None:
     get_quote = getattr(api, "get_quote", None)
     if not callable(get_quote):
         return None
@@ -83,7 +83,7 @@ def _resolve_from_quote(api, fallback_symbol: str, wait_timeout: float) -> str |
     underlying_symbol = getattr(quote, "underlying_symbol", "") or ""
     if underlying_symbol:
         try:
-            return tq_underlying_to_continuous(underlying_symbol)
+            return tq_underlying_to_continuous(underlying_symbol), underlying_symbol
         except ValueError:
             return None
 
@@ -97,7 +97,7 @@ def _resolve_from_quote(api, fallback_symbol: str, wait_timeout: float) -> str |
         underlying_symbol = getattr(quote, "underlying_symbol", "") or ""
         if underlying_symbol:
             try:
-                return tq_underlying_to_continuous(underlying_symbol)
+                return tq_underlying_to_continuous(underlying_symbol), underlying_symbol
             except ValueError:
                 return None
         if not updated:
@@ -111,21 +111,52 @@ def resolve_tq_continuous_symbol(
     api=None,
     wait_timeout: float = 2.0,
 ) -> str:
+    return resolve_tq_continuous_symbol_info(
+        symbol,
+        exchange,
+        api=api,
+        wait_timeout=wait_timeout,
+    )["continuous_symbol"]
+
+
+def resolve_tq_continuous_symbol_info(
+    symbol: str,
+    exchange: str,
+    api=None,
+    wait_timeout: float = 2.0,
+) -> dict[str, str]:
     fallback_symbol = symbol_to_tq_main(symbol, exchange)
     if api is None:
-        return fallback_symbol
+        return {
+            "continuous_symbol": fallback_symbol,
+            "source": "fallback",
+            "underlying_symbol": "",
+        }
 
     underlying_symbol = _query_cont_underlying(api, symbol, exchange)
     if underlying_symbol:
         try:
-            return tq_underlying_to_continuous(underlying_symbol)
+            return {
+                "continuous_symbol": tq_underlying_to_continuous(underlying_symbol),
+                "source": "query_cont_quotes",
+                "underlying_symbol": underlying_symbol,
+            }
         except ValueError:
             pass
 
     resolved_from_quote = _resolve_from_quote(api, fallback_symbol, wait_timeout)
     if resolved_from_quote:
-        return resolved_from_quote
-    return fallback_symbol
+        continuous_symbol, underlying_symbol = resolved_from_quote
+        return {
+            "continuous_symbol": continuous_symbol,
+            "source": "underlying_symbol",
+            "underlying_symbol": underlying_symbol,
+        }
+    return {
+        "continuous_symbol": fallback_symbol,
+        "source": "fallback",
+        "underlying_symbol": "",
+    }
 
 
 def klines_to_daily_frame(klines: pd.DataFrame) -> pd.DataFrame:

@@ -17,7 +17,7 @@ import time
 import pandas as pd
 
 from data_cache import BUILTIN_SYMBOLS
-from market_data_tq import resolve_tq_continuous_symbol
+from market_data_tq import resolve_tq_continuous_symbol_info
 
 
 def exchange_for_symbol(symbol: str) -> str | None:
@@ -27,7 +27,7 @@ def exchange_for_symbol(symbol: str) -> str | None:
     return None
 
 
-def internal_symbol_to_tq_continuous(symbol: str, api=None) -> str:
+def internal_symbol_to_tq_continuous(symbol: str, api=None) -> tuple[str, dict[str, str]]:
     """
     内部代码（如 LH0）→ TqSdk 连续合约代码 KQ.m@DCE.lh
     """
@@ -35,7 +35,8 @@ def internal_symbol_to_tq_continuous(symbol: str, api=None) -> str:
     if not ex:
         raise ValueError(f"未知品种代码（未在内置列表）: {symbol}")
     try:
-        return resolve_tq_continuous_symbol(symbol.strip(), ex, api=api)
+        info = resolve_tq_continuous_symbol_info(symbol.strip(), ex, api=api)
+        return info["continuous_symbol"], info
     except ValueError:
         raise
     except Exception as exc:
@@ -125,11 +126,14 @@ class TqPhase3Monitor:
         self._min_serial: dict[str, object] = {}
         self._day_serial: dict[str, object] = {}
         self._tq_syms: dict[str, str] = {}
+        self._resolve_info: dict[str, dict[str, str]] = {}
 
     def connect(self) -> None:
         self.api = self._TqApi(auth=self._TqAuth(self.account, self.password))
         for sym in self.symbols:
-            self._tq_syms[sym] = internal_symbol_to_tq_continuous(sym, api=self.api)
+            tq_symbol, info = internal_symbol_to_tq_continuous(sym, api=self.api)
+            self._tq_syms[sym] = tq_symbol
+            self._resolve_info[sym] = info
         for sym in self.symbols:
             tq = self._tq_syms[sym]
             self._min_serial[sym] = self.api.get_kline_serial(
@@ -159,7 +163,10 @@ class TqPhase3Monitor:
             time.sleep(seconds)
             return
         dl = time.time() + max(0.5, seconds)
-        self.api.wait_update(deadline=dl)
+        while time.time() < dl:
+            updated = self.api.wait_update(deadline=dl)
+            if not updated:
+                break
 
     def minute_df(self, symbol: str) -> pd.DataFrame | None:
         kl = self._min_serial.get(symbol)
@@ -199,7 +206,18 @@ class TqPhase3Monitor:
                 pass
 
     def describe_subscription(self) -> str:
-        parts = [f"{s}→{self._tq_syms.get(s, '?')}" for s in self.symbols]
+        parts = []
+        for sym in self.symbols:
+            tq_symbol = self._tq_syms.get(sym, "?")
+            info = self._resolve_info.get(sym) or {}
+            source = info.get("source") or "fallback"
+            underlying = info.get("underlying_symbol") or ""
+            if source == "query_cont_quotes" and underlying:
+                parts.append(f"{sym}→{tq_symbol} [query_cont_quotes:{underlying}]")
+            elif source == "underlying_symbol" and underlying:
+                parts.append(f"{sym}→{tq_symbol} [underlying_symbol:{underlying}]")
+            else:
+                parts.append(f"{sym}→{tq_symbol} [fallback]")
         return "; ".join(parts)
 
 

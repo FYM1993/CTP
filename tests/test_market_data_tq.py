@@ -15,6 +15,7 @@ if str(SCRIPTS) not in sys.path:
 from market_data_tq import (  # noqa: E402
     klines_to_daily_frame,
     resolve_tq_continuous_symbol,
+    resolve_tq_continuous_symbol_info,
     symbol_to_tq_main,
     tq_underlying_to_continuous,
 )
@@ -54,6 +55,22 @@ def test_resolve_tq_continuous_symbol_prefers_query_cont_quotes():
     assert api.calls == [("DCE", "LH"), ("DCE", "lh")]
 
 
+def test_resolve_tq_continuous_symbol_info_records_query_source():
+    class FakeApi:
+        def query_cont_quotes(self, exchange_id=None, product_id=None):
+            if exchange_id == "DCE" and product_id == "lh":
+                return ["DCE.lh2509"]
+            return []
+
+    info = resolve_tq_continuous_symbol_info("LH0", "dce", api=FakeApi())
+
+    assert info == {
+        "continuous_symbol": "KQ.m@DCE.lh",
+        "source": "query_cont_quotes",
+        "underlying_symbol": "DCE.lh2509",
+    }
+
+
 def test_resolve_tq_continuous_symbol_falls_back_to_local_mapping_when_query_empty():
     class FakeApi:
         def query_cont_quotes(self, exchange_id=None, product_id=None):
@@ -62,6 +79,20 @@ def test_resolve_tq_continuous_symbol_falls_back_to_local_mapping_when_query_emp
     out = resolve_tq_continuous_symbol("TA0", "czce", api=FakeApi())
 
     assert out == "KQ.m@CZCE.TA"
+
+
+def test_resolve_tq_continuous_symbol_info_records_fallback_source():
+    class FakeApi:
+        def query_cont_quotes(self, exchange_id=None, product_id=None):
+            return []
+
+    info = resolve_tq_continuous_symbol_info("TA0", "czce", api=FakeApi())
+
+    assert info == {
+        "continuous_symbol": "KQ.m@CZCE.TA",
+        "source": "fallback",
+        "underlying_symbol": "",
+    }
 
 
 def test_symbol_to_tq_main_raises_value_error_for_unknown_exchange():
@@ -470,6 +501,53 @@ def test_prefetch_all_reuses_single_tq_session(monkeypatch, tmp_path):
     assert len(created_apis) == 1
     assert used_apis == [created_apis[0], created_apis[0]]
     assert created_apis[0].closed is True
+
+
+def test_prefetch_all_does_not_create_tq_session_when_all_symbols_hit_cache(monkeypatch, tmp_path):
+    cache_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-04-15"]),
+            "open": [100.0],
+            "high": [110.0],
+            "low": [90.0],
+            "close": [105.0],
+            "volume": [1234.0],
+            "oi": [888.0],
+        }
+    )
+    for symbol in ("LH0", "M0"):
+        cache_frame.to_parquet(
+            tmp_path / f"daily_{symbol}_20260417_live.parquet",
+            index=False,
+        )
+
+    create_calls = []
+
+    class FakeDatetime:
+        @classmethod
+        def now(cls):
+            return pd.Timestamp("2026-04-17 10:57:04").to_pydatetime()
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "datetime", FakeDatetime)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(
+        data_cache,
+        "_create_tq_api",
+        lambda *args, **kwargs: create_calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    out = data_cache.prefetch_all(
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ]
+    )
+
+    assert set(out) == {"LH0", "M0"}
+    assert create_calls == []
 
 
 def test_prefetch_all_skips_per_symbol_tq_retry_after_session_init_failure(monkeypatch, tmp_path):

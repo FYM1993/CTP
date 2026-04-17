@@ -822,15 +822,7 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
     tq_credentials = _tq_credentials(config)
     tq_api = None
     tq_available = tq_credentials is not None
-
-    if tq_available:
-        account, password = tq_credentials
-        try:
-            tq_api = _create_tq_api(account, password)
-        except Exception as e:
-            _log.warning("TqSdk 初始化失败，批量预取改走 AkShare: %s", e)
-            tq_available = False
-            tq_api = None
+    tq_init_attempted = False
 
     try:
         for i, info in enumerate(symbols):
@@ -858,6 +850,16 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
                 data[sym] = cached_df
                 cache_hits += 1
                 continue
+
+            if tq_available and tq_api is None and not tq_init_attempted:
+                tq_init_attempted = True
+                account, password = tq_credentials
+                try:
+                    tq_api = _create_tq_api(account, password)
+                except Exception as e:
+                    _log.warning("TqSdk 初始化失败，批量预取改走 AkShare: %s", e)
+                    tq_available = False
+                    tq_api = None
 
             tq_attempted = False
             if tq_api is not None:
