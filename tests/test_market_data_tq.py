@@ -24,6 +24,10 @@ def test_symbol_to_tq_main_uses_exchange_table():
     assert symbol_to_tq_main("LH0", "dce") == "KQ.m@DCE.lh"
 
 
+def test_symbol_to_tq_main_uses_uppercase_product_for_czce():
+    assert symbol_to_tq_main("TA0", "czce") == "KQ.m@CZCE.TA"
+
+
 def test_symbol_to_tq_main_raises_value_error_for_unknown_exchange():
     try:
         symbol_to_tq_main("LH0", "xxx")

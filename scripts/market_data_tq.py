@@ -21,7 +21,9 @@ def symbol_to_tq_main(symbol: str, exchange: str) -> str:
     exchange_upper = EXCHANGE_UPPER.get(exchange.lower())
     if not exchange_upper:
         raise ValueError(f"未知交易所: {exchange}")
-    return f"KQ.m@{exchange_upper}.{match.group(1).lower()}"
+    product = match.group(1)
+    product_code = product.upper() if exchange_upper == "CZCE" else product.lower()
+    return f"KQ.m@{exchange_upper}.{product_code}"
 
 
 def klines_to_daily_frame(klines: pd.DataFrame) -> pd.DataFrame:
