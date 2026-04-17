@@ -45,8 +45,7 @@ from pre_market import analyze_one, resolve_phase2_direction, score_signals
 from intraday import print_dashboard
 from wyckoff import assess_reversal_status
 from tqsdk_live import try_create_phase3_monitor
-from fundamental_legacy import score_symbol_legacy
-from fundamental_regime import score_symbol_regime
+from phase1_pipeline import run_phase1_pipeline
 
 log = get_logger("workflow")
 
@@ -118,121 +117,34 @@ def phase_1_screen(
 ) -> list[dict]:
     cfg = load_config()
     fs = cfg.get("fundamental_screening") or {}
-    p1_engine = (fs.get("p1_engine") or "legacy").strip().lower()
-    if p1_engine not in ("legacy", "regime"):
-        p1_engine = "legacy"
-    score_fn = score_symbol_regime if p1_engine == "regime" else score_symbol_legacy
 
     log.info("\n" + "▓" * 60)
     log.info("▓  Phase 1: 全市场基本面筛选")
-    log.info(
-        "▓  P1引擎: %s（config fundamental_screening.p1_engine；regime 为实验对照）",
-        p1_engine,
-    )
+    log.info("▓  P1引擎: 关注优先级新管线（反转机会分 / 趋势机会分）")
     log.info("▓" * 60)
-
-    default_thr = (
-        float(fs["default_threshold"])
-        if fs.get("default_threshold") is not None
-        else float(threshold)
+    candidates = run_phase1_pipeline(
+        all_data=all_data,
+        symbols=get_all_symbols(),
+        threshold=threshold,
+        config=cfg,
     )
-    sym_to_threshold: dict[str, float] = {}
-    for cat_cfg in (fs.get("categories") or {}).values():
-        if not isinstance(cat_cfg, dict):
-            continue
-        if cat_cfg.get("threshold") is None:
-            continue
-        t = float(cat_cfg["threshold"])
-        for s in cat_cfg.get("symbols") or []:
-            sym_to_threshold[str(s)] = t
-
-    symbols = get_all_symbols()
-    candidates = []
-
-    for info in symbols:
-        sym = info["symbol"]
-        df = all_data.get(sym)
-        if df is None or len(df) < 60:
-            if sym == "LH0":
-                log.info("[P1] 生猪 LH0: 日线不足 60 根，跳过评分")
-            continue
-
-        eff_threshold = sym_to_threshold.get(sym, default_thr)
-        result = score_fn(
-            sym, info["name"], info["exchange"], df, threshold=eff_threshold
-        )
-        if result is None:
-            if sym == "LH0":
-                log.warning("[P1] 生猪 LH0: 评分失败")
-            continue
-
-        if sym == "LH0":
-            reg = result.get("lh_regime")
-            reg_s = f" @regime={reg}" if reg else ""
-            log.info(
-                f"[P1] 生猪 LH0: {result['score']:+.0f} (门槛{eff_threshold:g}){reg_s}"
-            )
-
-        fund_pass = abs(result["score"]) >= eff_threshold
-        extreme_price = result["range_pct"] < 5 or result["range_pct"] > 95
-
-        if fund_pass or extreme_price:
-            pool_parts = []
-            if fund_pass:
-                # 避免字符串含 ASCII |，否则 Markdown 表格列会错位
-                pool_parts.append(
-                    f"基本面达标(绝对值≥{eff_threshold:g}，当前{result['score']:+.0f})"
-                )
-            if extreme_price:
-                pool_parts.append(f"极端价位(区间位{result['range_pct']:.0f}%)")
-            result["entry_pool_reason"] = "；".join(pool_parts)
-
-            if not fund_pass and result["score"] == 0:
-                result["score"] = 1.0 if result["range_pct"] < 50 else -1.0
-
-            if fund_pass and extreme_price:
-                labels = ["双标签候选"]
-                reversal_score = abs(result["score"])
-                trend_score = abs(result["score"])
-            elif extreme_price:
-                labels = ["反转候选"]
-                reversal_score = abs(result["score"])
-                trend_score = 0.0
-            else:
-                labels = ["趋势候选"]
-                reversal_score = 0.0
-                trend_score = abs(result["score"])
-
-            result["attention_score"] = abs(result["score"])
-            result["reversal_score"] = reversal_score
-            result["trend_score"] = trend_score
-            result["labels"] = labels
-            result["state_labels"] = []
-            result["data_coverage"] = 1.0
-            result["reason_summary"] = result.get("fund_details") or result["entry_pool_reason"]
-            candidates.append(result)
-
-    candidates.sort(key=lambda x: x.get("attention_score", 0), reverse=True)
 
     log.info(
-        "\n  ✅ 通过筛选 (|基本面| 达各品种门槛，默认%g；或极端价格): %s 个品种\n",
-        default_thr,
+        "\n  ✅ 进入 Phase 2 候选池: %s 个品种\n",
         len(candidates),
     )
 
     def _log_cand(c):
-        extreme = " ⚡极端价格" if (c["range_pct"] < 5 or c["range_pct"] > 95) else ""
         label_text = "/".join(c.get("labels") or [])
         line = (f"     {c['name']:6s} ({c['symbol']:5s})  "
                 f"区间位{c['range_pct']:3.0f}%  "
-                f"基本面={c.get('fund_score', 0):+.0f}  "
+                f"反转={c.get('reversal_score', 0):.0f}  "
+                f"趋势={c.get('trend_score', 0):.0f}  "
                 f"关注={c.get('attention_score', 0):.0f}  "
-                f"标签={label_text}{extreme}")
+                f"标签={label_text}")
         fd = c.get("fund_details", "")
         if fd:
             line += f"  [{fd}]"
-        if c.get("lh_regime"):
-            line += f"  @regime={c['lh_regime']}"
         log.info(line)
 
     if candidates:
@@ -246,18 +158,6 @@ def phase_1_screen(
 # ============================================================
 #  Phase 2: 盘前深度分析（读缓存）
 # ============================================================
-
-def _phase_scores_support_direction(direction: str, fund: float, p2: float) -> bool:
-    """
-    约定：正分=偏多、负分=偏空。P1/P2 符号是否均支持计划交易方向（共振）。
-    仅用于报告/标签「逆势」，**不**再作为可操作门槛（选项：允许逆势参与但须明示）。
-    """
-    if direction == "long":
-        return fund > 0 and p2 > 0
-    if direction == "short":
-        return fund < 0 and p2 < 0
-    return False
-
 
 def build_phase1_summary(
     top_n: int,
@@ -358,15 +258,10 @@ def phase_2_premarket(
                 result["fund_receipt_change"] = cand.get("receipt_change")
                 result["fund_seasonal"] = cand.get("seasonal_signal")
                 result["fund_hog_profit"] = cand.get("hog_profit")
-                result["fund_screen_score"] = cand.get("score", 0)
+                result["fund_screen_score"] = cand.get("attention_score", cand.get("score", 0))
                 result["fund_details"] = cand.get("fund_details", "")
                 result["signal_strength"] = result.get("reversal_status", {}).get("signal_strength", 0.0)
                 result["phase2_decision"] = resolved_direction
-                result["score_signs_support_direction"] = _phase_scores_support_direction(
-                    analysis_direction,
-                    float(result.get("fund_screen_score", 0)),
-                    float(result.get("score", 0)),
-                )
                 result["entry_pool_reason"] = cand.get("entry_pool_reason", "")
 
                 if result["actionable"]:
@@ -379,10 +274,9 @@ def phase_2_premarket(
     # RRF (Reciprocal Rank Fusion): 按排名融合 P1 和 P2
     # k=10 适合候选数 10~30 的场景，让 top 排名拉开差距
     RRF_K = 10
-    DIRECTION_PENALTY = 0.5  # P1/P2 方向冲突时 RRF 打五折
     all_results = actionable + watchlist
     if all_results:
-        p1_ranked = sorted(all_results, key=lambda x: abs(x.get("fund_screen_score", 0)), reverse=True)
+        p1_ranked = sorted(all_results, key=lambda x: x.get("attention_score", x.get("fund_screen_score", 0)), reverse=True)
         p2_ranked = sorted(all_results, key=lambda x: abs(x.get("score", 0)), reverse=True)
         p1_rank = {id(r): i + 1 for i, r in enumerate(p1_ranked)}
         p2_rank = {id(r): i + 1 for i, r in enumerate(p2_ranked)}
@@ -390,14 +284,7 @@ def phase_2_premarket(
             r1 = p1_rank[id(r)]
             r2 = p2_rank[id(r)]
             raw_rrf = 1.0 / (RRF_K + r1) + 1.0 / (RRF_K + r2)
-            p1_score = r.get("fund_screen_score", 0)
-            p2_score = r.get("score", 0)
-            if p1_score != 0 and p2_score != 0 and (p1_score > 0) != (p2_score > 0):
-                r["rrf_score"] = raw_rrf * DIRECTION_PENALTY
-                r["direction_conflict"] = True
-            else:
-                r["rrf_score"] = raw_rrf
-                r["direction_conflict"] = False
+            r["rrf_score"] = raw_rrf
             r["rank_p1"] = r1
             r["rank_p2"] = r2
 
@@ -445,18 +332,12 @@ def phase_2_premarket(
             r2 = w.get("rank_p2", 0)
             p1 = w.get("fund_screen_score", 0)
             ss = w.get("signal_strength", 0)
-            tags = []
-            if w.get("direction_conflict"):
-                tags.append("P1P2异号")
-            if not w.get("score_signs_support_direction", True):
-                tags.append("逆势")
-            conflict = f" ⚠️{'/'.join(tags)}" if tags else ""
             pool_hint = (w.get("entry_pool_reason") or "")[:28]
             pool_suffix = f" | {pool_hint}" if pool_hint else ""
             log.info(
                 f"  👀{w['name']:8s} {w['symbol']:6s} {dir_str:4s} "
                 f"{rrf:>6.4f} {r1:>4d} {r2:>4d} {p1:>+5.0f} {w['score']:>+5.0f} "
-                f"{ss:>4.2f}  {next_exp}{conflict}{pool_suffix}"
+                f"{ss:>4.2f}  {next_exp}{pool_suffix}"
             )
     if not actionable and not watchlist:
         log.info("\n  ⚠️ 没有品种通过深度分析")
@@ -623,31 +504,19 @@ def phase_3_intraday(
                                 else:
                                     confirm = f"收盘维持在 {sig_bar.get('high', 0):.0f} 以下"
 
-                                aligned = w.get("score_signs_support_direction", True)
                                 pool_r = w.get("entry_pool_reason") or ""
                                 pool_line = f"       入池理由: {pool_r}" if pool_r else ""
-                                if aligned:
-                                    print(f"  🔔🔔 {w['name']} 出现反转信号（P1/P2 与计划方向共振）")
-                                    print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
-                                    if pool_line:
-                                        print(pool_line)
-                                    print(f"       {live_info}")
-                                    print(f"       确认条件: {confirm}")
-                                    print(f"       置信度: {rev['confidence']:.0%}")
-                                else:
-                                    print(f"  🔔 {w['name']} 出现反转信号（逆势：P1/P2 读数与计划方向未共振，见报告「入池理由/⚠️逆势」）")
-                                    print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
-                                    if pool_line:
-                                        print(pool_line)
-                                    print(f"       {live_info}")
-                                    print(f"       确认条件: {confirm}")
-                                    print(f"       置信度: {rev['confidence']:.0%}")
+                                print(f"  🔔🔔 {w['name']} 出现反转信号")
+                                print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
+                                if pool_line:
+                                    print(pool_line)
+                                print(f"       {live_info}")
+                                print(f"       确认条件: {confirm}")
+                                print(f"       置信度: {rev['confidence']:.0%}")
 
                             elif has_signal and had_signal:
                                 sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
-                                al = w.get("score_signs_support_direction", True)
-                                tag = "" if al else "（逆势未解除）"
-                                print(f"  🟢 {w['name']}: {sig_cn}信号持续{tag} | {live_info}")
+                                print(f"  🟢 {w['name']}: {sig_cn}信号持续 | {live_info}")
 
                             elif not has_signal and had_signal:
                                 print(f"  ❌ {w['name']}: 信号已消失（价格回落），继续观望")
@@ -782,8 +651,7 @@ def save_targets(
         )
         lines.append(
             "> **方向**由 Phase 2 技术面总分解析得到；Phase 1 只负责给出关注候选、关注分与机会标签。"
-            "若 RRF 旁有 **⚠️逆势**，表示 P1/P2 读数与计划方向未共振（常见于摸顶/抄底），"
-            "可在有确认信号时参与，但须自行加权风控。"
+            "机会标签描述的是基本面机会类型，不直接等同于最终交易方向。"
         )
     else:
         lines.append("## 今日无信号")
@@ -837,17 +705,10 @@ def save_targets(
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
             ss = t.get("signal_strength", 0)
-            tag_cells = []
-            if t.get("direction_conflict"):
-                tag_cells.append("P1P2异号")
-            if not t.get("score_signs_support_direction", True):
-                tag_cells.append("逆势")
-            tag_str = "/".join(tag_cells) if tag_cells else "-"
             epr = _md_cell(t.get("entry_pool_reason") or "-")
             phase1_labels = "/".join(t.get("phase1_labels") or t.get("labels") or []) or "-"
             phase1_summary = _md_cell(t.get("phase1_reason_summary") or t.get("reason_summary") or "-")
-            risk_suffix = f" ⚠️{tag_str}" if tag_cells else ""
-            rrf_cell = _md_cell(f"**{rrf:.4f}**{risk_suffix}")
+            rrf_cell = _md_cell(f"**{rrf:.4f}**")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
             lines.append(
@@ -873,16 +734,10 @@ def save_targets(
             r1 = t.get("rank_p1", "-")
             r2 = t.get("rank_p2", "-")
             ss = t.get("signal_strength", 0)
-            wtags = []
-            if t.get("direction_conflict"):
-                wtags.append("P1P2异号")
-            if not t.get("score_signs_support_direction", True):
-                wtags.append("逆势")
-            conflict_tag = f" ⚠️{'/'.join(wtags)}" if wtags else ""
             epr = _md_cell(t.get("entry_pool_reason") or "-")
             phase1_labels = "/".join(t.get("phase1_labels") or t.get("labels") or []) or "-"
             phase1_summary = _md_cell(t.get("phase1_reason_summary") or t.get("reason_summary") or "-")
-            rrf_cell = _md_cell(f"**{rrf:.4f}**{conflict_tag}")
+            rrf_cell = _md_cell(f"**{rrf:.4f}**")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
             lines.append(
@@ -898,11 +753,11 @@ def save_targets(
     lines.append("")
     lines.append("### Phase 1 机会发现评分体系")
     lines.append("")
-    lines.append("所有评分统一约定：**正分=偏多机会，负分=偏空机会**。分值越大代表关注优先级越高。")
+    lines.append("Phase 1 的三个分数均使用 `0-100` 区间；分值越大代表机会强度或关注优先级越高。")
     lines.append("")
     lines.append(
-        "Phase 1 负责发现机会并输出关注优先级，通过**各品种基本面门槛**或极端价格位（<5% 或 >95%）进入候选池。"
-        "它不直接定方向，方向由 Phase 2 结合技术面与信号时机决定。门槛由 config 分层配置（默认与各品种分类），并非单一固定「数值≥10」规则。"
+        "Phase 1 负责发现机会并输出关注优先级，不再直接给做多/做空建议。"
+        "候选池由关注门槛控制，门槛沿用 config 分层配置，并映射为各品种的关注分入池线。"
     )
     lines.append("")
     lines.append("| 指标 | 满分 | 数据来源 | 含义 |")
@@ -926,10 +781,10 @@ def save_targets(
     )
     lines.append(
         "**计划方向**来自 Phase 2 对技术面总分的解析；Phase 1 仅提供关注候选、关注分与机会标签。"
-        "若标签含 **逆势**，表示 P1/P2 未与计划方向共振，属反转/摸顶情境，须额外风控。"
+        "机会标签描述的是基本面机会类型，不直接等同于最终交易方向。"
     )
     lines.append("")
-    lines.append("**两阶段评分**：正分=偏多机会, 负分=偏空机会。P1 与 P2 同号时通常更可靠；RRF 对 P1/P2 异号有惩罚。")
+    lines.append("**两阶段评分**：Phase 1 负责发现机会，Phase 2 负责解析方向与时机，两者通过 RRF 排名融合。")
     lines.append("")
     lines.append("### RRF 综合排名 (Reciprocal Rank Fusion)")
     lines.append("")
@@ -941,7 +796,6 @@ def save_targets(
     lines.append("- RRF 不依赖评分的绝对值或尺度，只看排名位次")
     lines.append("- 两个 Phase 都排名靠前的品种，RRF 得分最高")
     lines.append("- 只有一个 Phase 排名高的品种，也能保留但排名靠后")
-    lines.append("- **方向一致性惩罚**: 若 P1(基本面)与 P2(技术面)方向冲突(一正一负)，RRF 得分×0.5")
     lines.append("")
     lines.append("### 入场信号说明")
     lines.append("")
@@ -1001,10 +855,6 @@ def save_targets(
         if phase1_labels:
             lines.append(f"**机会标签（Phase 1）**: {_md_cell('/'.join(phase1_labels))}")
             lines.append("")
-        aln = t.get("score_signs_support_direction", True)
-        if not aln:
-            lines.append("**⚠️ 逆势**: P1/P2 综合分符号与计划方向未共振；表内「方向」来自 Phase 2 技术面解析，不是 Phase 1 分栏。")
-            lines.append("")
 
         # --- 入场信号状态 ---
         rev = t.get("reversal_status", {})
@@ -1060,8 +910,7 @@ def save_targets(
         rrf = t.get("rrf_score", 0)
         r1 = t.get("rank_p1", "-")
         r2 = t.get("rank_p2", "-")
-        conflict_note = " ⚠️ 方向冲突(已惩罚×0.5)" if t.get("direction_conflict") else ""
-        lines.append(f"- **RRF 综合: {rrf:.4f}** (P1排名#{r1} + P2排名#{r2}){conflict_note}")
+        lines.append(f"- **RRF 综合: {rrf:.4f}** (P1排名#{r1} + P2排名#{r2})")
         lines.append(f"- Phase 2 综合: {t.get('score', 0):+.1f} "
                      f"(技术{t.get('classical_score', 0):+.1f} / "
                      f"量价{t.get('wyckoff_score', 0):+.1f} / "

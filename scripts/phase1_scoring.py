@@ -14,6 +14,27 @@ def build_labels(*, reversal_score: float, trend_score: float, data_coverage: fl
     return labels
 
 
+def build_state_labels(
+    *,
+    reversal_up_score: float,
+    reversal_down_score: float,
+    trend_up_score: float,
+    trend_down_score: float,
+) -> list[str]:
+    labels: list[str] = []
+    if max(reversal_up_score, reversal_down_score) >= 60:
+        if reversal_up_score >= reversal_down_score:
+            labels.append("低位出清")
+        else:
+            labels.append("高位扩产")
+    if max(trend_up_score, trend_down_score) >= 60:
+        if trend_up_score >= trend_down_score:
+            labels.append("紧平衡强化")
+        else:
+            labels.append("过剩深化")
+    return labels
+
+
 def calc_attention_raw(
     *,
     reversal_rank: int,
