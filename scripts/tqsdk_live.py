@@ -17,7 +17,7 @@ import time
 import pandas as pd
 
 from data_cache import BUILTIN_SYMBOLS
-from market_data_tq import symbol_to_tq_main
+from market_data_tq import resolve_tq_continuous_symbol
 
 
 def exchange_for_symbol(symbol: str) -> str | None:
@@ -27,7 +27,7 @@ def exchange_for_symbol(symbol: str) -> str | None:
     return None
 
 
-def internal_symbol_to_tq_continuous(symbol: str) -> str:
+def internal_symbol_to_tq_continuous(symbol: str, api=None) -> str:
     """
     内部代码（如 LH0）→ TqSdk 连续合约代码 KQ.m@DCE.lh
     """
@@ -35,8 +35,10 @@ def internal_symbol_to_tq_continuous(symbol: str) -> str:
     if not ex:
         raise ValueError(f"未知品种代码（未在内置列表）: {symbol}")
     try:
-        return symbol_to_tq_main(symbol.strip(), ex)
-    except KeyError as exc:
+        return resolve_tq_continuous_symbol(symbol.strip(), ex, api=api)
+    except ValueError:
+        raise
+    except Exception as exc:
         raise ValueError(f"未知交易所: {ex}") from exc
 
 
@@ -125,9 +127,9 @@ class TqPhase3Monitor:
         self._tq_syms: dict[str, str] = {}
 
     def connect(self) -> None:
-        for sym in self.symbols:
-            self._tq_syms[sym] = internal_symbol_to_tq_continuous(sym)
         self.api = self._TqApi(auth=self._TqAuth(self.account, self.password))
+        for sym in self.symbols:
+            self._tq_syms[sym] = internal_symbol_to_tq_continuous(sym, api=self.api)
         for sym in self.symbols:
             tq = self._tq_syms[sym]
             self._min_serial[sym] = self.api.get_kline_serial(

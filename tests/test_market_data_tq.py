@@ -14,7 +14,9 @@ if str(SCRIPTS) not in sys.path:
 
 from market_data_tq import (  # noqa: E402
     klines_to_daily_frame,
+    resolve_tq_continuous_symbol,
     symbol_to_tq_main,
+    tq_underlying_to_continuous,
 )
 import data_cache  # noqa: E402
 import market_data_tq  # noqa: E402
@@ -26,6 +28,40 @@ def test_symbol_to_tq_main_uses_exchange_table():
 
 def test_symbol_to_tq_main_uses_uppercase_product_for_czce():
     assert symbol_to_tq_main("TA0", "czce") == "KQ.m@CZCE.TA"
+
+
+def test_tq_underlying_to_continuous_uses_returned_product_case():
+    assert tq_underlying_to_continuous("DCE.lh2509") == "KQ.m@DCE.lh"
+    assert tq_underlying_to_continuous("CZCE.TA609") == "KQ.m@CZCE.TA"
+
+
+def test_resolve_tq_continuous_symbol_prefers_query_cont_quotes():
+    class FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        def query_cont_quotes(self, exchange_id=None, product_id=None):
+            self.calls.append((exchange_id, product_id))
+            if exchange_id == "DCE" and product_id == "lh":
+                return ["DCE.lh2509"]
+            return []
+
+    api = FakeApi()
+
+    out = resolve_tq_continuous_symbol("LH0", "dce", api=api)
+
+    assert out == "KQ.m@DCE.lh"
+    assert api.calls == [("DCE", "LH"), ("DCE", "lh")]
+
+
+def test_resolve_tq_continuous_symbol_falls_back_to_local_mapping_when_query_empty():
+    class FakeApi:
+        def query_cont_quotes(self, exchange_id=None, product_id=None):
+            return []
+
+    out = resolve_tq_continuous_symbol("TA0", "czce", api=FakeApi())
+
+    assert out == "KQ.m@CZCE.TA"
 
 
 def test_symbol_to_tq_main_raises_value_error_for_unknown_exchange():
@@ -286,6 +322,7 @@ def test_fetch_daily_from_tq_standardizes_oi_from_close_oi(monkeypatch):
         def __init__(self, auth=None):
             self.auth = auth
             self.closed = False
+            self.query_calls = []
 
         def get_kline_serial(self, symbol, duration_seconds, data_length=None):
             assert symbol == "KQ.m@DCE.lh"
@@ -301,6 +338,12 @@ def test_fetch_daily_from_tq_standardizes_oi_from_close_oi(monkeypatch):
                     "close_oi": [888.0],
                 }
             )
+
+        def query_cont_quotes(self, exchange_id=None, product_id=None):
+            self.query_calls.append((exchange_id, product_id))
+            if exchange_id == "DCE" and product_id == "lh":
+                return ["DCE.lh2509"]
+            return []
 
         def close(self):
             self.closed = True
