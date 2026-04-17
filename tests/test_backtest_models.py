@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from datetime import date
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +34,13 @@ def test_backtest_case_stores_date_objects():
     assert isinstance(case.start_dt, date)
     assert isinstance(case.end_dt, date)
 
+    try:
+        case.symbol = "PS0"  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("BacktestCase should be frozen")
+
 
 def test_trade_plan_stores_contract_fields():
     plan = TradePlan(
@@ -60,6 +68,13 @@ def test_trade_plan_stores_contract_fields():
     assert plan.phase2_score == 88.5
     assert plan.signal_type == "reversal"
     assert plan.meta == {"source": "baseline"}
+
+    try:
+        plan.entry_ref = 100.0  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("TradePlan should be frozen")
 
 
 def test_trade_record_stores_exit_and_hold_fields():
@@ -93,6 +108,13 @@ def test_trade_record_stores_exit_and_hold_fields():
     assert record.pnl_ratio == 0.038
     assert record.meta == {"notes": "executed"}
 
+    try:
+        record.exit_reason = "stop"  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("TradeRecord should be frozen")
+
 
 def test_backtest_result_stores_case_trades_and_summary():
     record = TradeRecord(
@@ -118,3 +140,10 @@ def test_backtest_result_stores_case_trades_and_summary():
     assert result.case_id == "lh0_long"
     assert result.trades == [record]
     assert result.summary == {"trade_count": 1, "win_rate": 1.0}
+
+    try:
+        result.summary = {"trade_count": 2}  # type: ignore[misc]
+    except FrozenInstanceError:
+        pass
+    else:  # pragma: no cover - defensive
+        raise AssertionError("BacktestResult should be frozen")
