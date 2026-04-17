@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -65,6 +66,21 @@ def _long_plan(*, trade_id: str = "trade-long", plan_date: str = "2025-01-06") -
         tp2=109.0,
         phase2_score=30.0,
         signal_type="spring",
+    )
+
+
+def _short_plan(*, trade_id: str = "trade-short", plan_date: str = "2025-01-06") -> TradePlan:
+    return TradePlan(
+        trade_id=trade_id,
+        symbol="PS0",
+        direction="short",
+        plan_date=plan_date,
+        entry_ref=199.0,
+        stop=205.0,
+        tp1=192.0,
+        tp2=189.0,
+        phase2_score=-31.0,
+        signal_type="upthrust",
     )
 
 
@@ -160,21 +176,21 @@ def test_make_trade_plan_from_phase2_maps_actionable_raw_plan(monkeypatch):
     )
 
 
-def test_run_case_from_frames_opens_long_and_exits_on_tp2(monkeypatch):
+def test_run_case_from_frames_opens_long_and_exits_on_tp2_intrabar_touch(monkeypatch):
     minute_df = _build_minute_df(
         [
             ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
             ("2025-01-06 09:32:00", 101.0, 103.0, 100.0, 103.0),
             ("2025-01-06 09:33:00", 103.0, 108.0, 102.0, 107.0),
-            ("2025-01-06 09:34:00", 107.0, 111.0, 106.0, 110.0),
+            ("2025-01-06 09:34:00", 107.0, 111.0, 106.0, 108.5),
         ]
     )
     daily_df = _daily_df_for_backtest().iloc[:3].copy()
     plan = _long_plan()
 
     monkeypatch.setattr(
-        "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
     )
 
     result = run_case_from_frames(
@@ -195,19 +211,19 @@ def test_run_case_from_frames_opens_long_and_exits_on_tp2(monkeypatch):
     assert trade.entry_time == "2025-01-06 09:31:00"
     assert trade.entry_price == 100.0
     assert trade.exit_time == "2025-01-06 09:34:00"
-    assert trade.exit_price == 110.0
+    assert trade.exit_price == 109.0
     assert trade.exit_reason == "tp2"
     assert trade.tp1_hit is True
-    assert trade.pnl_ratio == 0.10
+    assert trade.pnl_ratio == 0.09
 
 
-def test_run_case_from_frames_opens_short_and_exits_on_tp2(monkeypatch):
+def test_run_case_from_frames_opens_short_and_exits_on_tp2_intrabar_touch(monkeypatch):
     minute_df = _build_minute_df(
         [
             ("2025-01-06 09:31:00", 200.0, 201.0, 199.0, 200.0),
             ("2025-01-06 09:32:00", 198.0, 199.0, 197.0, 194.0),
             ("2025-01-06 09:33:00", 194.0, 195.0, 193.0, 190.0),
-            ("2025-01-06 09:34:00", 190.0, 191.0, 188.0, 188.0),
+            ("2025-01-06 09:34:00", 190.0, 191.0, 188.0, 190.0),
         ]
     )
     daily_df = pd.DataFrame(
@@ -221,22 +237,11 @@ def test_run_case_from_frames_opens_short_and_exits_on_tp2(monkeypatch):
             "oi": [7000, 7001, 7002],
         }
     )
-    plan = TradePlan(
-        trade_id="trade-short",
-        symbol="PS0",
-        direction="short",
-        plan_date="2025-01-06",
-        entry_ref=199.0,
-        stop=205.0,
-        tp1=192.0,
-        tp2=189.0,
-        phase2_score=-31.0,
-        signal_type="upthrust",
-    )
+    plan = _short_plan()
 
     monkeypatch.setattr(
-        "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: [{"type": "开空"}] if len(df) >= 1 else [],
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开空"}],
     )
 
     result = run_case_from_frames(
@@ -257,16 +262,102 @@ def test_run_case_from_frames_opens_short_and_exits_on_tp2(monkeypatch):
     assert trade.entry_time == "2025-01-06 09:31:00"
     assert trade.entry_price == 200.0
     assert trade.exit_time == "2025-01-06 09:34:00"
-    assert trade.exit_price == 188.0
+    assert trade.exit_price == 189.0
     assert trade.exit_reason == "tp2"
     assert trade.tp1_hit is True
-    assert trade.pnl_ratio == 0.06
+    assert trade.pnl_ratio == 0.055
+
+
+def test_run_case_from_frames_exits_long_on_stop_intrabar_touch(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 101.0, 97.5, 99.5),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.exit_time == "2025-01-06 09:32:00"
+    assert trade.exit_price == 98.0
+    assert trade.exit_reason == "stop"
+    assert trade.pnl_ratio == -0.02
+
+
+def test_run_case_from_frames_exits_short_on_stop_intrabar_touch(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 200.0, 201.0, 199.0, 200.0),
+            ("2025-01-06 09:32:00", 200.0, 206.0, 198.0, 204.0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开空"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("short"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _short_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.exit_time == "2025-01-06 09:32:00"
+    assert trade.exit_price == 205.0
+    assert trade.exit_reason == "stop"
+    assert trade.pnl_ratio == -0.025
+
+
+def test_run_case_from_frames_prefers_stop_when_stop_and_tp2_touch_same_bar(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 110.0, 97.0, 107.0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.exit_time == "2025-01-06 09:32:00"
+    assert trade.exit_price == 98.0
+    assert trade.exit_reason == "stop"
 
 
 def test_safe_generate_signals_returns_empty_list_when_history_is_too_short(monkeypatch):
     monkeypatch.setattr(
         "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: (_ for _ in ()).throw(IndexError("single bar")),
+        lambda df, direction, cfg: (_ for _ in ()).throw(AssertionError("should not be called")),
     )
 
     signals = _safe_generate_signals(
@@ -282,6 +373,25 @@ def test_safe_generate_signals_returns_empty_list_when_history_is_too_short(monk
     assert signals == []
 
 
+def test_safe_generate_signals_propagates_index_errors_after_short_history_guard(monkeypatch):
+    monkeypatch.setattr(
+        "backtest_phase23.generate_signals",
+        lambda df, direction, cfg: (_ for _ in ()).throw(IndexError("boom")),
+    )
+
+    with pytest.raises(IndexError, match="boom"):
+        _safe_generate_signals(
+            _build_minute_df(
+                [
+                    ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+                    ("2025-01-06 09:32:00", 101.0, 102.0, 100.0, 101.0),
+                ]
+            ),
+            "long",
+            {},
+        )
+
+
 def test_safe_generate_signals_propagates_runtime_errors(monkeypatch):
     monkeypatch.setattr(
         "backtest_phase23.generate_signals",
@@ -295,12 +405,8 @@ def test_safe_generate_signals_propagates_runtime_errors(monkeypatch):
         ]
     )
 
-    try:
+    with pytest.raises(ValueError, match="boom"):
         _safe_generate_signals(minute_df, "long", {})
-    except ValueError as exc:
-        assert str(exc) == "boom"
-    else:
-        raise AssertionError("expected ValueError to propagate")
 
 
 def test_run_case_from_frames_force_closes_open_position_at_end_of_data(monkeypatch):
@@ -313,8 +419,8 @@ def test_run_case_from_frames_force_closes_open_position_at_end_of_data(monkeypa
     )
 
     monkeypatch.setattr(
-        "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
     )
 
     result = run_case_from_frames(
@@ -347,8 +453,8 @@ def test_run_case_from_frames_exits_active_trade_when_phase2_invalidates_next_da
     plan = _long_plan()
 
     monkeypatch.setattr(
-        "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
     )
 
     def plan_factory(*, daily_df, **_kwargs):
@@ -377,7 +483,7 @@ def test_run_case_from_frames_plan_factory_sees_only_prior_daily_bars(monkeypatc
     seen_daily_dates: list[tuple[date, list[date]]] = []
     expected_trade_dates = [date(2025, 1, 6), date(2025, 1, 7)]
 
-    monkeypatch.setattr("backtest_phase23.generate_signals", lambda df, direction, cfg: [])
+    monkeypatch.setattr("backtest_phase23._safe_generate_signals", lambda df, direction, cfg: [])
 
     minute_df = _build_minute_df(
         [
@@ -427,8 +533,8 @@ def test_run_case_from_frames_consumes_trade_id_after_completed_trade(monkeypatc
     plan = _long_plan(trade_id="reused-trade-id")
 
     monkeypatch.setattr(
-        "backtest_phase23.generate_signals",
-        lambda df, direction, cfg: [{"type": "开多"}] if len(df) >= 1 else [],
+        "backtest_phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
     )
 
     result = run_case_from_frames(

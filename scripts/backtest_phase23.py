@@ -65,12 +65,9 @@ def make_trade_plan_from_phase2(
 
 
 def _safe_generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
-    if df.empty:
+    if len(df) < 2:
         return []
-    try:
-        return generate_signals(df, direction, cfg)
-    except IndexError:
-        return []
+    return generate_signals(df, direction, cfg)
 
 
 def _calc_pnl_ratio(direction: str, entry_price: float, exit_price: float) -> float:
@@ -112,6 +109,26 @@ def _build_trade_record(
             "phase2_score": plan.phase2_score,
         },
     )
+
+
+def _resolve_exit_on_bar(
+    *, direction: str, bar: pd.Series, plan: TradePlan
+) -> tuple[str, float] | None:
+    high = float(bar["high"])
+    low = float(bar["low"])
+
+    if direction == "long":
+        if low <= plan.stop:
+            return "stop", plan.stop
+        if high >= plan.tp2:
+            return "tp2", plan.tp2
+        return None
+
+    if high >= plan.stop:
+        return "stop", plan.stop
+    if low <= plan.tp2:
+        return "tp2", plan.tp2
+    return None
 
 
 def run_case_from_frames(
@@ -215,21 +232,17 @@ def run_case_from_frames(
 
             if case.direction == "long":
                 tp1_hit = tp1_hit or last_price >= active_plan.tp1
-                exit_reason = None
-                if last_price <= active_plan.stop:
-                    exit_reason = "stop"
-                elif last_price >= active_plan.tp2:
-                    exit_reason = "tp2"
             else:
                 tp1_hit = tp1_hit or last_price <= active_plan.tp1
-                exit_reason = None
-                if last_price >= active_plan.stop:
-                    exit_reason = "stop"
-                elif last_price <= active_plan.tp2:
-                    exit_reason = "tp2"
+            exit = _resolve_exit_on_bar(
+                direction=case.direction,
+                bar=current_minute,
+                plan=active_plan,
+            )
 
-            if exit_reason is None:
+            if exit is None:
                 continue
+            exit_reason, exit_price = exit
 
             trades.append(
                 _build_trade_record(
@@ -238,7 +251,7 @@ def run_case_from_frames(
                     entry_time=entry_time,
                     entry_price=entry_price,
                     exit_time=current_minute["datetime"],
-                    exit_price=last_price,
+                    exit_price=exit_price,
                     exit_reason=exit_reason,
                     bars_held=bars_held,
                     tp1_hit=tp1_hit,
