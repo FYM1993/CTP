@@ -214,3 +214,12 @@ ctp/
 ```bash
 pip install -r requirements.txt
 ```
+
+## 最小回测命令
+
+基于内置 case 跑 Phase 2 / Phase 3 回测：
+
+```bash
+python scripts/run_backtest.py --case lh0_long
+python scripts/run_backtest.py --case ps0_short
+```
