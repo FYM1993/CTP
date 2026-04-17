@@ -1,12 +1,169 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import time
 
 import pandas as pd
 
 import pre_market
 from backtest_models import BacktestCase, BacktestResult, TradePlan, TradeRecord
+from data_cache import _exchange_for_symbol
 from intraday import generate_signals
+from market_data_tq import (
+    klines_to_daily_frame,
+    resolve_tq_continuous_symbol,
+    symbol_to_tq_main,
+)
+
+
+def _create_backtest_api(*, start_dt, end_dt, account: str, password: str):
+    from tqsdk import TqApi, TqAuth, TqBacktest, TqSim
+
+    return TqApi(
+        TqSim(),
+        backtest=TqBacktest(start_dt=start_dt, end_dt=end_dt),
+        auth=TqAuth(account, password),
+    )
+
+
+def resolve_case_tq_symbol(case: BacktestCase, api=None) -> str:
+    symbol = case.symbol.strip()
+    exchange = _exchange_for_symbol(symbol)
+    if not exchange:
+        raise ValueError(f"未知品种代码（未在内置列表）: {symbol}")
+
+    try:
+        resolved = resolve_tq_continuous_symbol(
+            symbol,
+            exchange,
+            api=api,
+            wait_timeout=2.0,
+        )
+        if resolved:
+            return resolved
+    except Exception:
+        pass
+    return symbol_to_tq_main(symbol, exchange)
+
+
+def _empty_daily_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "oi"])
+
+
+def _empty_minute_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+
+def _klines_to_minute_frame(klines: pd.DataFrame | None) -> pd.DataFrame:
+    if klines is None or len(klines) < 1:
+        return _empty_minute_frame()
+
+    df = klines.copy()
+    required = ("datetime", "open", "high", "low", "close", "volume")
+    for column in required:
+        if column not in df.columns:
+            return _empty_minute_frame()
+
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    if getattr(df["datetime"].dt, "tz", None) is not None:
+        df["datetime"] = df["datetime"].dt.tz_localize(None)
+    for column in ("open", "high", "low", "close", "volume"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    out = df[list(required)].dropna(subset=["close"])
+    if out.empty:
+        return _empty_minute_frame()
+    return out.sort_values("datetime", kind="stable").reset_index(drop=True)
+
+
+def _wait_for_serial_frame(
+    *,
+    api,
+    klines,
+    converter: Callable[[pd.DataFrame | None], pd.DataFrame],
+    wait_timeout: float = 8.0,
+) -> pd.DataFrame:
+    frame = converter(klines)
+    if not frame.empty:
+        return frame
+
+    wait_update = getattr(api, "wait_update", None)
+    if not callable(wait_update):
+        return frame
+
+    deadline = time.time() + max(wait_timeout, 0.0)
+    while time.time() < deadline:
+        updated = wait_update(deadline=deadline)
+        frame = converter(klines)
+        if not frame.empty:
+            return frame
+        if not updated:
+            break
+    return frame
+
+
+def _filter_daily_range(frame: pd.DataFrame, case: BacktestCase) -> pd.DataFrame:
+    if frame.empty:
+        return _empty_daily_frame()
+    out = frame.copy()
+    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+    out = out.loc[out["date"].dt.date.between(case.start_dt, case.end_dt)].copy()
+    return out.reset_index(drop=True)
+
+
+def _filter_minute_range(frame: pd.DataFrame, case: BacktestCase) -> pd.DataFrame:
+    if frame.empty:
+        return _empty_minute_frame()
+    out = frame.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"])
+    out = out.loc[out["datetime"].dt.date.between(case.start_dt, case.end_dt)].copy()
+    return out.reset_index(drop=True)
+
+
+def load_case_frames_with_tqbacktest(
+    *,
+    case: BacktestCase,
+    config: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    tq_cfg = config.get("tqsdk") or {}
+    account = str(tq_cfg.get("account") or "").strip()
+    password = str(tq_cfg.get("password") or "").strip()
+    if not account or not password:
+        raise ValueError("缺少 tqsdk 账号或密码配置")
+
+    api = None
+    try:
+        api = _create_backtest_api(
+            start_dt=case.start_dt,
+            end_dt=case.end_dt,
+            account=account,
+            password=password,
+        )
+        tq_symbol = resolve_case_tq_symbol(case, api=api)
+        day_count = max((case.end_dt - case.start_dt).days + 1, 1)
+        daily_length = max(day_count + 5, 30)
+        minute_length = max(day_count * 24 * 60, 24 * 60)
+
+        daily_klines = api.get_kline_serial(tq_symbol, 86400, data_length=daily_length)
+        minute_klines = api.get_kline_serial(tq_symbol, 60, data_length=minute_length)
+
+        daily_df = _wait_for_serial_frame(
+            api=api,
+            klines=daily_klines,
+            converter=klines_to_daily_frame,
+        )
+        minute_df = _wait_for_serial_frame(
+            api=api,
+            klines=minute_klines,
+            converter=_klines_to_minute_frame,
+        )
+        return _filter_daily_range(daily_df, case), _filter_minute_range(minute_df, case)
+    finally:
+        try:
+            if api is not None:
+                api.close()
+        except Exception:
+            pass
 
 
 def aggregate_partial_5m_bars(minute_df: pd.DataFrame) -> pd.DataFrame:

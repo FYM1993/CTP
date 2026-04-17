@@ -14,9 +14,12 @@ if str(SCRIPTS) not in sys.path:
 
 from backtest_models import BacktestCase, TradePlan  # noqa: E402
 from backtest_phase23 import (  # noqa: E402
+    _create_backtest_api,
     _safe_generate_signals,
     aggregate_partial_5m_bars,
+    load_case_frames_with_tqbacktest,
     make_trade_plan_from_phase2,
+    resolve_case_tq_symbol,
     run_case_from_frames,
 )
 
@@ -548,3 +551,160 @@ def test_run_case_from_frames_consumes_trade_id_after_completed_trade(monkeypatc
 
     assert result.summary == {"num_trades": 1}
     assert [trade.trade_id for trade in result.trades] == ["reused-trade-id"]
+
+
+def test_create_backtest_api_builds_tqsdk_backtest_session(monkeypatch):
+    created: dict[str, object] = {}
+
+    class FakeTqSim:
+        pass
+
+    class FakeTqBacktest:
+        def __init__(self, start_dt, end_dt):
+            self.start_dt = start_dt
+            self.end_dt = end_dt
+
+    class FakeTqAuth:
+        def __init__(self, account, password):
+            self.account = account
+            self.password = password
+
+    class FakeTqApi:
+        def __init__(self, sim, backtest=None, auth=None):
+            created["sim"] = sim
+            created["backtest"] = backtest
+            created["auth"] = auth
+
+    fake_tqsdk = type(sys)("tqsdk")
+    fake_tqsdk.TqApi = FakeTqApi
+    fake_tqsdk.TqAuth = FakeTqAuth
+    fake_tqsdk.TqBacktest = FakeTqBacktest
+    fake_tqsdk.TqSim = FakeTqSim
+    monkeypatch.setitem(sys.modules, "tqsdk", fake_tqsdk)
+
+    api = _create_backtest_api(
+        start_dt=date(2025, 1, 1),
+        end_dt=date(2025, 1, 31),
+        account="acct",
+        password="pwd",
+    )
+
+    assert isinstance(api, FakeTqApi)
+    assert isinstance(created["sim"], FakeTqSim)
+    assert created["backtest"].start_dt == date(2025, 1, 1)
+    assert created["backtest"].end_dt == date(2025, 1, 31)
+    assert created["auth"].account == "acct"
+    assert created["auth"].password == "pwd"
+
+
+def test_resolve_case_tq_symbol_prefers_dynamic_resolution(monkeypatch):
+    seen: dict[str, object] = {}
+    fake_api = object()
+
+    def fake_resolve(symbol, exchange, api=None, wait_timeout=None):
+        seen["symbol"] = symbol
+        seen["exchange"] = exchange
+        seen["api"] = api
+        seen["wait_timeout"] = wait_timeout
+        return "KQ.m@DCE.lh"
+
+    monkeypatch.setattr("backtest_phase23._exchange_for_symbol", lambda symbol: "dce")
+    monkeypatch.setattr("backtest_phase23.resolve_tq_continuous_symbol", fake_resolve)
+    monkeypatch.setattr(
+        "backtest_phase23.symbol_to_tq_main",
+        lambda symbol, exchange: pytest.fail("unexpected fallback"),
+    )
+
+    out = resolve_case_tq_symbol(_make_case("long"), api=fake_api)
+
+    assert out == "KQ.m@DCE.lh"
+    assert seen == {
+        "symbol": "LH0",
+        "exchange": "dce",
+        "api": fake_api,
+        "wait_timeout": 2.0,
+    }
+
+
+def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeypatch):
+    case = _make_case("long")
+    created: dict[str, object] = {}
+
+    daily_serial = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2025-01-03", "2025-01-04"]),
+            "open": [100.0, 101.0],
+            "high": [110.0, 111.0],
+            "low": [95.0, 96.0],
+            "close": [105.0, 106.0],
+            "volume": [1000.0, 1001.0],
+            "close_oi": [800.0, 801.0],
+        }
+    )
+    minute_serial = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2025-01-06 09:31:00", "2025-01-06 09:32:00"]),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [10.0, 12.0],
+        }
+    )
+
+    class FakeApi:
+        def __init__(self):
+            self.calls: list[tuple[str, int, int | None]] = []
+            self.closed = False
+
+        def get_kline_serial(self, symbol, duration_seconds, data_length=None):
+            self.calls.append((symbol, duration_seconds, data_length))
+            if duration_seconds == 86400:
+                return daily_serial
+            if duration_seconds == 60:
+                return minute_serial
+            raise AssertionError(f"unexpected duration: {duration_seconds}")
+
+        def wait_update(self, deadline=None):
+            return False
+
+        def close(self):
+            self.closed = True
+
+    def fake_create_backtest_api(*, start_dt, end_dt, account, password):
+        created["start_dt"] = start_dt
+        created["end_dt"] = end_dt
+        created["account"] = account
+        created["password"] = password
+        api = FakeApi()
+        created["api"] = api
+        return api
+
+    monkeypatch.setattr("backtest_phase23._create_backtest_api", fake_create_backtest_api)
+    monkeypatch.setattr(
+        "backtest_phase23.resolve_case_tq_symbol",
+        lambda case, api=None: "KQ.m@DCE.lh",
+    )
+
+    daily_df, minute_df = load_case_frames_with_tqbacktest(
+        case=case,
+        config={"tqsdk": {"account": "acct", "password": "pwd"}},
+    )
+
+    assert created["start_dt"] == case.start_dt
+    assert created["end_dt"] == case.end_dt
+    assert created["account"] == "acct"
+    assert created["password"] == "pwd"
+    assert created["api"].calls == [
+        ("KQ.m@DCE.lh", 86400, 36),
+        ("KQ.m@DCE.lh", 60, 31 * 24 * 60),
+    ]
+    assert created["api"].calls[0][2] >= 31
+    assert created["api"].calls[1][2] >= 31 * 24 * 60
+    assert list(daily_df.columns) == ["date", "open", "high", "low", "close", "volume", "oi"]
+    assert len(daily_df) == 2
+    assert float(daily_df.iloc[0]["oi"]) == 800.0
+    assert list(minute_df.columns) == ["datetime", "open", "high", "low", "close", "volume"]
+    assert len(minute_df) == 2
+    assert float(minute_df.iloc[1]["close"]) == 101.5
+    assert created["api"].closed is True
