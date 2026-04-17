@@ -106,6 +106,10 @@ def _fetch_daily_from_tq_with_api(symbol: str, days: int, api, config: dict | No
         return None
 
 
+def _has_configured_tq_daily_source(symbol: str, config: dict | None = None) -> bool:
+    return _exchange_for_symbol(symbol) is not None and _tq_credentials(config) is not None
+
+
 def fetch_daily_from_tq(symbol: str, days: int) -> pd.DataFrame | None:
     exchange = _exchange_for_symbol(symbol)
     if not exchange:
@@ -257,7 +261,11 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
             except Exception:
                 live_path.unlink(missing_ok=True)
 
-    df = fetch_daily_from_tq(symbol, days)
+    tq_configured = _has_configured_tq_daily_source(symbol)
+    df = fetch_daily_from_tq(symbol, days) if tq_configured else None
+    if tq_configured and (df is None or len(df) == 0):
+        _log.warning("%s TqSdk无数据，跳过AkShare回退", symbol)
+        return None
     if df is None or len(df) == 0:
         df = _fetch_daily_from_api(symbol, days)
     if df is not None and len(df) > 0:
@@ -851,13 +859,19 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
                 cache_hits += 1
                 continue
 
+            tq_attempted = False
             if tq_api is not None:
                 df = _fetch_daily_from_tq_with_api(sym, days=400, api=tq_api, config=config)
+                tq_attempted = True
             elif tq_available:
                 df = fetch_daily_from_tq(sym, days=400)
+                tq_attempted = True
             else:
                 df = None
             if df is None or len(df) == 0:
+                if tq_attempted:
+                    _log.warning("%s TqSdk无数据，跳过AkShare回退", sym)
+                    continue
                 _log.warning("%s TqSdk无数据，回退AkShare日线接口", sym)
                 df = _fetch_daily_from_api(sym, days=400)
                 api_calls += 1

@@ -98,6 +98,26 @@ def test_get_daily_uses_tq_daily_standardized_columns(monkeypatch, tmp_path):
     assert float(out.iloc[0]["close"]) == 105.0
 
 
+def test_get_daily_skips_akshare_fallback_when_tq_is_configured_but_empty(monkeypatch, tmp_path):
+    warnings = []
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "_tq_credentials", lambda config=None: ("acct", "pwd"))
+    monkeypatch.setattr(data_cache, "fetch_daily_from_tq", lambda symbol, days: None)
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("configured Tq path should not fallback")),
+    )
+    monkeypatch.setattr(data_cache._log, "warning", lambda msg, *args: warnings.append(msg % args))
+
+    out = data_cache.get_daily("PK0", 30)
+
+    assert out is None
+    assert any("PK0" in message and "TqSdk无数据，跳过AkShare回退" in message for message in warnings)
+
+
 def test_choose_cache_suffix_keeps_same_day_data_live_before_close(monkeypatch):
     class FakeDatetime:
         @classmethod
@@ -450,6 +470,36 @@ def test_prefetch_all_skips_per_symbol_tq_retry_after_session_init_failure(monke
     assert fallback_calls == [("LH0", 400), ("M0", 400)]
 
 
+def test_prefetch_all_skips_akshare_fallback_when_tq_session_is_available_but_symbol_empty(
+    monkeypatch,
+    tmp_path,
+):
+    warnings = []
+
+    class FakeApi:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(data_cache, "_create_tq_api", lambda account, password: FakeApi(), raising=False)
+    monkeypatch.setattr(data_cache, "_fetch_daily_from_tq_with_api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("per-symbol empty Tq should not fallback")),
+    )
+    monkeypatch.setattr(data_cache._log, "warning", lambda msg, *args: warnings.append(msg % args))
+
+    out = data_cache.prefetch_all(
+        symbols=[{"symbol": "PK0", "name": "花生", "exchange": "czce"}]
+    )
+
+    assert out == {}
+    assert any("PK0" in message and "TqSdk无数据，跳过AkShare回退" in message for message in warnings)
+
+
 def test_fetch_daily_from_api_logs_retry_and_uses_socket_timeout(monkeypatch):
     warnings = []
     timeout_values = []
@@ -480,14 +530,18 @@ def test_fetch_daily_from_api_logs_retry_and_uses_socket_timeout(monkeypatch):
     assert "AkShare日线获取失败" in warnings[0]
 
 
-def test_prefetch_all_logs_when_tq_falls_back_to_akshare(monkeypatch, tmp_path):
+def test_prefetch_all_logs_when_global_tq_is_unavailable_and_falls_back_to_akshare(monkeypatch, tmp_path):
     warnings = []
 
     monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(data_cache, "_cache_cleaned", False)
     monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
-    monkeypatch.setattr(data_cache, "_create_tq_api", lambda account, password: object(), raising=False)
-    monkeypatch.setattr(data_cache, "_fetch_daily_from_tq_with_api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        data_cache,
+        "_create_tq_api",
+        lambda account, password: (_ for _ in ()).throw(RuntimeError("boom")),
+        raising=False,
+    )
     monkeypatch.setattr(
         data_cache,
         "_fetch_daily_from_api",
@@ -510,4 +564,4 @@ def test_prefetch_all_logs_when_tq_falls_back_to_akshare(monkeypatch, tmp_path):
     )
 
     assert set(out) == {"PK0"}
-    assert any("PK0" in message and "TqSdk无数据，回退AkShare" in message for message in warnings)
+    assert any("TqSdk 初始化失败" in message for message in warnings)
