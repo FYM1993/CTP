@@ -12,7 +12,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import pre_market  # noqa: E402
+from phase2 import pre_market  # noqa: E402
 
 
 def _build_daily_frame(rows: int = 130) -> pd.DataFrame:
@@ -175,6 +175,172 @@ def test_build_trade_plan_from_daily_df_returns_watch_plan_without_signal(monkey
     assert plan["tp2"] == 0.0
     assert plan["rr"] == 0.0
     assert plan["reversal_status"]["has_signal"] is False
+
+
+def test_build_trade_plan_from_daily_df_returns_trend_long_plan_without_reversal_signal(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": False,
+            "signal_type": "",
+            "signal_date": "",
+            "signal_bar": {"low": 0.0, "high": 0.0},
+            "signal_detail": "",
+            "current_stage": "上涨中",
+            "next_expected": "等待回踩",
+            "confidence": 0.0,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        pre_market,
+        "score_signals",
+        lambda *args, **kwargs: {
+            "均线排列": 12.0,
+            "MACD": 6.0,
+            "RSI": 4.0,
+            "布林带": 3.0,
+            "动量": 5.0,
+            "价格位置": 0.0,
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([100.0], [116.0, 120.0]))
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+    monkeypatch.setattr(
+        pre_market,
+        "calc_ma",
+        lambda series, window: pd.Series(
+            [100.0 + window * 0.2 + i * (0.15 if window == 20 else 0.08) for i in range(len(series))],
+            index=series.index,
+        ),
+    )
+
+    plan = pre_market.build_trade_plan_from_daily_df(
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        df=df,
+        cfg={},
+    )
+
+    assert plan is not None
+    assert plan.get("actionable") is True
+    assert plan["reversal_status"]["has_signal"] is False
+    assert plan.get("entry_family") == "trend"
+    assert plan.get("entry_signal_type") == "Pullback"
+
+
+def test_build_trade_plan_from_daily_df_returns_trend_short_plan_without_reversal_signal(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": False,
+            "signal_type": "",
+            "signal_date": "",
+            "signal_bar": {"low": 0.0, "high": 0.0},
+            "signal_detail": "",
+            "current_stage": "下跌中",
+            "next_expected": "等待反弹受阻",
+            "confidence": 0.0,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        pre_market,
+        "score_signals",
+        lambda *args, **kwargs: {
+            "均线排列": -12.0,
+            "MACD": -6.0,
+            "RSI": -4.0,
+            "布林带": -3.0,
+            "动量": -5.0,
+            "价格位置": 0.0,
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([104.0, 108.0], [118.0]))
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markdown"})())
+    monkeypatch.setattr(
+        pre_market,
+        "calc_ma",
+        lambda series, window: pd.Series(
+            [130.0 - window * 0.2 - i * (0.15 if window == 20 else 0.08) for i in range(len(series))],
+            index=series.index,
+        ),
+    )
+
+    plan = pre_market.build_trade_plan_from_daily_df(
+        symbol="LH0",
+        name="生猪",
+        direction="short",
+        df=df,
+        cfg={},
+    )
+
+    assert plan is not None
+    assert plan.get("actionable") is True
+    assert plan["reversal_status"]["has_signal"] is False
+    assert plan.get("entry_family") == "trend"
+    assert plan.get("entry_signal_type") == "TrendBreak"
+
+
+def test_build_trade_plan_from_daily_df_prefers_higher_rr_candidate(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": True,
+            "signal_type": "SOS",
+            "signal_date": "2025-05-10",
+            "signal_bar": {"low": 110.0, "high": 114.0},
+            "signal_detail": "reversal signal",
+            "current_stage": "反转确认",
+            "next_expected": "继续观察",
+            "confidence": 0.8,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        pre_market,
+        "score_signals",
+        lambda *args, **kwargs: {
+            "均线排列": 12.0,
+            "MACD": 5.0,
+            "RSI": 4.0,
+            "布林带": 3.0,
+            "动量": 4.0,
+            "价格位置": 2.0,
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "calc_ma", lambda series, window: pd.Series([100.0 + i * 0.2 for i in range(len(series))], index=series.index))
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([100.0], [116.0, 120.0]))
+
+    plan = pre_market.build_trade_plan_from_daily_df(
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        df=df,
+        cfg={},
+    )
+
+    assert plan is not None
+    assert plan.get("entry_family") == "trend"
+    assert plan.get("entry_signal_type") == "Pullback"
+    assert plan.get("rr", 0.0) >= 1.0
 
 
 def test_build_trade_plan_from_daily_df_returns_none_for_empty_df() -> None:
