@@ -16,7 +16,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import daily_workflow  # noqa: E402
+from cli import daily_workflow  # noqa: E402
 
 
 def test_build_phase1_summary_returns_cn_metadata() -> None:
@@ -194,7 +194,6 @@ def test_save_targets_does_not_emit_obsolete_phase1_direction_risk_flags(
                 "has_signal": True,
                 "signal_type": "Spring",
                 "signal_date": "2026-04-15",
-                "entry_mode": "reversal",
                 "signal_strength": 0.7,
                 "current_stage": "accumulation",
                 "confidence": 0.8,
@@ -208,6 +207,124 @@ def test_save_targets_does_not_emit_obsolete_phase1_direction_risk_flags(
 
     md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
     assert "⚠️P1P2异号/逆势" not in md_text
+
+
+def test_save_targets_renders_trend_plan_from_entry_family(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    targets = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 31.0,
+            "price": 100.0,
+            "entry": 101.0,
+            "stop": 97.0,
+            "tp1": 109.0,
+            "tp2": 113.0,
+            "rr": 2.0,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 1,
+            "fund_screen_score": 66.0,
+            "attention_score": 72.0,
+            "signal_strength": 0.7,
+            "labels": ["趋势候选"],
+            "phase1_labels": ["趋势候选"],
+            "phase1_reason_summary": "库存下降",
+            "reason_summary": "库存下降",
+            "entry_pool_reason": "趋势机会分达标",
+            "actionable": True,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "markup 阶段顺势回踩",
+            "reversal_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_date": "",
+                "signal_strength": 0.0,
+                "current_stage": "markup",
+                "confidence": 0.0,
+                "signal_detail": "",
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(targets, [], phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "**入场信号**: [顺势] 顺势回撤(Pullback)" in md_text
+    assert "- 信号详情: markup 阶段顺势回踩" in md_text
+    assert "尚无有效入场信号" not in md_text
+
+
+def test_load_targets_normalizes_legacy_trend_snapshot(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    payload = {
+        "date": "2026-04-16",
+        "targets": [
+            {
+                "symbol": "LH0",
+                "name": "生猪",
+                "direction": "long",
+                "score": 28.0,
+                "actionable": True,
+                "price": 100.0,
+                "entry": 101.0,
+                "stop": 97.0,
+                "tp1": 109.0,
+                "tp2": 113.0,
+                "rr": 2.0,
+                "reversal_status": {
+                    "has_signal": False,
+                    "entry_mode": "trend",
+                    "signal_type": "Pullback",
+                    "signal_detail": "legacy trend snapshot",
+                    "signal_date": "",
+                    "current_stage": "markup",
+                    "confidence": 0.0,
+                },
+            }
+        ],
+        "watchlist": [],
+        "phase1_summary": {},
+    }
+    (tmp_path / "2026-04-16_targets.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    snapshot = daily_workflow.load_targets()
+
+    assert snapshot is not None
+    targets, watchlist = snapshot
+    assert watchlist == []
+    assert len(targets) == 1
+    row = targets[0]
+    assert row["entry_family"] == "trend"
+    assert row["entry_signal_type"] == "Pullback"
+    assert row["entry_signal_detail"] == "legacy trend snapshot"
+    assert daily_workflow._resolve_entry_signal(row)["has_signal"] is True
 
 
 if __name__ == "__main__":
