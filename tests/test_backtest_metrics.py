@@ -10,8 +10,8 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from backtest_metrics import summarize_trades  # noqa: E402
-from backtest_models import TradeRecord  # noqa: E402
+from backtest.metrics import summarize_trades  # noqa: E402
+from backtest.models import TradeRecord  # noqa: E402
 
 
 def test_summarize_trades_counts_wins_losses_and_exit_reasons():
@@ -78,12 +78,47 @@ def test_summarize_trades_counts_wins_losses_and_exit_reasons():
 
     assert summary["num_trades"] == 4
     assert summary["wins"] == 2
+    assert summary["losses"] == 2
     assert summary["win_rate"] == 0.5
     assert summary["avg_pnl"] == pytest.approx(0.02)
     assert summary["total_pnl"] == pytest.approx(0.08)
+    assert summary["avg_win_pnl"] == pytest.approx(0.06)
+    assert summary["avg_loss_pnl"] == pytest.approx(-0.02)
+    assert summary["max_win_pnl"] == pytest.approx(0.10)
+    assert summary["max_loss_pnl"] == pytest.approx(-0.03)
     assert summary["tp1_hits"] == 2
     assert summary["tp2_hits"] == 1
     assert summary["stop_hits"] == 2
+    assert summary["loss_stop_hits"] == 2
+    assert summary["protective_stop_hits"] == 0
+
+
+def test_summarize_trades_splits_loss_stops_from_protective_stops():
+    trades = [
+        TradeRecord(
+            trade_id="t1",
+            symbol="PS0",
+            direction="long",
+            entry_time="2025-01-01 10:00:00",
+            entry_price=100.0,
+            exit_time="2025-01-02 10:00:00",
+            exit_price=104.0,
+            exit_reason="stop",
+            bars_held=10,
+            days_held=1,
+            tp1_hit=True,
+            pnl_ratio=0.04,
+        )
+    ]
+
+    summary = summarize_trades(trades)
+
+    assert summary["num_trades"] == 1
+    assert summary["wins"] == 1
+    assert summary["losses"] == 0
+    assert summary["stop_hits"] == 1
+    assert summary["loss_stop_hits"] == 0
+    assert summary["protective_stop_hits"] == 1
 
 
 def test_summarize_trades_returns_zeroes_for_empty_input():
@@ -92,10 +127,17 @@ def test_summarize_trades_returns_zeroes_for_empty_input():
     assert summary == {
         "num_trades": 0,
         "wins": 0,
+        "losses": 0,
         "win_rate": 0.0,
         "avg_pnl": 0.0,
         "total_pnl": 0.0,
+        "avg_win_pnl": 0.0,
+        "avg_loss_pnl": 0.0,
+        "max_win_pnl": 0.0,
+        "max_loss_pnl": 0.0,
         "tp1_hits": 0,
         "tp2_hits": 0,
         "stop_hits": 0,
+        "loss_stop_hits": 0,
+        "protective_stop_hits": 0,
     }

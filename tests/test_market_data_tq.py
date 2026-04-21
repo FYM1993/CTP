@@ -12,7 +12,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from market_data_tq import (  # noqa: E402
+from market.tq import (  # noqa: E402
     klines_to_daily_frame,
     resolve_tq_continuous_symbol,
     resolve_tq_continuous_symbol_info,
@@ -20,7 +20,7 @@ from market_data_tq import (  # noqa: E402
     tq_underlying_to_continuous,
 )
 import data_cache  # noqa: E402
-import market_data_tq  # noqa: E402
+from market import tq as market_data_tq  # noqa: E402
 
 
 def test_symbol_to_tq_main_uses_exchange_table():
@@ -294,6 +294,51 @@ def test_get_daily_keeps_live_cache_during_night_session(monkeypatch, tmp_path):
     out = data_cache.get_daily("LH0", 30)
 
     assert float(out.iloc[0]["close"]) == 92.0
+
+
+def test_get_daily_refreshes_cache_when_requested_history_exceeds_cached_rows(monkeypatch, tmp_path):
+    today = pd.Timestamp("2026-04-15")
+    final_path = tmp_path / f"daily_LH0_{today.strftime('%Y%m%d')}_final.parquet"
+    cached_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-04-14", "2026-04-15"]),
+            "open": [90.0, 91.0],
+            "high": [95.0, 96.0],
+            "low": [85.0, 86.0],
+            "close": [92.0, 93.0],
+            "volume": [100.0, 101.0],
+            "oi": [50.0, 51.0],
+        }
+    )
+    cached_frame.to_parquet(final_path, index=False)
+
+    fresh_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-04-11", "2026-04-12", "2026-04-13", "2026-04-14", "2026-04-15"]),
+            "open": [80.0, 81.0, 82.0, 83.0, 84.0],
+            "high": [85.0, 86.0, 87.0, 88.0, 89.0],
+            "low": [75.0, 76.0, 77.0, 78.0, 79.0],
+            "close": [82.0, 83.0, 84.0, 85.0, 86.0],
+            "volume": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "oi": [50.0, 51.0, 52.0, 53.0, 54.0],
+        }
+    )
+
+    class FakeDatetime:
+        @classmethod
+        def now(cls):
+            return today.to_pydatetime()
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "datetime", FakeDatetime)
+    monkeypatch.setattr(data_cache, "_tq_credentials", lambda config=None: ("acct", "pwd"))
+    monkeypatch.setattr(data_cache, "fetch_daily_from_tq", lambda symbol, days: fresh_frame.copy())
+
+    out = data_cache.get_daily("LH0", 5)
+
+    assert len(out) == 5
+    assert float(out.iloc[0]["close"]) == 82.0
 
 
 def test_get_daily_ignores_live_cache_on_weekend(monkeypatch, tmp_path):
@@ -690,3 +735,130 @@ def test_prefetch_all_logs_when_global_tq_is_unavailable_and_falls_back_to_aksha
 
     assert set(out) == {"PK0"}
     assert any("TqSdk 初始化失败" in message for message in warnings)
+
+
+def test_get_hog_fundamentals_includes_spot_price_percentile(monkeypatch):
+    monkeypatch.setattr(data_cache, "_hog_cache", None)
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_core",
+        lambda symbol="外三元": pd.DataFrame({"date": ["2026-04-16", "2026-04-17", "2026-04-18", "2026-04-19"], "value": [20.0, 15.0, 10.0, 12.0]}),
+    )
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_cost",
+        lambda symbol="玉米": pd.DataFrame({"date": ["2026-04-19"], "value": [2400.0]}),
+    )
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_supply",
+        lambda symbol="猪肉批发价": pd.DataFrame({"date": ["2026-04-19"], "value": [100.0]}),
+    )
+
+    out = data_cache.get_hog_fundamentals()
+
+    assert out is not None
+    assert out["price"] == 12.0
+    assert round(out["spot_price_percentile"], 2) == 20.0
+
+
+def test_get_inventory_historical_replay_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_inventory_em",
+        lambda symbol="a": (_ for _ in ()).throw(AssertionError("历史库存回放不应请求东方财富")),
+    )
+
+    out = data_cache.get_inventory("A0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out is None
+
+
+def test_get_inventory_live_uses_eastmoney_source(monkeypatch):
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_inventory_em",
+        lambda symbol="a": pd.DataFrame(
+            {
+                "日期": [f"2026-04-{day:02d}" for day in range(10, 20)],
+                "库存": [70.0, 72.0, 75.0, 78.0, 80.0, 85.0, 90.0, 100.0, 130.0, 120.0],
+                "增减": [0.0, 2.0, 3.0, 3.0, 2.0, 5.0, 5.0, 10.0, 30.0, -10.0],
+            }
+        ),
+    )
+
+    out = data_cache.get_inventory("A0")
+
+    assert out is not None
+    assert out["inv_now"] == 120.0
+    assert round(out["inv_change_4wk"], 2) == 41.18
+    assert out["inv_cumulating_weeks"] == 7
+    assert out["inv_trend"] == "累库"
+
+
+def test_get_warehouse_receipt_uses_as_of_date_snapshot(monkeypatch):
+    monkeypatch.setattr(data_cache, "_shfe_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_gfex_receipt_cache", {})
+    seen: list[str] = []
+
+    def fake_shfe(date="20200702"):
+        seen.append(date)
+        return {
+            "天然橡胶": pd.DataFrame(
+                {
+                    "WRTWGHTS": [20.0, 30.0],
+                    "WRTCHANGE": [2.0, -1.0],
+                }
+            )
+        }
+
+    monkeypatch.setattr(data_cache.aks, "futures_shfe_warehouse_receipt", fake_shfe)
+
+    out = data_cache.get_warehouse_receipt("RU0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out == {"receipt_total": 50.0, "receipt_change": 1.0, "exchange": "SHFE"}
+    assert seen == ["20250401"]
+
+
+def test_get_hog_fundamentals_respects_as_of_date(monkeypatch):
+    monkeypatch.setattr(data_cache, "_hog_cache", None)
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_core",
+        lambda symbol="外三元": pd.DataFrame(
+            {
+                "date": ["2025-04-01", "2025-04-02", "2025-04-03", "2025-04-04"],
+                "value": [16.0, 14.0, 10.0, 12.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_cost",
+        lambda symbol="玉米": pd.DataFrame(
+            {
+                "date": ["2025-04-01", "2025-04-03", "2025-04-04"],
+                "value": [2600.0, 2500.0, 2400.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_hog_supply",
+        lambda symbol="猪肉批发价": pd.DataFrame(
+            {
+                "date": ["2025-04-01", "2025-04-03", "2025-04-04"],
+                "value": [90.0, 95.0, 100.0],
+            }
+        ),
+    )
+
+    out = data_cache.get_hog_fundamentals(as_of_date=pd.Timestamp("2025-04-03").date())
+
+    assert out is not None
+    assert out["price"] == 10.0
+    assert out["price_5d_ago"] == 16.0
+    assert round(out["price_trend"], 2) == -37.5
+    assert round(out["spot_price_percentile"], 2) == 0.0
+    assert out["cost"] == 2500.0
+    assert out["supply"] == 95.0

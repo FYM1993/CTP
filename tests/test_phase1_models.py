@@ -8,7 +8,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from phase1_models import (  # noqa: E402
+from phase1.models import (  # noqa: E402
     Phase1Candidate,
     Phase1Label,
     Phase1StateLabel,

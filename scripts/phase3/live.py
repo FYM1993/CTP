@@ -17,7 +17,7 @@ import time
 import pandas as pd
 
 from data_cache import BUILTIN_SYMBOLS
-from market_data_tq import resolve_tq_continuous_symbol_info
+from market.tq import resolve_tq_continuous_symbol_info
 
 
 def exchange_for_symbol(symbol: str) -> str | None:

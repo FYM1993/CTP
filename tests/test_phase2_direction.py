@@ -8,7 +8,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from phase2_direction import choose_phase2_direction  # noqa: E402
+from phase2.direction import choose_phase2_direction  # noqa: E402
 
 
 def test_choose_phase2_direction_prefers_long_when_long_side_clearly_stronger() -> None:

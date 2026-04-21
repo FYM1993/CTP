@@ -8,8 +8,8 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import fundamental_edb_map as edb_map  # noqa: E402
-from fundamental_data import get_inventory_fundamental  # noqa: E402
+from market import fundamental_edb_map as edb_map  # noqa: E402
+from market.fundamental_data import get_inventory_fundamental  # noqa: E402
 
 
 def test_inventory_falls_back_to_akshare_when_edb_unmapped_or_empty():

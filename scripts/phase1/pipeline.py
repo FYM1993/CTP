@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -7,10 +9,11 @@ import pandas as pd
 from data_cache import (
     get_hog_fundamentals,
     get_inventory,
+    get_oi_structure,
     get_seasonality,
     get_warehouse_receipt,
 )
-from phase1_scoring import build_labels, build_state_labels, calc_attention_raw
+from phase1.scoring import build_labels, build_state_labels, calc_attention_raw
 
 
 def _clip_score(value: float) -> float:
@@ -23,6 +26,23 @@ def _safe_percentile(last: float, low: float, high: float) -> float:
 
 def _attention_threshold(raw_threshold: float) -> float:
     return _clip_score(55.0 + raw_threshold)
+
+
+def _supports_as_of_date(func: Any) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "as_of_date" in signature.parameters
+
+
+def _call_factor(func: Any, *args: Any, as_of_date: date | None = None) -> Any:
+    if as_of_date is not None and _supports_as_of_date(func):
+        return func(*args, as_of_date=as_of_date)
+    return func(*args)
 
 
 def _symbol_thresholds(
@@ -44,6 +64,20 @@ def _symbol_thresholds(
         for symbol in cat_cfg.get("symbols") or []:
             resolved[str(symbol)] = cat_threshold
     return resolved
+
+
+def _entry_pool_reason(row: dict[str, Any]) -> str:
+    reversal_score = float(row.get("reversal_score") or 0.0)
+    trend_score = float(row.get("trend_score") or 0.0)
+    dominant_family = "反转机会分" if reversal_score >= trend_score else "趋势机会分"
+    dominant_score = max(reversal_score, trend_score)
+    entry_threshold = float(row.get("entry_threshold") or 0.0)
+    if dominant_score >= entry_threshold:
+        return f"{dominant_family}达标（反转{reversal_score:.0f} / 趋势{trend_score:.0f}）"
+    return (
+        f"{dominant_family}未达标（反转{reversal_score:.0f} / 趋势{trend_score:.0f}；"
+        f"门槛{entry_threshold:.0f}）"
+    )
 
 
 def _price_stats(df: pd.DataFrame) -> dict[str, float]:
@@ -79,6 +113,34 @@ def _price_stats(df: pd.DataFrame) -> dict[str, float]:
         "low_persistence_days": low_days,
         "high_persistence_days": high_days,
     }
+
+
+def _soft_low_price_score(percentile: float) -> float:
+    extreme_low = max(0.0, 25.0 - percentile) * 3.2
+    broad_low = max(0.0, 45.0 - percentile) * 1.6
+    return _clip_score(extreme_low + broad_low)
+
+
+def _soft_high_price_score(percentile: float) -> float:
+    extreme_high = max(0.0, percentile - 75.0) * 3.2
+    broad_high = max(0.0, percentile - 55.0) * 1.6
+    return _clip_score(extreme_high + broad_high)
+
+
+def _reversal_price_scores(
+    *,
+    stats: dict[str, float],
+    hog: dict[str, Any] | None,
+) -> tuple[float, float]:
+    low_anchor = min(stats["price_percentile_300d"], stats["price_percentile_full"])
+    high_anchor = max(stats["price_percentile_300d"], stats["price_percentile_full"])
+
+    if hog and hog.get("spot_price_percentile") is not None:
+        spot_percentile = float(hog["spot_price_percentile"])
+        low_anchor = min(low_anchor, spot_percentile)
+        high_anchor = max(high_anchor, spot_percentile)
+
+    return _soft_low_price_score(low_anchor), _soft_high_price_score(high_anchor)
 
 
 def _inventory_scores(inv: dict[str, Any] | None) -> tuple[float, float, list[tuple[str, float]]]:
@@ -197,24 +259,26 @@ def _hog_scores(hog: dict[str, Any] | None) -> tuple[float, float, float | None,
     return reversal_bias, trend_bias, pm_value, reasons
 
 
-def _build_candidate(
+def _historical_proxy_scores(
     *,
-    info: dict[str, Any],
     df: pd.DataFrame,
-) -> dict[str, Any] | None:
-    if df is None or len(df) < 60:
-        return None
+    stats: dict[str, float],
+) -> tuple[dict[str, float], list[tuple[str, float]]]:
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(close) < 60:
+        return {
+            "reversal_up": 0.0,
+            "reversal_down": 0.0,
+            "trend_up": 0.0,
+            "trend_down": 0.0,
+        }, []
 
-    stats = _price_stats(df)
-    inv = get_inventory(info["symbol"])
-    receipt = get_warehouse_receipt(info["symbol"])
-    seasonal = get_seasonality(df)
-    hog = get_hog_fundamentals() if info["symbol"] == "LH0" else None
-
-    inv_up, inv_down, inv_reasons = _inventory_scores(inv)
-    receipt_up, receipt_down, receipt_reasons = _receipt_scores(receipt)
-    seasonal_up, seasonal_down, seasonal_reasons = _seasonal_scores(seasonal)
-    hog_reversal, hog_trend, hog_profit, hog_reasons = _hog_scores(hog)
+    ma20 = float(close.tail(20).mean())
+    ma60 = float(close.tail(60).mean())
+    ma120 = float(close.tail(min(len(close), 120)).mean())
+    last = float(close.iloc[-1])
+    ret20 = (last / (float(close.iloc[-21]) + 1e-12) - 1.0) * 100.0 if len(close) > 21 else 0.0
+    ret60 = (last / (float(close.iloc[-61]) + 1e-12) - 1.0) * 100.0 if len(close) > 61 else ret20
 
     avg_pct = (stats["price_percentile_300d"] + stats["price_percentile_full"]) / 2.0
     low_price = _clip_score(max(0.0, 25.0 - avg_pct) * 4.0)
@@ -222,28 +286,151 @@ def _build_candidate(
     low_persistence = _clip_score(stats["low_persistence_days"] / 25.0 * 100.0)
     high_persistence = _clip_score(stats["high_persistence_days"] / 25.0 * 100.0)
 
-    reversal_up = (
-        low_price * 0.32
-        + low_persistence * 0.16
-        + hog_reversal * 0.36
-        + max(inv_down, receipt_down) * 0.16
+    trend_alignment_up = 100.0 if last > ma20 > ma60 > ma120 else 0.0
+    trend_alignment_down = 100.0 if last < ma20 < ma60 < ma120 else 0.0
+    trend_impulse_up = _clip_score(max(ret20, 0.0) * 8.0 + max(ret60, 0.0) * 3.5)
+    trend_impulse_down = _clip_score(max(-ret20, 0.0) * 8.0 + max(-ret60, 0.0) * 3.5)
+
+    oi_structure = get_oi_structure(df)
+    oi_trend_up = 0.0
+    oi_trend_down = 0.0
+    oi_reversal_up = 0.0
+    oi_reversal_down = 0.0
+    proxy_reasons: list[tuple[str, float]] = []
+
+    if oi_structure:
+        oi_vs_price = str(oi_structure.get("oi_vs_price") or "")
+        oi_change = float(oi_structure.get("oi_20d_change", 0.0))
+        oi_pct = float(oi_structure.get("oi_percentile", 50.0))
+
+        if oi_vs_price == "增仓上涨":
+            oi_trend_up = _clip_score(55.0 + max(oi_change, 0.0) * 2.5)
+            proxy_reasons.append(("历史代理:价格/OI共振上行", oi_trend_up))
+        elif oi_vs_price == "增仓下跌":
+            oi_trend_down = _clip_score(55.0 + max(oi_change, 0.0) * 2.5)
+            proxy_reasons.append(("历史代理:价格/OI共振下行", oi_trend_down))
+        elif oi_vs_price == "减仓下跌":
+            oi_reversal_up = _clip_score(45.0 + max(50.0 - oi_pct, 0.0) * 0.6 + max(-oi_change, 0.0) * 2.0)
+            proxy_reasons.append(("历史代理:低位减仓洗出", oi_reversal_up))
+        elif oi_vs_price == "减仓上涨":
+            oi_reversal_down = _clip_score(45.0 + max(oi_pct - 50.0, 0.0) * 0.6 + max(-oi_change, 0.0) * 2.0)
+            proxy_reasons.append(("历史代理:高位减仓衰竭", oi_reversal_down))
+
+    trend_up = _clip_score(
+        high_price * 0.30
+        + high_persistence * 0.15
+        + trend_alignment_up * 0.25
+        + trend_impulse_up * 0.15
+        + oi_trend_up * 0.15
     )
-    if low_price >= 80 and hog_reversal >= 45:
-        reversal_up += 15.0
-    if hog_reversal <= 0:
-        reversal_up *= 0.72
+    trend_down = _clip_score(
+        low_price * 0.30
+        + low_persistence * 0.15
+        + trend_alignment_down * 0.25
+        + trend_impulse_down * 0.15
+        + oi_trend_down * 0.15
+    )
+    if oi_trend_up <= 0:
+        trend_up = _clip_score(trend_up * 0.82)
+    if oi_trend_down <= 0:
+        trend_down = _clip_score(trend_down * 0.82)
+    reversal_up = _clip_score(
+        low_price * 0.42
+        + low_persistence * 0.18
+        + trend_impulse_down * 0.15
+        + oi_reversal_up * 0.25
+    )
+    reversal_down = _clip_score(
+        high_price * 0.42
+        + high_persistence * 0.18
+        + trend_impulse_up * 0.15
+        + oi_reversal_down * 0.25
+    )
+
+    if trend_up >= 60:
+        proxy_reasons.append(("历史代理:价格沿均线多头扩散", trend_up))
+    if trend_down >= 60:
+        proxy_reasons.append(("历史代理:价格沿均线空头扩散", trend_down))
+    if reversal_up >= 60:
+        proxy_reasons.append(("历史代理:长期低位+抛压出清", reversal_up))
+    if reversal_down >= 60:
+        proxy_reasons.append(("历史代理:长期高位+追涨衰竭", reversal_down))
+
+    return {
+        "reversal_up": reversal_up,
+        "reversal_down": reversal_down,
+        "trend_up": trend_up,
+        "trend_down": trend_down,
+    }, proxy_reasons
+
+
+def _build_candidate(
+    *,
+    info: dict[str, Any],
+    df: pd.DataFrame,
+    as_of_date: date | None = None,
+) -> dict[str, Any] | None:
+    if df is not None and as_of_date is not None and "date" in df.columns:
+        frame = df.copy()
+        frame["date"] = pd.to_datetime(frame["date"])
+        df = frame.loc[frame["date"].dt.date <= as_of_date].reset_index(drop=True)
+    if df is None or len(df) < 60:
+        return None
+
+    stats = _price_stats(df)
+    inv = _call_factor(get_inventory, info["symbol"], as_of_date=as_of_date)
+    receipt = _call_factor(get_warehouse_receipt, info["symbol"], as_of_date=as_of_date)
+    seasonal = _call_factor(get_seasonality, df, as_of_date=as_of_date)
+    hog = _call_factor(get_hog_fundamentals, as_of_date=as_of_date) if info["symbol"] == "LH0" else None
+
+    inv_up, inv_down, inv_reasons = _inventory_scores(inv)
+    receipt_up, receipt_down, receipt_reasons = _receipt_scores(receipt)
+    seasonal_up, seasonal_down, seasonal_reasons = _seasonal_scores(seasonal)
+    hog_reversal, hog_trend, hog_profit, hog_reasons = _hog_scores(hog)
+    use_proxy_scores = as_of_date is not None or not any((inv, receipt, seasonal, hog))
+    if use_proxy_scores:
+        proxy_scores, proxy_reasons = _historical_proxy_scores(df=df, stats=stats)
+    else:
+        proxy_scores, proxy_reasons = (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 0.0,
+            },
+            [],
+        )
+
+    low_price, high_price = _reversal_price_scores(stats=stats, hog=hog)
+    low_persistence = _clip_score(stats["low_persistence_days"] / 25.0 * 100.0)
+    high_persistence = _clip_score(stats["high_persistence_days"] / 25.0 * 100.0)
+    structural_down = max(inv_down, receipt_down)
+    structural_up = max(inv_up, receipt_up)
+
+    reversal_up = (
+        low_price * 0.18
+        + low_persistence * 0.28
+        + hog_reversal * 0.42
+        + structural_down * 0.30
+    )
+    if low_price >= 50 and hog_reversal >= 45:
+        reversal_up += 12.0
+    if low_persistence >= 60 and structural_down >= 70:
+        reversal_up += 13.0
+    if low_persistence >= 60 and hog_reversal >= 50:
+        reversal_up += 6.0
     reversal_up = _clip_score(reversal_up)
 
     reversal_down = (
-        high_price * 0.32
-        + high_persistence * 0.16
-        + hog_reversal * 0.36
-        + max(inv_up, receipt_up) * 0.16
+        high_price * 0.18
+        + high_persistence * 0.22
+        + hog_reversal * 0.42
+        + structural_up * 0.12
     )
-    if high_price >= 80 and hog_reversal >= 45:
-        reversal_down += 15.0
-    if hog_reversal <= 0:
-        reversal_down *= 0.72
+    if high_price >= 50 and hog_reversal >= 45:
+        reversal_down += 12.0
+    if high_persistence >= 60 and hog_reversal >= 50:
+        reversal_down += 6.0
     reversal_down = _clip_score(reversal_down)
 
     trend_up = _clip_score(
@@ -259,6 +446,11 @@ def _build_candidate(
         + (hog_trend if hog and float(hog.get("price_trend", 0.0)) < 0 else 0.0) * 0.10
     )
 
+    reversal_up = _clip_score(max(reversal_up, proxy_scores["reversal_up"]))
+    reversal_down = _clip_score(max(reversal_down, proxy_scores["reversal_down"]))
+    trend_up = _clip_score(max(trend_up, proxy_scores["trend_up"]))
+    trend_down = _clip_score(max(trend_down, proxy_scores["trend_down"]))
+
     available_families = 1
     if inv:
         available_families += 1
@@ -266,6 +458,9 @@ def _build_candidate(
         available_families += 1
     if seasonal or hog:
         available_families += 1
+    if max(proxy_scores.values()) >= 40.0:
+        available_families += 1
+    available_families = min(available_families, 4)
     data_coverage = round(available_families / 4.0, 2)
     shrink = 0.6 + 0.4 * data_coverage
 
@@ -310,12 +505,13 @@ def _build_candidate(
         else:
             dominant_reasons.extend(inv_reasons + receipt_reasons + seasonal_reasons + hog_reasons)
 
+    dominant_reasons.extend(proxy_reasons)
     dominant_reasons = [item for item in dominant_reasons if item[1] > 0]
     dominant_reasons.sort(key=lambda item: item[1], reverse=True)
     reason_summary = "；".join(reason for reason, _ in dominant_reasons[:3]) or "基本面证据有限"
 
-    dominant_family = "反转机会分" if reversal_score >= trend_score else "趋势机会分"
-    entry_pool_reason = f"{dominant_family}达标（反转{reversal_score:.0f} / 趋势{trend_score:.0f}）"
+    reversal_direction = "long" if reversal_up >= reversal_down else "short"
+    trend_direction = "long" if trend_up >= trend_down else "short"
 
     return {
         "symbol": info["symbol"],
@@ -333,12 +529,14 @@ def _build_candidate(
         "hog_profit": hog_profit,
         "reversal_score": reversal_score,
         "trend_score": trend_score,
+        "reversal_direction": reversal_direction,
+        "trend_direction": trend_direction,
         "attention_score": 0.0,
         "labels": labels,
         "state_labels": state_labels,
         "data_coverage": data_coverage,
         "reason_summary": reason_summary,
-        "entry_pool_reason": entry_pool_reason,
+        "entry_pool_reason": "",
         "_reversal_up_score": reversal_up,
         "_reversal_down_score": reversal_down,
         "_trend_up_score": trend_up,
@@ -346,35 +544,23 @@ def _build_candidate(
     }
 
 
-def select_top_candidates(rows: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
-    eligible = []
-    for row in rows:
-        dominant_score = max(row["reversal_score"], row["trend_score"])
-        entry_threshold = float(row.get("entry_threshold", 55.0))
-        if dominant_score >= entry_threshold:
-            eligible.append(row)
-            continue
-        if row.get("data_coverage", 1.0) < 0.5 and dominant_score >= max(entry_threshold, 85.0):
-            eligible.append(row)
-    eligible.sort(key=lambda row: row["attention_score"], reverse=True)
-    return eligible[:top_n]
-
-
-def run_phase1_pipeline(
+def build_phase1_candidates(
     *,
     all_data: dict[str, pd.DataFrame],
     symbols: list[dict[str, Any]],
     threshold: float,
     config: dict[str, Any],
+    as_of_date: date | None = None,
 ) -> list[dict[str, Any]]:
     thresholds = _symbol_thresholds(symbols=symbols, threshold=threshold, config=config)
     rows: list[dict[str, Any]] = []
     for info in symbols:
         df = all_data.get(info["symbol"])
-        candidate = _build_candidate(info=info, df=df)
+        candidate = _build_candidate(info=info, df=df, as_of_date=as_of_date)
         if candidate is None:
             continue
         candidate["entry_threshold"] = thresholds.get(info["symbol"], _attention_threshold(threshold))
+        candidate["entry_pool_reason"] = _entry_pool_reason(candidate)
         rows.append(candidate)
 
     if not rows:
@@ -407,6 +593,42 @@ def run_phase1_pipeline(
         row.pop("_reversal_down_score", None)
         row.pop("_trend_up_score", None)
         row.pop("_trend_down_score", None)
+
+    return rows
+
+
+def is_phase1_candidate_eligible(row: dict[str, Any]) -> bool:
+    dominant_score = max(row["reversal_score"], row["trend_score"])
+    entry_threshold = float(row.get("entry_threshold", 55.0))
+    if dominant_score >= entry_threshold:
+        return True
+    return row.get("data_coverage", 1.0) < 0.5 and dominant_score >= max(entry_threshold, 85.0)
+
+
+def select_top_candidates(rows: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
+    eligible = []
+    for row in rows:
+        if is_phase1_candidate_eligible(row):
+            eligible.append(row)
+    eligible.sort(key=lambda row: row["attention_score"], reverse=True)
+    return eligible[:top_n]
+
+
+def run_phase1_pipeline(
+    *,
+    all_data: dict[str, pd.DataFrame],
+    symbols: list[dict[str, Any]],
+    threshold: float,
+    config: dict[str, Any],
+    as_of_date: date | None = None,
+) -> list[dict[str, Any]]:
+    rows = build_phase1_candidates(
+        all_data=all_data,
+        symbols=symbols,
+        threshold=threshold,
+        config=config,
+        as_of_date=as_of_date,
+    )
 
     fs_cfg = config.get("fundamental_screening") or {}
     top_n = int(fs_cfg.get("top_n") or 40)

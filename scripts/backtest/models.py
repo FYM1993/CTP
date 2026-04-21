@@ -12,6 +12,7 @@ class BacktestCase:
     direction: str
     start_dt: date
     end_dt: date
+    strategy_family: str = ""
     note: str = ""
 
 
@@ -52,3 +53,5 @@ class BacktestResult:
     case_id: str
     trades: list[TradeRecord]
     summary: dict[str, float | int]
+    diagnostics: dict[str, float | int] = field(default_factory=dict)
+    debug: dict[str, object] = field(default_factory=dict)

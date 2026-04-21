@@ -14,9 +14,11 @@ if str(SCRIPTS) not in sys.path:
 
 from backtest.models import BacktestCase, TradePlan  # noqa: E402
 from backtest.phase23 import (  # noqa: E402
+    _backtest_cache_paths,
     _create_backtest_api,
     _backtest_start_dt,
     _daily_warmup_bars,
+    _open_backtest_anchor_api,
     _safe_generate_signals,
     aggregate_partial_5m_bars,
     load_case_frames_with_tqbacktest,
@@ -24,9 +26,10 @@ from backtest.phase23 import (  # noqa: E402
     resolve_case_tq_symbol,
     run_case_from_frames,
 )
+from shared.strategy import STRATEGY_REVERSAL  # noqa: E402
 
 
-def _make_case(direction: str) -> BacktestCase:
+def _make_case(direction: str, strategy_family: str = "") -> BacktestCase:
     return BacktestCase(
         case_id=f"case_{direction}",
         symbol="LH0" if direction == "long" else "PS0",
@@ -34,6 +37,7 @@ def _make_case(direction: str) -> BacktestCase:
         direction=direction,
         start_dt=date(2025, 1, 1),
         end_dt=date(2025, 1, 31),
+        strategy_family=strategy_family,
     )
 
 
@@ -154,6 +158,7 @@ def test_make_trade_plan_from_phase2_maps_actionable_raw_plan(monkeypatch):
     raw_plan = {
         "symbol": "LH0",
         "direction": "long",
+        "strategy_family": "reversal_fundamental",
         "score": 36.5,
         "actionable": True,
         "entry": 103.0,
@@ -189,6 +194,7 @@ def test_make_trade_plan_from_phase2_maps_actionable_raw_plan(monkeypatch):
         phase2_score=36.5,
         signal_type="spring",
         meta={
+            "strategy_family": "reversal_fundamental",
             "entry_family": "",
             "entry_signal_type": "spring",
             "entry_signal_detail": "",
@@ -544,6 +550,10 @@ def test_run_case_from_frames_exits_active_trade_when_phase2_invalidates_next_da
         "backtest.phase23._safe_generate_signals",
         lambda df, direction, cfg: [{"type": "开多"}],
     )
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.assess_active_reversal_hold_from_daily_df",
+        lambda **_kwargs: {"hold_valid": False},
+    )
 
     def plan_factory(*, daily_df, **_kwargs):
         latest_visible = daily_df["trade_date"].max() if not daily_df.empty else None
@@ -565,6 +575,224 @@ def test_run_case_from_frames_exits_active_trade_when_phase2_invalidates_next_da
     assert trade.exit_time == "2025-01-07 09:31:00"
     assert trade.exit_price == 97.0
     assert trade.exit_reason == "phase2_invalidated"
+
+
+def test_run_case_from_frames_keeps_custom_reversal_trade_when_hold_is_still_valid(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 102.0, 99.0, 101.0),
+            ("2025-01-07 09:31:00", 101.5, 102.0, 101.0, 101.8),
+            ("2025-01-07 09:32:00", 101.8, 102.2, 101.5, 102.0),
+        ]
+    )
+    daily_df = _daily_df_for_backtest().copy()
+    plan = TradePlan(
+        trade_id="reversal-custom-hold",
+        symbol="LH0",
+        direction="long",
+        plan_date="2025-01-06",
+        entry_ref=102.0,
+        stop=98.0,
+        tp1=106.0,
+        tp2=109.0,
+        phase2_score=30.0,
+        signal_type="Spring",
+        meta={
+            "strategy_family": "reversal_fundamental",
+            "entry_family": "reversal",
+            "entry_signal_type": "Spring",
+            "entry_signal_detail": "反转信号仍然新鲜",
+        },
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.assess_active_reversal_hold_from_daily_df",
+        lambda **_kwargs: {"hold_valid": True},
+    )
+
+    def plan_factory(*, daily_df, **_kwargs):
+        latest_visible = daily_df["trade_date"].max() if not daily_df.empty else None
+        if latest_visible == date(2025, 1, 5):
+            return plan
+        return None
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family="reversal_fundamental"),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        plan_factory=plan_factory,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    trade = result.trades[0]
+    assert trade.exit_reason == "end_of_data"
+    assert trade.exit_time == "2025-01-07 09:32:00"
+    assert trade.meta["strategy_family"] == "reversal_fundamental"
+    assert trade.meta["entry_family"] == "reversal"
+
+
+def test_run_case_from_frames_keeps_trend_trade_when_phase_still_valid_but_signal_softens(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 200.0, 201.0, 199.0, 200.0),
+            ("2025-01-06 09:32:00", 199.0, 200.0, 198.0, 199.0),
+            ("2025-01-07 09:31:00", 198.5, 199.0, 198.0, 198.2),
+            ("2025-01-07 09:32:00", 198.0, 198.5, 197.5, 197.8),
+        ]
+    )
+    daily_df = _daily_df_for_backtest().copy()
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开空"}],
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.assess_active_trend_hold_from_daily_df",
+        lambda **_kwargs: {"hold_valid": True},
+    )
+
+    def fake_build_trade_plan_from_daily_df(*, df, **_kwargs):
+        latest_visible = pd.to_datetime(df["date"]).max().date() if not df.empty else None
+        if latest_visible == date(2025, 1, 5):
+            return {
+                "symbol": "PS0",
+                "name": "豆粕",
+                "direction": "short",
+                "score": -28.0,
+                "actionable": True,
+                "entry": 199.0,
+                "stop": 205.0,
+                "tp1": 192.0,
+                "tp2": 189.0,
+                "rr": 1.16,
+                "entry_family": "trend",
+                "entry_signal_type": "Pullback",
+                "entry_signal_detail": "markdown 阶段顺势反弹受阻",
+                "reversal_status": {"has_signal": False},
+                "trend_status": {
+                    "has_signal": True,
+                    "signal_type": "Pullback",
+                    "signal_detail": "markdown 阶段顺势反弹受阻",
+                    "phase": "markdown",
+                    "phase_ok": True,
+                    "slope_ok": True,
+                    "trend_indicator_ok": True,
+                },
+            }
+        if latest_visible == date(2025, 1, 6):
+            return {
+                "symbol": "PS0",
+                "name": "豆粕",
+                "direction": "short",
+                "score": 5.0,
+                "actionable": False,
+                "entry": 198.2,
+                "stop": 205.0,
+                "tp1": 192.0,
+                "tp2": 189.0,
+                "rr": 0.6,
+                "entry_family": "trend",
+                "entry_signal_type": "Pullback",
+                "entry_signal_detail": "markdown 阶段仍在，但短期指标回摆",
+                "reversal_status": {"has_signal": False},
+                "trend_status": {
+                    "has_signal": False,
+                    "signal_type": "",
+                    "signal_detail": "",
+                    "phase": "markdown",
+                    "phase_ok": True,
+                    "slope_ok": False,
+                    "trend_indicator_ok": False,
+                },
+            }
+        return None
+
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.build_trade_plan_from_daily_df",
+        fake_build_trade_plan_from_daily_df,
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("short"),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    trade = result.trades[0]
+    assert trade.exit_reason == "end_of_data"
+    assert trade.exit_time == "2025-01-07 09:32:00"
+    assert trade.meta["entry_family"] == "trend"
+
+
+def test_run_case_from_frames_keeps_custom_trend_trade_when_hold_is_still_valid(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 200.0, 201.0, 199.0, 200.0),
+            ("2025-01-06 09:32:00", 199.0, 200.0, 198.0, 199.0),
+            ("2025-01-07 09:31:00", 198.5, 199.0, 198.0, 198.2),
+            ("2025-01-07 09:32:00", 198.0, 198.5, 197.5, 197.8),
+        ]
+    )
+    daily_df = _daily_df_for_backtest().copy()
+    plan = TradePlan(
+        trade_id="trend-custom-hold",
+        symbol="LH0",
+        direction="short",
+        plan_date="2025-01-06",
+        entry_ref=199.0,
+        stop=205.0,
+        tp1=192.0,
+        tp2=189.0,
+        phase2_score=-28.0,
+        signal_type="Pullback",
+        meta={
+            "strategy_family": "trend_following",
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "markdown 阶段顺势反弹受阻",
+        },
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开空"}],
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.assess_active_trend_hold_from_daily_df",
+        lambda **_kwargs: {"hold_valid": True},
+    )
+
+    def plan_factory(*, daily_df, **_kwargs):
+        latest_visible = daily_df["trade_date"].max() if not daily_df.empty else None
+        if latest_visible == date(2025, 1, 5):
+            return plan
+        return None
+
+    result = run_case_from_frames(
+        case=_make_case("short", strategy_family="trend_following"),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        plan_factory=plan_factory,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    trade = result.trades[0]
+    assert trade.exit_reason == "end_of_data"
+    assert trade.exit_time == "2025-01-07 09:32:00"
+    assert trade.meta["strategy_family"] == "trend_following"
+    assert trade.meta["entry_family"] == "trend"
 
 
 def test_run_case_from_frames_plan_factory_sees_only_prior_daily_bars(monkeypatch):
@@ -677,6 +905,8 @@ def test_run_case_from_frames_reports_actionable_plan_without_entry(monkeypatch)
         "phase2_actionable_days": 1,
         "phase2_actionable_reversal_days": 1,
         "phase2_actionable_trend_days": 0,
+        "phase2_actionable_strategy_reversal_days": 0,
+        "phase2_actionable_strategy_trend_days": 0,
         "phase2_reject_no_signal_days": 0,
         "phase2_reject_score_gate_days": 0,
         "phase2_reject_rr_gate_days": 0,
@@ -686,6 +916,8 @@ def test_run_case_from_frames_reports_actionable_plan_without_entry(monkeypatch)
         "trades_opened": 0,
         "trades_opened_reversal": 0,
         "trades_opened_trend": 0,
+        "trades_opened_strategy_reversal": 0,
+        "trades_opened_strategy_trend": 0,
     }
 
 
@@ -741,6 +973,8 @@ def test_run_case_from_frames_reports_short_history_then_entry(monkeypatch):
         "phase2_actionable_days": 1,
         "phase2_actionable_reversal_days": 1,
         "phase2_actionable_trend_days": 0,
+        "phase2_actionable_strategy_reversal_days": 0,
+        "phase2_actionable_strategy_trend_days": 0,
         "phase2_reject_no_signal_days": 0,
         "phase2_reject_score_gate_days": 0,
         "phase2_reject_rr_gate_days": 0,
@@ -750,6 +984,8 @@ def test_run_case_from_frames_reports_short_history_then_entry(monkeypatch):
         "trades_opened": 1,
         "trades_opened_reversal": 1,
         "trades_opened_trend": 0,
+        "trades_opened_strategy_reversal": 0,
+        "trades_opened_strategy_trend": 0,
     }
 
 
@@ -772,6 +1008,7 @@ def test_run_case_from_frames_tracks_trend_entry_family_diagnostics(monkeypatch)
         phase2_score=30.0,
         signal_type="Pullback",
         meta={
+            "strategy_family": "trend_following",
             "entry_family": "trend",
             "entry_signal_type": "Pullback",
             "entry_signal_detail": "上涨趋势回踩后转强",
@@ -784,7 +1021,7 @@ def test_run_case_from_frames_tracks_trend_entry_family_diagnostics(monkeypatch)
     )
 
     result = run_case_from_frames(
-        case=_make_case("long"),
+        case=_make_case("long", strategy_family="trend_following"),
         daily_df=_daily_df_for_backtest().iloc[:3].copy(),
         minute_df=minute_df,
         plan_factory=lambda **_kwargs: plan,
@@ -795,9 +1032,12 @@ def test_run_case_from_frames_tracks_trend_entry_family_diagnostics(monkeypatch)
     assert result.diagnostics["phase2_actionable_days"] == 1
     assert result.diagnostics["phase2_actionable_reversal_days"] == 0
     assert result.diagnostics["phase2_actionable_trend_days"] == 1
+    assert result.diagnostics["phase2_actionable_strategy_trend_days"] == 1
     assert result.diagnostics["trades_opened"] == 1
     assert result.diagnostics["trades_opened_reversal"] == 0
     assert result.diagnostics["trades_opened_trend"] == 1
+    assert result.diagnostics["trades_opened_strategy_trend"] == 1
+    assert result.trades[0].meta["strategy_family"] == "trend_following"
     assert result.trades[0].meta["entry_family"] == "trend"
     assert result.trades[0].meta["entry_signal_type"] == "Pullback"
     assert result.trades[0].meta["entry_signal_detail"] == "上涨趋势回踩后转强"
@@ -923,6 +1163,130 @@ def test_run_case_from_frames_reports_phase2_score_and_rr_rejections(monkeypatch
     assert result.diagnostics["phase2_reject_rr_gate_days"] == 1
 
 
+def test_run_case_from_frames_does_not_treat_trend_signal_as_no_signal(monkeypatch):
+    minute_df = _build_minute_df([("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0)])
+    daily_df = _daily_df_for_backtest()
+
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.build_trade_plan_from_daily_df",
+        lambda **_kwargs: {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 18.0,
+            "actionable": False,
+            "entry": 100.0,
+            "stop": 95.0,
+            "tp1": 103.0,
+            "tp2": 105.0,
+            "rr": 0.8,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "上涨趋势回踩后转强",
+            "reversal_status": {"has_signal": False},
+            "trend_status": {
+                "has_signal": True,
+                "signal_type": "Pullback",
+                "signal_detail": "上涨趋势回踩后转强",
+                "phase": "markup",
+                "phase_ok": True,
+                "slope_ok": True,
+                "trend_indicator_ok": True,
+            },
+        },
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 0}
+    assert result.diagnostics["phase2_non_actionable_days"] == 1
+    assert result.diagnostics["phase2_reject_no_signal_days"] == 0
+    assert result.diagnostics["phase2_reject_score_gate_days"] == 1
+    assert result.diagnostics["phase2_reject_rr_gate_days"] == 1
+
+
+def test_run_case_from_frames_collects_phase2_debug_days_when_requested(monkeypatch):
+    minute_df = _build_minute_df([("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0)])
+    daily_df = _daily_df_for_backtest()
+
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.build_trade_plan_from_daily_df",
+        lambda **_kwargs: {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 18.0,
+            "actionable": False,
+            "entry": 100.0,
+            "stop": 95.0,
+            "tp1": 103.0,
+            "tp2": 105.0,
+            "rr": 0.8,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "上涨趋势回踩后转强",
+            "reversal_status": {
+                "has_signal": False,
+                "current_stage": "markdown",
+                "next_expected": "等待Spring",
+            },
+            "trend_status": {
+                "has_signal": True,
+                "signal_type": "Pullback",
+                "signal_detail": "上涨趋势回踩后转强",
+                "phase": "markup",
+                "phase_ok": True,
+                "slope_ok": True,
+                "trend_indicator_ok": True,
+            },
+        },
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+        capture_debug=True,
+    )
+
+    assert result.debug["phase2_days"] == [
+        {
+            "trade_date": "2025-01-06",
+            "visible_daily_rows": 3,
+            "phase2_state": "score_gate+rr_gate",
+            "strategy_family": "",
+            "score": 18.0,
+            "rr": 0.8,
+            "phase2_score_gate_passed": False,
+            "phase2_rr_gate_passed": False,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "上涨趋势回踩后转强",
+            "reversal_has_signal": False,
+            "reversal_signal_type": "",
+            "reversal_signal_days_ago": None,
+            "reversal_signal_strength": 0.0,
+            "reversal_signal_fresh": False,
+            "reversal_current_stage": "markdown",
+            "reversal_next_expected": "等待Spring",
+            "trend_has_signal": True,
+            "trend_signal_type": "Pullback",
+            "trend_phase": "markup",
+            "trend_phase_ok": True,
+            "trend_slope_ok": True,
+            "trend_indicator_ok": True,
+        }
+    ]
+
+
 def test_create_backtest_api_builds_tqsdk_backtest_session(monkeypatch):
     created: dict[str, object] = {}
 
@@ -967,6 +1331,98 @@ def test_create_backtest_api_builds_tqsdk_backtest_session(monkeypatch):
     assert created["auth"].password == "pwd"
 
 
+def test_run_case_from_frames_strategy_specific_debug_keeps_reversal_watch_snapshot(monkeypatch):
+    daily_df = _daily_df_for_backtest().iloc[:4].copy()
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 101.0, 101.5, 100.8, 101.2),
+            ("2025-01-06 09:32:00", 101.2, 101.6, 101.0, 101.3),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.build_reversal_trade_plan_from_daily_df",
+        lambda **kwargs: {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "strategy_family": STRATEGY_REVERSAL,
+            "score": 9.0,
+            "actionable": False,
+            "entry": 103.0,
+            "stop": 98.0,
+            "tp1": 107.0,
+            "tp2": 110.0,
+            "rr": 0.0,
+            "entry_family": "",
+            "entry_signal_type": "",
+            "entry_signal_detail": "",
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Spring",
+                "signal_days_ago": 2,
+                "signal_strength": 0.75,
+                "current_stage": "反转信号出现",
+                "next_expected": "信号新鲜(2天前)，可考虑入场",
+            },
+            "trend_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "phase": "markdown",
+                "phase_ok": False,
+                "slope_ok": False,
+                "trend_indicator_ok": False,
+            },
+            "phase2_score_gate_passed": False,
+            "phase2_rr_gate_passed": True,
+            "reversal_signal_fresh": True,
+        },
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", STRATEGY_REVERSAL),
+        daily_df=daily_df,
+        minute_df=minute_df,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+        plan_factory=lambda **kwargs: None,
+        capture_debug=True,
+    )
+
+    assert result.diagnostics["phase2_non_actionable_days"] == 1
+    assert result.diagnostics["phase2_reject_no_signal_days"] == 0
+    assert result.diagnostics["phase2_reject_score_gate_days"] == 1
+    assert result.diagnostics["phase2_reject_rr_gate_days"] == 0
+    assert result.debug["phase2_days"] == [
+        {
+            "trade_date": "2025-01-06",
+            "visible_daily_rows": 3,
+            "phase2_state": "score_gate",
+            "strategy_family": STRATEGY_REVERSAL,
+            "score": 9.0,
+            "rr": 0.0,
+            "phase2_score_gate_passed": False,
+            "phase2_rr_gate_passed": True,
+            "entry_family": "",
+            "entry_signal_type": "Spring",
+            "entry_signal_detail": "",
+            "reversal_has_signal": True,
+            "reversal_signal_type": "Spring",
+            "reversal_signal_days_ago": 2,
+            "reversal_signal_strength": 0.75,
+            "reversal_signal_fresh": True,
+            "reversal_current_stage": "反转信号出现",
+            "reversal_next_expected": "信号新鲜(2天前)，可考虑入场",
+            "trend_has_signal": False,
+            "trend_signal_type": "",
+            "trend_phase": "markdown",
+            "trend_phase_ok": False,
+            "trend_slope_ok": False,
+            "trend_indicator_ok": False,
+        }
+    ]
+
+
 def test_daily_warmup_bars_defaults_to_phase2_min_history() -> None:
     assert _daily_warmup_bars({}) == 60
     assert _daily_warmup_bars({"pre_market": {"min_history_bars": 75}}) == 75
@@ -1009,24 +1465,31 @@ def test_resolve_case_tq_symbol_prefers_dynamic_resolution(monkeypatch):
     }
 
 
-def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeypatch):
-    case = _make_case("long")
-    created: dict[str, object] = {}
+def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeypatch, tmp_path):
+    case = BacktestCase(
+        case_id="chunk_case",
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        start_dt=date(2025, 1, 1),
+        end_dt=date(2025, 1, 4),
+    )
+    created: dict[str, object] = {"calls": []}
 
     daily_serial = pd.DataFrame(
         {
-            "datetime": pd.to_datetime(["2025-01-03", "2025-01-04"]),
-            "open": [100.0, 101.0],
-            "high": [110.0, 111.0],
-            "low": [95.0, 96.0],
-            "close": [105.0, 106.0],
-            "volume": [1000.0, 1001.0],
-            "close_oi": [800.0, 801.0],
+            "datetime": pd.to_datetime(["2024-12-31", "2025-01-03", "2025-01-04"]),
+            "open": [99.0, 100.0, 101.0],
+            "high": [109.0, 110.0, 111.0],
+            "low": [94.0, 95.0, 96.0],
+            "close": [104.0, 105.0, 106.0],
+            "volume": [999.0, 1000.0, 1001.0],
+            "close_oi": [799.0, 800.0, 801.0],
         }
     )
-    minute_serial = pd.DataFrame(
+    minute_chunk_a = pd.DataFrame(
         {
-            "datetime": pd.to_datetime(["2025-01-06 09:31:00", "2025-01-06 09:32:00"]),
+            "datetime": pd.to_datetime(["2025-01-03 09:31:00", "2025-01-04 09:32:00"]),
             "open": [100.0, 101.0],
             "high": [101.0, 102.0],
             "low": [99.0, 100.0],
@@ -1034,9 +1497,20 @@ def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeyp
             "volume": [10.0, 12.0],
         }
     )
+    minute_chunk_b = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2025-01-01 09:31:00", "2025-01-02 09:32:00"]),
+            "open": [98.0, 99.0],
+            "high": [99.0, 100.0],
+            "low": [97.0, 98.0],
+            "close": [98.5, 99.5],
+            "volume": [9.0, 11.0],
+        }
+    )
 
     class FakeApi:
-        def __init__(self):
+        def __init__(self, anchor_dt):
+            self.anchor_dt = anchor_dt
             self.calls: list[tuple[str, int, int | None]] = []
             self.closed = False
 
@@ -1045,25 +1519,29 @@ def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeyp
             if duration_seconds == 86400:
                 return daily_serial
             if duration_seconds == 60:
-                return minute_serial
+                if self.anchor_dt == date(2025, 1, 5):
+                    return minute_chunk_a
+                if self.anchor_dt == date(2025, 1, 3):
+                    return minute_chunk_b
+                raise AssertionError(f"unexpected minute anchor: {self.anchor_dt}")
             raise AssertionError(f"unexpected duration: {duration_seconds}")
 
         def wait_update(self, deadline=None):
-            return False
+            raise AssertionError("chunk loader should not drive wait_update")
 
         def close(self):
             self.closed = True
 
     def fake_create_backtest_api(*, start_dt, end_dt, account, password):
-        created["start_dt"] = start_dt
-        created["end_dt"] = end_dt
-        created["account"] = account
-        created["password"] = password
-        api = FakeApi()
-        created["api"] = api
+        created["calls"].append((start_dt, end_dt, account, password))
+        api = FakeApi(end_dt)
+        created.setdefault("apis", []).append(api)
         return api
 
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
     monkeypatch.setattr("backtest.phase23._create_backtest_api", fake_create_backtest_api)
+    monkeypatch.setattr("backtest.phase23.BACKTEST_ANCHOR_OFFSETS", (1,))
+    monkeypatch.setattr("backtest.phase23.BACKTEST_MINUTE_CHUNK_DAYS", 2)
     monkeypatch.setattr(
         "backtest.phase23.resolve_case_tq_symbol",
         lambda case, api=None: "KQ.m@DCE.lh",
@@ -1074,26 +1552,25 @@ def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeyp
         config={"tqsdk": {"account": "acct", "password": "pwd"}},
     )
 
-    assert created["start_dt"] == case.start_dt - timedelta(days=120)
-    assert created["end_dt"] == case.end_dt
-    assert created["account"] == "acct"
-    assert created["password"] == "pwd"
-    assert created["api"].calls == [
-        ("KQ.m@DCE.lh", 86400, 96),
-        ("KQ.m@DCE.lh", 60, 31 * 24 * 60),
-    ]
-    assert created["api"].calls[0][2] >= 31 + 60
-    assert created["api"].calls[1][2] >= 31 * 24 * 60
+    assert created["calls"][0] == (case.start_dt - timedelta(days=120), case.end_dt, "acct", "pwd")
+    assert created["calls"][1] == (date(2025, 1, 5), date(2025, 1, 5), "acct", "pwd")
+    assert created["calls"][2] == (date(2025, 1, 5), date(2025, 1, 5), "acct", "pwd")
+    assert created["calls"][3] == (date(2025, 1, 3), date(2025, 1, 3), "acct", "pwd")
     assert list(daily_df.columns) == ["date", "open", "high", "low", "close", "volume", "oi"]
-    assert len(daily_df) == 2
-    assert float(daily_df.iloc[0]["oi"]) == 800.0
+    assert len(daily_df) == 3
+    assert float(daily_df.iloc[1]["oi"]) == 800.0
     assert list(minute_df.columns) == ["datetime", "open", "high", "low", "close", "volume"]
-    assert len(minute_df) == 2
-    assert float(minute_df.iloc[1]["close"]) == 101.5
-    assert created["api"].closed is True
+    assert len(minute_df) == 4
+    assert list(minute_df["datetime"].dt.date) == [
+        date(2025, 1, 1),
+        date(2025, 1, 2),
+        date(2025, 1, 3),
+        date(2025, 1, 4),
+    ]
+    assert all(api.closed is True for api in created["apis"])
 
 
-def test_load_case_frames_with_tqbacktest_keeps_pre_start_daily_warmup(monkeypatch):
+def test_load_case_frames_with_tqbacktest_keeps_pre_start_daily_warmup(monkeypatch, tmp_path):
     case = BacktestCase(
         case_id="warmup_case",
         symbol="LH0",
@@ -1139,6 +1616,7 @@ def test_load_case_frames_with_tqbacktest_keeps_pre_start_daily_warmup(monkeypat
         def close(self):
             return None
 
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
     monkeypatch.setattr("backtest.phase23._create_backtest_api", lambda **_kwargs: FakeApi())
     monkeypatch.setattr(
         "backtest.phase23.resolve_case_tq_symbol",
@@ -1158,176 +1636,167 @@ def test_load_case_frames_with_tqbacktest_keeps_pre_start_daily_warmup(monkeypat
     assert list(minute_df["datetime"].dt.date) == [date(2025, 1, 6), date(2025, 1, 6)]
 
 
-def test_load_case_frames_with_tqbacktest_drives_backtest_until_finished(monkeypatch):
+def test_load_case_frames_with_tqbacktest_returns_cached_frames_without_tqsdk(monkeypatch, tmp_path):
     case = _make_case("long")
+    warmup_bars = _daily_warmup_bars({})
+    cached_daily = _daily_df_for_backtest().copy()
+    cached_minute = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 101.0, 102.0, 100.0, 101.0),
+        ]
+    )
+
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
+    daily_path, minute_path = _backtest_cache_paths(case=case, warmup_bars=warmup_bars)
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_daily.to_parquet(daily_path, index=False)
+    cached_minute.to_parquet(minute_path, index=False)
+    monkeypatch.setattr(
+        "backtest.phase23._create_backtest_api",
+        lambda **_kwargs: pytest.fail("cache hit should not open tqbacktest"),
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.resolve_case_tq_symbol",
+        lambda *args, **kwargs: pytest.fail("cache hit should not resolve tq symbol"),
+    )
+
+    daily_df, minute_df = load_case_frames_with_tqbacktest(case=case, config={})
+
+    pd.testing.assert_frame_equal(daily_df, cached_daily)
+    pd.testing.assert_frame_equal(minute_df, cached_minute)
+
+
+def test_load_case_frames_with_tqbacktest_writes_cache_for_followup_runs(monkeypatch, tmp_path):
+    case = BacktestCase(
+        case_id="cache_case",
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        start_dt=date(2025, 1, 1),
+        end_dt=date(2025, 1, 4),
+    )
+    created: dict[str, object] = {"calls": []}
 
     daily_serial = pd.DataFrame(
         {
-            "datetime": pd.to_datetime(["2025-01-03", "2025-01-06"]),
-            "open": [pd.NA, pd.NA],
-            "high": [pd.NA, pd.NA],
-            "low": [pd.NA, pd.NA],
-            "close": [pd.NA, pd.NA],
-            "volume": [pd.NA, pd.NA],
-            "close_oi": [pd.NA, pd.NA],
+            "datetime": pd.to_datetime(["2024-12-31", "2025-01-03", "2025-01-04"]),
+            "open": [99.0, 100.0, 101.0],
+            "high": [109.0, 110.0, 111.0],
+            "low": [94.0, 95.0, 96.0],
+            "close": [104.0, 105.0, 106.0],
+            "volume": [999.0, 1000.0, 1001.0],
+            "close_oi": [799.0, 800.0, 801.0],
         }
     )
-    minute_serial = pd.DataFrame(
+    minute_chunk_a = pd.DataFrame(
         {
-            "datetime": pd.to_datetime(["2025-01-06 09:31:00", "2025-01-06 09:32:00"]),
-            "open": [pd.NA, pd.NA],
-            "high": [pd.NA, pd.NA],
-            "low": [pd.NA, pd.NA],
-            "close": [pd.NA, pd.NA],
-            "volume": [pd.NA, pd.NA],
+            "datetime": pd.to_datetime(["2025-01-03 09:31:00", "2025-01-04 09:32:00"]),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [10.0, 12.0],
         }
     )
-
-    class FakeBacktestFinished(Exception):
-        pass
+    minute_chunk_b = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2025-01-01 09:31:00", "2025-01-02 09:32:00"]),
+            "open": [98.0, 99.0],
+            "high": [99.0, 100.0],
+            "low": [97.0, 98.0],
+            "close": [98.5, 99.5],
+            "volume": [9.0, 11.0],
+        }
+    )
 
     class FakeApi:
-        def __init__(self):
-            self.step = 0
+        def __init__(self, anchor_dt):
+            self.anchor_dt = anchor_dt
             self.closed = False
 
         def get_kline_serial(self, symbol, duration_seconds, data_length=None):
             if duration_seconds == 86400:
                 return daily_serial
             if duration_seconds == 60:
-                return minute_serial
+                if self.anchor_dt == date(2025, 1, 5):
+                    return minute_chunk_a
+                if self.anchor_dt == date(2025, 1, 3):
+                    return minute_chunk_b
+                raise AssertionError(f"unexpected minute anchor: {self.anchor_dt}")
             raise AssertionError(f"unexpected duration: {duration_seconds}")
-
-        def wait_update(self, deadline=None, _task=None):
-            self.step += 1
-            if self.step == 1:
-                daily_serial.loc[0, ["open", "high", "low", "close", "volume", "close_oi"]] = [
-                    100.0,
-                    110.0,
-                    95.0,
-                    105.0,
-                    1000.0,
-                    800.0,
-                ]
-                minute_serial.loc[0, ["open", "high", "low", "close", "volume"]] = [
-                    100.0,
-                    101.0,
-                    99.0,
-                    100.5,
-                    10.0,
-                ]
-                return True
-            if self.step == 2:
-                daily_serial.loc[1, ["open", "high", "low", "close", "volume", "close_oi"]] = [
-                    101.0,
-                    111.0,
-                    96.0,
-                    106.0,
-                    1001.0,
-                    801.0,
-                ]
-                minute_serial.loc[1, ["open", "high", "low", "close", "volume"]] = [
-                    101.0,
-                    102.0,
-                    100.0,
-                    101.5,
-                    12.0,
-                ]
-                return True
-            raise FakeBacktestFinished()
 
         def close(self):
             self.closed = True
 
-    fake_tqsdk = type(sys)("tqsdk")
-    fake_tqsdk.BacktestFinished = FakeBacktestFinished
-    monkeypatch.setitem(sys.modules, "tqsdk", fake_tqsdk)
-    monkeypatch.setattr("backtest.phase23._create_backtest_api", lambda **_kwargs: FakeApi())
+    def fake_create_backtest_api(*, start_dt, end_dt, account, password):
+        created["calls"].append((start_dt, end_dt, account, password))
+        api = FakeApi(end_dt)
+        created.setdefault("apis", []).append(api)
+        return api
+
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
+    monkeypatch.setattr("backtest.phase23._create_backtest_api", fake_create_backtest_api)
+    monkeypatch.setattr("backtest.phase23.BACKTEST_ANCHOR_OFFSETS", (1,))
+    monkeypatch.setattr("backtest.phase23.BACKTEST_MINUTE_CHUNK_DAYS", 2)
     monkeypatch.setattr(
         "backtest.phase23.resolve_case_tq_symbol",
         lambda case, api=None: "KQ.m@DCE.lh",
     )
 
-    daily_df, minute_df = load_case_frames_with_tqbacktest(
+    first_daily, first_minute = load_case_frames_with_tqbacktest(
         case=case,
         config={"tqsdk": {"account": "acct", "password": "pwd"}},
     )
 
-    assert len(daily_df) == 2
-    assert float(daily_df.iloc[-1]["close"]) == 106.0
-    assert len(minute_df) == 2
-    assert float(minute_df.iloc[-1]["close"]) == 101.5
+    warmup_bars = _daily_warmup_bars({"tqsdk": {"account": "acct", "password": "pwd"}})
+    daily_path, minute_path = _backtest_cache_paths(case=case, warmup_bars=warmup_bars)
+    assert daily_path.exists() is True
+    assert minute_path.exists() is True
+    pd.testing.assert_frame_equal(pd.read_parquet(daily_path), first_daily)
+    pd.testing.assert_frame_equal(pd.read_parquet(minute_path), first_minute)
 
-
-def test_load_case_frames_with_tqbacktest_drives_updates_without_task_pin(monkeypatch):
-    case = _make_case("long")
-    wait_kwargs: list[dict[str, object]] = []
-
-    daily_serial = pd.DataFrame(
-        {
-            "datetime": pd.to_datetime(["2025-01-03"]),
-            "open": [pd.NA],
-            "high": [pd.NA],
-            "low": [pd.NA],
-            "close": [pd.NA],
-            "volume": [pd.NA],
-            "close_oi": [pd.NA],
-        }
+    monkeypatch.setattr(
+        "backtest.phase23._create_backtest_api",
+        lambda **_kwargs: pytest.fail("cached rerun should not open tqbacktest"),
     )
-    minute_serial = pd.DataFrame(
-        {
-            "datetime": pd.to_datetime(["2025-01-06 09:31:00"]),
-            "open": [pd.NA],
-            "high": [pd.NA],
-            "low": [pd.NA],
-            "close": [pd.NA],
-            "volume": [pd.NA],
-        }
+    monkeypatch.setattr(
+        "backtest.phase23.resolve_case_tq_symbol",
+        lambda *args, **kwargs: pytest.fail("cached rerun should not resolve tq symbol"),
     )
-    daily_serial.__dict__["_task"] = "daily-task"
-    minute_serial.__dict__["_task"] = "minute-task"
+
+    second_daily, second_minute = load_case_frames_with_tqbacktest(case=case, config={})
+
+    pd.testing.assert_frame_equal(second_daily, first_daily)
+    pd.testing.assert_frame_equal(second_minute, first_minute)
+
+
+def test_open_backtest_anchor_api_retries_future_offsets(monkeypatch):
+    attempts: list[tuple[date, date]] = []
 
     class FakeApi:
-        def get_kline_serial(self, symbol, duration_seconds, data_length=None):
-            if duration_seconds == 86400:
-                return daily_serial
-            if duration_seconds == 60:
-                return minute_serial
-            raise AssertionError(f"unexpected duration: {duration_seconds}")
-
-        def wait_update(self, **kwargs):
-            wait_kwargs.append(kwargs)
-            daily_serial.loc[0, ["open", "high", "low", "close", "volume", "close_oi"]] = [
-                100.0,
-                110.0,
-                95.0,
-                105.0,
-                1000.0,
-                800.0,
-            ]
-            minute_serial.loc[0, ["open", "high", "low", "close", "volume"]] = [
-                100.0,
-                101.0,
-                99.0,
-                100.5,
-                10.0,
-            ]
-            return False
-
         def close(self):
             return None
 
-    monkeypatch.setattr("backtest.phase23._create_backtest_api", lambda **_kwargs: FakeApi())
-    monkeypatch.setattr(
-        "backtest.phase23.resolve_case_tq_symbol",
-        lambda case, api=None: "KQ.m@DCE.lh",
+    monkeypatch.setattr("backtest.phase23.BACKTEST_ANCHOR_OFFSETS", (1, 3))
+
+    def fake_create_backtest_api(*, start_dt, end_dt, account, password):
+        attempts.append((start_dt, end_dt))
+        if start_dt == date(2025, 2, 1):
+            raise IndexError("holiday calendar gap")
+        return FakeApi()
+
+    monkeypatch.setattr("backtest.phase23._create_backtest_api", fake_create_backtest_api)
+
+    api, anchor_dt = _open_backtest_anchor_api(
+        target_dt=date(2025, 1, 31),
+        account="acct",
+        password="pwd",
     )
 
-    daily_df, minute_df = load_case_frames_with_tqbacktest(
-        case=case,
-        config={"tqsdk": {"account": "acct", "password": "pwd"}},
-    )
-
-    assert len(daily_df) == 1
-    assert len(minute_df) == 1
-    assert wait_kwargs == [{}]
+    assert isinstance(api, FakeApi)
+    assert anchor_dt == date(2025, 2, 3)
+    assert attempts == [
+        (date(2025, 2, 1), date(2025, 2, 1)),
+        (date(2025, 2, 3), date(2025, 2, 3)),
+    ]

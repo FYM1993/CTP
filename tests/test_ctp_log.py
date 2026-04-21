@@ -11,7 +11,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import ctp_log  # noqa: E402
+from shared import ctp_log  # noqa: E402
 
 
 def test_ensure_ctp_logging_uses_run_scoped_log_file(monkeypatch, tmp_path):

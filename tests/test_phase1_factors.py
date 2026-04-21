@@ -8,7 +8,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from phase1_factors import build_reversal_factors  # noqa: E402
+from phase1.factors import build_reversal_factors  # noqa: E402
 
 
 def test_low_price_without_cost_stress_is_not_extreme_reversal() -> None:

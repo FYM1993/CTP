@@ -38,6 +38,8 @@ WINDOW_DIAGNOSTIC_KEYS = (
     "phase2_actionable_days",
     "phase2_actionable_reversal_days",
     "phase2_actionable_trend_days",
+    "phase2_actionable_strategy_reversal_days",
+    "phase2_actionable_strategy_trend_days",
     "phase2_non_actionable_days",
     "phase2_history_insufficient_days",
     "phase2_reject_no_signal_days",
@@ -49,6 +51,8 @@ WINDOW_DIAGNOSTIC_KEYS = (
     "trades_opened",
     "trades_opened_reversal",
     "trades_opened_trend",
+    "trades_opened_strategy_reversal",
+    "trades_opened_strategy_trend",
 )
 
 
@@ -128,12 +132,19 @@ def _empty_aggregate_summary() -> dict[str, float | int]:
         "num_windows_with_trades": 0,
         "num_trades": 0,
         "wins": 0,
+        "losses": 0,
         "win_rate": 0.0,
         "avg_pnl": 0.0,
         "total_pnl": 0.0,
+        "avg_win_pnl": 0.0,
+        "avg_loss_pnl": 0.0,
+        "max_win_pnl": 0.0,
+        "max_loss_pnl": 0.0,
         "tp1_hits": 0,
         "tp2_hits": 0,
         "stop_hits": 0,
+        "loss_stop_hits": 0,
+        "protective_stop_hits": 0,
     }
 
 
@@ -159,6 +170,7 @@ def run_walk_forward_from_frames(
     step_days: int,
     plan_factory=make_trade_plan_from_phase2,
     run_window=run_case_from_frames,
+    capture_debug: bool = False,
 ) -> RollingBacktestResult:
     min_history_bars = max(int((pre_market_cfg or {}).get("min_history_bars", 60)), 1)
     effective_start = find_effective_start_date(
@@ -211,6 +223,7 @@ def run_walk_forward_from_frames(
             plan_factory=plan_factory,
             pre_market_cfg=pre_market_cfg,
             signal_cfg=signal_cfg,
+            capture_debug=capture_debug,
         )
         window_results.append(RollingWindowResult(window=window, result=result))
         aggregate_trades.extend(result.trades)

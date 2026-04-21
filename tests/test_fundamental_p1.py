@@ -9,6 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -267,6 +268,39 @@ def test_save_targets_renders_trend_plan_from_entry_family(monkeypatch, tmp_path
     assert "**入场信号**: [顺势] 顺势回撤(Pullback)" in md_text
     assert "- 信号详情: markup 阶段顺势回踩" in md_text
     assert "尚无有效入场信号" not in md_text
+
+
+def test_save_targets_cleans_nested_numpy_in_strategy_results(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    strategy_results = {
+        "reversal": {
+            "actionable": [
+                {
+                    "symbol": "LH0",
+                    "score": np.int64(31),
+                    "rr": np.float64(2.0),
+                }
+            ]
+        }
+    }
+
+    daily_workflow.save_targets([], [], phase1_summary=summary, grouped_results=strategy_results)
+
+    payload = json.loads((tmp_path / "2026-04-16_targets.json").read_text(encoding="utf-8"))
+    saved = payload["strategy_results"]["reversal"]["actionable"][0]
+    assert saved["score"] == 31
+    assert saved["rr"] == 2.0
 
 
 def test_load_targets_normalizes_legacy_trend_snapshot(monkeypatch, tmp_path) -> None:

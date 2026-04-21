@@ -8,9 +8,9 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from phase1_pipeline import select_top_candidates  # noqa: E402
-import phase1_pipeline  # noqa: E402
-import daily_workflow  # noqa: E402
+from phase1.pipeline import build_phase1_candidates, select_top_candidates  # noqa: E402
+from phase1 import pipeline as phase1_pipeline  # noqa: E402
+from cli import daily_workflow  # noqa: E402
 import pandas as pd  # noqa: E402
 
 
@@ -87,6 +87,92 @@ def test_select_top_candidates_respects_symbol_specific_threshold() -> None:
     assert [row["symbol"] for row in selected] == ["M0"]
 
 
+def test_build_phase1_candidates_keeps_rows_below_threshold_for_diagnostics(monkeypatch) -> None:
+    df = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=120, freq="D")})
+    raw_candidates = {
+        "LH0": {
+            "symbol": "LH0",
+            "name": "生猪",
+            "exchange": "dce",
+            "reversal_score": 62.0,
+            "trend_score": 15.0,
+            "data_coverage": 0.8,
+            "labels": ["反转候选"],
+            "state_labels": ["低位出清"],
+            "reason_summary": "养殖利润深亏",
+            "reversal_direction": "long",
+            "trend_direction": "short",
+        },
+        "M0": {
+            "symbol": "M0",
+            "name": "豆粕",
+            "exchange": "dce",
+            "reversal_score": 59.0,
+            "trend_score": 18.0,
+            "data_coverage": 0.8,
+            "labels": ["反转候选"],
+            "state_labels": ["低位出清"],
+            "reason_summary": "库存偏紧",
+            "reversal_direction": "long",
+            "trend_direction": "short",
+        },
+    }
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_build_candidate",
+        lambda *, info, df, as_of_date=None: dict(raw_candidates[info["symbol"]]),
+    )
+
+    candidates = build_phase1_candidates(
+        all_data={"LH0": df, "M0": df},
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ],
+        threshold=10.0,
+        config={
+            "fundamental_screening": {
+                "top_n": 5,
+                "categories": {
+                    "meal": {
+                        "threshold": 3.0,
+                        "symbols": ["M0"],
+                    }
+                },
+            }
+        },
+    )
+
+    assert [row["symbol"] for row in candidates] == ["LH0", "M0"]
+    assert candidates[0]["entry_threshold"] == 65.0
+    assert candidates[1]["entry_threshold"] == 58.0
+    assert candidates[0]["entry_pool_reason"] == "反转机会分未达标（反转62 / 趋势15；门槛65）"
+    assert candidates[1]["entry_pool_reason"] == "反转机会分达标（反转59 / 趋势18）"
+
+    selected = phase1_pipeline.run_phase1_pipeline(
+        all_data={"LH0": df, "M0": df},
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ],
+        threshold=10.0,
+        config={
+            "fundamental_screening": {
+                "top_n": 5,
+                "categories": {
+                    "meal": {
+                        "threshold": 3.0,
+                        "symbols": ["M0"],
+                    }
+                },
+            }
+        },
+    )
+
+    assert [row["symbol"] for row in selected] == ["M0"]
+
+
 def test_phase1_output_has_attention_not_direction() -> None:
     candidate = {
         "symbol": "LH0",
@@ -102,6 +188,8 @@ def test_phase1_output_has_attention_not_direction() -> None:
 
 
 def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch, capsys) -> None:
+    seen_logs: list[str] = []
+
     monkeypatch.setattr(
         daily_workflow,
         "load_config",
@@ -130,7 +218,7 @@ def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch, capsys
     )
     monkeypatch.setattr(
         daily_workflow,
-        "run_phase1_pipeline",
+        "build_phase1_candidates",
         lambda *, all_data, symbols, threshold, config: [
             {
                 "symbol": "LH0",
@@ -153,6 +241,17 @@ def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch, capsys
         ],
         raising=False,
     )
+    monkeypatch.setattr(
+        daily_workflow,
+        "select_top_candidates",
+        lambda rows, top_n: list(rows),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: seen_logs.append(msg % args if args else msg),
+    )
 
     rows = daily_workflow.phase_1_screen(
         {"LH0": [None] * 60},
@@ -171,6 +270,81 @@ def test_phase_1_screen_adds_bridge_fields_without_direction(monkeypatch, capsys
     assert row["state_labels"] == ["低位出清"]
     assert row["data_coverage"] == 0.75
     assert row["reason_summary"] == "库存下降"
+    assert any("Phase 1关注池（门槛通过）: 1 个品种，其中反转线1 个" in line for line in seen_logs)
+    assert not any("进入 Phase 2 候选池" in line for line in seen_logs)
+
+
+def test_build_phase1_diagnostics_reports_factor_hits_and_blocked_rows() -> None:
+    rows = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "attention_score": 70.0,
+            "reversal_score": 62.0,
+            "trend_score": 18.0,
+            "entry_threshold": 58.0,
+            "data_coverage": 0.75,
+            "labels": ["反转候选"],
+            "inv_change_4wk": 3.0,
+            "receipt_change": None,
+            "seasonal_signal": None,
+            "hog_profit": -12.0,
+            "reason_summary": "养殖利润深亏",
+        },
+        {
+            "symbol": "M0",
+            "name": "豆粕",
+            "attention_score": 61.0,
+            "reversal_score": 61.0,
+            "trend_score": 12.0,
+            "entry_threshold": 63.0,
+            "data_coverage": 0.75,
+            "labels": ["反转候选"],
+            "inv_change_4wk": -18.0,
+            "receipt_change": -120.0,
+            "seasonal_signal": None,
+            "hog_profit": None,
+            "reason_summary": "库存偏紧",
+        },
+        {
+            "symbol": "CF0",
+            "name": "棉花",
+            "attention_score": 58.0,
+            "reversal_score": 22.0,
+            "trend_score": 58.0,
+            "entry_threshold": 63.0,
+            "data_coverage": 0.5,
+            "labels": [],
+            "inv_change_4wk": None,
+            "receipt_change": None,
+            "seasonal_signal": 0.8,
+            "hog_profit": None,
+            "reason_summary": "季节性偏强",
+        },
+    ]
+
+    diag = daily_workflow._build_phase1_diagnostics(rows, selected_rows=[rows[0]])
+
+    assert diag["num_rows"] == 3
+    assert diag["num_eligible"] == 1
+    assert diag["num_selected"] == 1
+    assert diag["factor_hits"] == {
+        "inventory": 2,
+        "receipt": 1,
+        "seasonality": 1,
+        "hog": 1,
+    }
+    assert diag["label_counts"] == {
+        "reversal": 2,
+        "trend": 0,
+        "dual": 0,
+        "low_coverage": 0,
+    }
+    assert diag["threshold_counts"] == {58.0: 1, 63.0: 2}
+    assert diag["blocked_preview"][0]["symbol"] == "M0"
+    assert diag["blocked_preview"][0]["dominant_score"] == 61.0
+    assert diag["blocked_preview"][0]["entry_threshold"] == 63.0
+    assert diag["blocked_reversal_labeled"] == 1
 
 
 def test_run_phase1_pipeline_builds_reversal_candidate_from_distress(monkeypatch) -> None:
@@ -215,7 +389,158 @@ def test_run_phase1_pipeline_builds_reversal_candidate_from_distress(monkeypatch
     assert row["labels"] == ["反转候选"]
     assert "低位出清" in row["state_labels"]
     assert row["reversal_score"] > row["trend_score"]
+    assert row["reversal_direction"] == "long"
     assert row["attention_score"] >= 55.0
+
+
+def test_build_candidate_keeps_hog_reversal_high_when_spot_is_still_low(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    closes = [12000.0] * 120
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_price_stats",
+        lambda frame: {
+            "price": 11290.0,
+            "range_pct": 40.38,
+            "price_percentile_300d": 40.38,
+            "price_percentile_full": 23.84,
+            "low_persistence_days": 0,
+            "high_persistence_days": 0,
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_historical_proxy_scores",
+        lambda *, df, stats: (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 0.0,
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_inventory",
+        lambda symbol, as_of_date=None: {
+            "inv_now": 1210.0,
+            "inv_change_4wk": -1.2,
+            "inv_cumulating_weeks": 3,
+            "inv_percentile": 96.8,
+            "inv_trend": "持平",
+        },
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_warehouse_receipt", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_seasonality", lambda frame, as_of_date=None: None)
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_hog_fundamentals",
+        lambda as_of_date=None: {
+            "price": 9.9,
+            "price_5d_ago": 8.77,
+            "price_trend": 12.88,
+            "cost": 2396.0,
+            "profit_margin": -50.4,
+            "spot_price_percentile": 17.3,
+            "data_status": "full",
+        },
+    )
+
+    cand = phase1_pipeline._build_candidate(
+        info={"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+        df=df,
+    )
+
+    assert cand is not None
+    assert cand["reversal_score"] >= 60.0
+    assert "反转候选" in cand["labels"] or "双标签候选" in cand["labels"]
+
+
+def test_build_candidate_keeps_structural_distress_reversal_high_after_small_rebound(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    closes = [42000.0] * 120
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_price_stats",
+        lambda frame: {
+            "price": 42685.0,
+            "range_pct": 38.96,
+            "price_percentile_300d": 38.96,
+            "price_percentile_full": 38.96,
+            "low_persistence_days": 39,
+            "high_persistence_days": 0,
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_historical_proxy_scores",
+        lambda *, df, stats: (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 0.0,
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_inventory",
+        lambda symbol, as_of_date=None: {
+            "inv_now": 12580.0,
+            "inv_change_4wk": 2.69,
+            "inv_cumulating_weeks": 6,
+            "inv_percentile": 100.0,
+            "inv_trend": "累库",
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_warehouse_receipt",
+        lambda symbol, as_of_date=None: {
+            "receipt_total": 12580.0,
+            "receipt_change": 40.0,
+            "exchange": "GFEX",
+        },
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_seasonality", lambda frame, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+
+    cand = phase1_pipeline._build_candidate(
+        info={"symbol": "PS0", "name": "多晶硅", "exchange": "gfex"},
+        df=df,
+    )
+
+    assert cand is not None
+    assert cand["reversal_score"] >= 60.0
+    assert "反转候选" in cand["labels"] or "双标签候选" in cand["labels"]
 
 
 def test_run_phase1_pipeline_builds_trend_candidate_from_tightening(monkeypatch) -> None:
@@ -277,7 +602,169 @@ def test_run_phase1_pipeline_builds_trend_candidate_from_tightening(monkeypatch)
     assert row["labels"] == ["趋势候选"]
     assert "紧平衡强化" in row["state_labels"]
     assert row["trend_score"] > row["reversal_score"]
+    assert row["trend_direction"] == "long"
     assert row["attention_score"] >= 55.0
+
+
+def test_run_phase1_pipeline_passes_as_of_date_to_factor_fetchers(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [100.0] * 120,
+            "high": [101.0] * 120,
+            "low": [99.0] * 120,
+            "close": [100.0] * 120,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+    seen: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_inventory",
+        lambda symbol, as_of_date=None: seen.append(("inventory", as_of_date)) or None,
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_warehouse_receipt",
+        lambda symbol, as_of_date=None: seen.append(("receipt", as_of_date)) or None,
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_seasonality",
+        lambda frame, as_of_date=None: seen.append(("seasonality", as_of_date)) or None,
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_hog_fundamentals",
+        lambda as_of_date=None: seen.append(("hog", as_of_date)) or None,
+    )
+
+    as_of_date = pd.Timestamp("2025-04-15").date()
+    phase1_pipeline.run_phase1_pipeline(
+        all_data={"LH0": df},
+        symbols=[{"symbol": "LH0", "name": "生猪", "exchange": "dce"}],
+        threshold=10.0,
+        config={"fundamental_screening": {"top_n": 5}},
+        as_of_date=as_of_date,
+    )
+
+    assert seen == [
+        ("inventory", as_of_date),
+        ("receipt", as_of_date),
+        ("seasonality", as_of_date),
+        ("hog", as_of_date),
+    ]
+
+
+def test_run_phase1_pipeline_historical_replay_uses_trend_proxy_when_external_factors_missing(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=180, freq="D")
+    closes = [7000 + i * 18 for i in range(180)]
+    oi = [10000 + i * 25 for i in range(180)]
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": [c + 40 for c in closes],
+            "low": [c - 40 for c in closes],
+            "close": closes,
+            "volume": [1000] * 180,
+            "oi": oi,
+        }
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_inventory", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_warehouse_receipt", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_seasonality", lambda frame, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+
+    rows = phase1_pipeline.run_phase1_pipeline(
+        all_data={"M0": df},
+        symbols=[{"symbol": "M0", "name": "豆粕", "exchange": "dce"}],
+        threshold=10.0,
+        config={"fundamental_screening": {"top_n": 5, "default_threshold": 3}},
+        as_of_date=pd.Timestamp("2025-06-29").date(),
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["labels"] == ["趋势候选"]
+    assert row["trend_score"] >= 55.0
+    assert row["trend_direction"] == "long"
+    assert "历史代理" in row["reason_summary"]
+
+
+def test_run_phase1_pipeline_live_uses_trend_proxy_when_external_factors_missing(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=180, freq="D")
+    closes = [7000 + i * 18 for i in range(180)]
+    oi = [10000 + i * 25 for i in range(180)]
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": [c + 40 for c in closes],
+            "low": [c - 40 for c in closes],
+            "close": closes,
+            "volume": [1000] * 180,
+            "oi": oi,
+        }
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_inventory", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_warehouse_receipt", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_seasonality", lambda frame, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+
+    rows = phase1_pipeline.run_phase1_pipeline(
+        all_data={"M0": df},
+        symbols=[{"symbol": "M0", "name": "豆粕", "exchange": "dce"}],
+        threshold=10.0,
+        config={"fundamental_screening": {"top_n": 5, "default_threshold": 3}},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["labels"] == ["趋势候选"]
+    assert row["trend_score"] >= 55.0
+    assert row["trend_direction"] == "long"
+    assert "历史代理" in row["reason_summary"]
+
+
+def test_run_phase1_pipeline_historical_replay_uses_reversal_proxy_when_external_factors_missing(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=180, freq="D")
+    base = [22000 - i * 55 for i in range(170)]
+    closes = base + [12550, 12480, 12420, 12380, 12360, 12340, 12320, 12300, 12280, 12260]
+    oi = [15000 - i * 10 for i in range(180)]
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": [c + 80 for c in closes],
+            "low": [c - 80 for c in closes],
+            "close": closes,
+            "volume": [1000] * 180,
+            "oi": oi,
+        }
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_inventory", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_warehouse_receipt", lambda symbol, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_seasonality", lambda frame, as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+
+    rows = phase1_pipeline.run_phase1_pipeline(
+        all_data={"LH0": df},
+        symbols=[{"symbol": "LH0", "name": "生猪", "exchange": "dce"}],
+        threshold=10.0,
+        config={"fundamental_screening": {"top_n": 5, "default_threshold": 3}},
+        as_of_date=pd.Timestamp("2025-06-29").date(),
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["labels"] == ["反转候选"]
+    assert row["reversal_score"] >= 55.0
+    assert row["reversal_direction"] == "long"
+    assert "历史代理" in row["reason_summary"]
 
 
 def test_phase_2_premarket_uses_resolved_direction_before_analyze(monkeypatch) -> None:
@@ -400,3 +887,225 @@ def test_phase_2_premarket_falls_back_to_stronger_side_when_resolver_watches(mon
     assert calls[0]["direction"] == "short"
     assert watchlist[0]["direction"] == "short"
     assert watchlist[0]["phase2_decision"] == "watch"
+
+
+def test_run_dual_strategy_phase2_merges_results_with_strategy_family(monkeypatch) -> None:
+    reversal_candidates = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "labels": ["反转候选"],
+            "reversal_score": 88.0,
+            "trend_score": 20.0,
+            "attention_score": 76.0,
+        },
+    ]
+    trend_candidates = [
+        {
+            "symbol": "RM0",
+            "name": "菜粕",
+            "labels": [],
+            "reversal_score": 18.0,
+            "trend_score": 78.0,
+            "attention_score": 74.0,
+        }
+    ]
+
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_reversal_strategy_phase2",
+        lambda candidates, config, max_picks: (
+            [
+                {
+                    "symbol": "LH0",
+                    "name": "生猪",
+                    "direction": "long",
+                    "score": 32.0,
+                    "rrf_score": 0.15,
+                    "strategy_family": "reversal_fundamental",
+                }
+            ],
+            [],
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_trend_strategy_phase2",
+        lambda candidates, config, max_picks: (
+            [
+                {
+                    "symbol": "RM0",
+                    "name": "菜粕",
+                    "direction": "short",
+                    "score": -29.0,
+                    "rrf_score": 0.14,
+                    "strategy_family": "trend_following",
+                }
+            ],
+            [],
+        ),
+        raising=False,
+    )
+
+    actionable, watchlist, grouped = daily_workflow.run_dual_strategy_phase2(
+        reversal_candidates,
+        trend_candidates,
+        {"pre_market": {}},
+        max_picks=4,
+    )
+
+    assert [row["strategy_family"] for row in actionable] == [
+        "reversal_fundamental",
+        "trend_following",
+    ]
+    assert watchlist == []
+    assert set(grouped.keys()) == {"reversal_fundamental", "trend_following"}
+
+
+def test_main_builds_reversal_and_trend_universes_separately(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(daily_workflow, "phase_0_prefetch", lambda: {"LH0": "lh", "RM0": "rm"})
+    monkeypatch.setattr(
+        daily_workflow,
+        "phase_1_screen",
+        lambda all_data, threshold=10: calls.append(("phase1", sorted(all_data.keys()))) or [
+            {
+                "symbol": "LH0",
+                "name": "生猪",
+                "labels": ["反转候选"],
+                "reversal_score": 88.0,
+                "trend_score": 18.0,
+                "attention_score": 75.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "build_trend_universe",
+        lambda all_data, config: calls.append(("trend_universe", sorted(all_data.keys()))) or [
+            {
+                "symbol": "RM0",
+                "name": "菜粕",
+                "labels": [],
+                "reversal_score": 0.0,
+                "trend_score": 78.0,
+                "attention_score": 70.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_dual_strategy_phase2",
+        lambda reversal_candidates, trend_candidates, config, max_picks=6: (
+            calls.append(("phase2", [c["symbol"] for c in reversal_candidates], [c["symbol"] for c in trend_candidates]))
+            or ([], [], {"reversal_fundamental": {"actionable": [], "watchlist": []}, "trend_following": {"actionable": [], "watchlist": []}})
+        ),
+    )
+    monkeypatch.setattr(daily_workflow, "save_targets", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow, "build_phase1_summary", lambda **kwargs: {})
+    monkeypatch.setattr(daily_workflow, "get_request_count", lambda: 0)
+    monkeypatch.setattr(
+        daily_workflow,
+        "load_config",
+        lambda: {"fundamental_screening": {"top_n": 5}, "phase1": {"top_n": 5}},
+    )
+    monkeypatch.setattr(
+        daily_workflow.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: type(
+            "Args",
+            (),
+            {
+                "resume": False,
+                "threshold": 10.0,
+                "skip_screen": False,
+                "max_picks": 3,
+                "no_monitor": True,
+                "period": "5",
+                "interval": 60,
+            },
+        )(),
+    )
+
+    daily_workflow.main()
+
+    assert calls == [
+        ("phase1", ["LH0", "RM0"]),
+        ("trend_universe", ["LH0", "RM0"]),
+        ("phase2", ["LH0"], ["RM0"]),
+    ]
+
+
+def test_run_trend_strategy_phase2_accepts_trend_universe_without_labels(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    monkeypatch.setattr(
+        daily_workflow,
+        "get_daily",
+        lambda symbol: pd.DataFrame({"close": [100.0, 101.0, 102.0]}),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "score_signals",
+        lambda df, direction, cfg: {"trend": 14.0, "volume": 0.0, "wyckoff": -2.0},
+    )
+    monkeypatch.setattr(daily_workflow, "resolve_phase2_direction", lambda **kwargs: "long")
+
+    def fake_build_trade_plan_from_daily_df(**kwargs) -> dict:
+        calls.append(
+            {
+                "symbol": kwargs["symbol"],
+                "name": kwargs["name"],
+                "direction": kwargs["direction"],
+                "fund_screen_score": kwargs["cfg"]["fund_screen_score"],
+                "reason": kwargs["cfg"]["reason"],
+            }
+        )
+        return {
+            "symbol": kwargs["symbol"],
+            "name": kwargs["name"],
+            "direction": kwargs["direction"],
+            "score": 12.0,
+            "actionable": True,
+            "entry": 101.0,
+            "stop": 96.0,
+            "tp1": 110.0,
+            "rr": 1.8,
+            "reversal_status": {"signal_strength": 0.2, "next_expected": "继续观察"},
+        }
+
+    monkeypatch.setattr(
+        daily_workflow.trend_pre_market,
+        "build_trade_plan_from_daily_df",
+        fake_build_trade_plan_from_daily_df,
+    )
+
+    actionable, watchlist = daily_workflow.run_trend_strategy_phase2(
+        [
+            {
+                "symbol": "RM0",
+                "name": "菜粕",
+                "labels": [],
+                "reversal_score": 21.0,
+                "trend_score": 78.0,
+                "attention_score": 9.0,
+                "entry_pool_reason": "趋势机会分达标",
+            }
+        ],
+        {"pre_market": {"direction_delta": 12.0}},
+        max_picks=3,
+    )
+
+    assert len(actionable) == 1
+    assert watchlist == []
+    assert calls == [
+        {
+            "symbol": "RM0",
+            "name": "菜粕",
+            "direction": "long",
+            "fund_screen_score": 78.0,
+            "reason": "趋势筛选+78, 趋势机会分达标",
+        }
+    ]

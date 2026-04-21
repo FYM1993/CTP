@@ -10,7 +10,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from backtest_models import BacktestCase, BacktestResult, TradePlan, TradeRecord  # noqa: E402
+from backtest.models import BacktestCase, BacktestResult, TradePlan, TradeRecord  # noqa: E402
 
 
 def test_backtest_case_stores_date_objects():
@@ -21,6 +21,7 @@ def test_backtest_case_stores_date_objects():
         direction="long",
         start_dt=date(2025, 1, 1),
         end_dt=date(2025, 12, 31),
+        strategy_family="reversal_fundamental",
         note="baseline long case",
     )
 
@@ -30,6 +31,7 @@ def test_backtest_case_stores_date_objects():
     assert case.direction == "long"
     assert case.start_dt == date(2025, 1, 1)
     assert case.end_dt == date(2025, 12, 31)
+    assert case.strategy_family == "reversal_fundamental"
     assert case.note == "baseline long case"
     assert isinstance(case.start_dt, date)
     assert isinstance(case.end_dt, date)
@@ -135,11 +137,13 @@ def test_backtest_result_stores_case_trades_and_summary():
         case_id="lh0_long",
         trades=[record],
         summary={"trade_count": 1, "win_rate": 1.0},
+        diagnostics={"phase2_actionable_days": 3},
     )
 
     assert result.case_id == "lh0_long"
     assert result.trades == [record]
     assert result.summary == {"trade_count": 1, "win_rate": 1.0}
+    assert result.diagnostics == {"phase2_actionable_days": 3}
 
     try:
         result.summary = {"trade_count": 2}  # type: ignore[misc]

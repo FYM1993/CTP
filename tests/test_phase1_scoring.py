@@ -8,7 +8,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from phase1_scoring import build_labels, calc_attention_raw  # noqa: E402
+from phase1.scoring import build_labels, calc_attention_raw  # noqa: E402
 
 
 def test_build_labels_double_label_candidate() -> None:

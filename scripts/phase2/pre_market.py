@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from shared.ctp_log import get_log_path, get_logger
+from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
 from data_cache import get_daily
 from phase2.direction import choose_phase2_direction as _choose_phase2_direction
 
@@ -29,7 +30,7 @@ from wyckoff import (
     wyckoff_phase, vsa_scan, analyze_oi, oi_divergence,
     analyze_volume_pattern, detect_climax, detect_spring_upthrust,
     detect_sos_sow, relative_volume, close_position,
-    assess_reversal_status,
+    assess_reversal_status, REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO,
 )
 
 
@@ -203,15 +204,15 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     # 1. 均线排列 (15) — 综合价格位置和均线排列
     ma_cfg = cfg.get("ma_windows", [5, 10, 20, 60, 120])
     mas = {w: calc_ma(close, w).iloc[-1] for w in ma_cfg}
-    all_ma_vals = [mas[w] for w in ma_cfg if w in mas]
+    all_ma_vals = [float(mas[w]) for w in ma_cfg if w in mas and np.isfinite(mas[w])]
     if all_ma_vals:
         # (a) 价格在均线上方/下方的数量: 全在上方=多头, 全在下方=空头
         above_count = sum(1 for m in all_ma_vals if last > m)
         price_vs_ma = (above_count / len(all_ma_vals) - 0.5) * 2  # -1~+1
 
         # (b) 均线排列方向: 短均 vs 长均
-        short_mas = [mas[w] for w in ma_cfg[:3] if w in mas]
-        long_mas = [mas[w] for w in ma_cfg[3:] if w in mas]
+        short_mas = [float(mas[w]) for w in ma_cfg[:3] if w in mas and np.isfinite(mas[w])]
+        long_mas = [float(mas[w]) for w in ma_cfg[3:] if w in mas and np.isfinite(mas[w])]
         if short_mas and long_mas:
             alignment = np.sign(np.mean(short_mas) / np.mean(long_mas) - 1)
         else:
@@ -352,10 +353,88 @@ def _score_gate(direction: str, total: float, threshold: float = 20.0) -> bool:
     return total < -threshold
 
 
+def _soft_countertrend_score_gate(direction: str, total: float, threshold: float = 15.0) -> bool:
+    if direction == "long":
+        return total > -threshold
+    return total < threshold
+
+
 def _directional_value_ok(direction: str, value: float) -> bool:
     if direction == "long":
         return value > 0
     return value < 0
+
+
+def _reward_risk(direction: str, *, entry: float, target: float, stop: float) -> float:
+    if direction == "long":
+        return (target - entry) / (entry - stop + 1e-12)
+    return (entry - target) / (stop - entry + 1e-12)
+
+
+def _fresh_reversal_score_gate(direction: str, total: float, reversal: dict) -> bool:
+    return bool(_fresh_reversal_gate_details(direction, total, reversal)["score_gate_passed"])
+
+
+def _fresh_reversal_soft_countertrend_threshold(reversal: dict) -> float:
+    signal_type = str(reversal.get("signal_type") or "")
+    strength = float(reversal.get("signal_strength") or 0.0)
+    threshold = 12.0
+    if signal_type in {"SOS", "SOW"}:
+        threshold += 8.0
+    elif signal_type in {"Spring", "UT"}:
+        threshold += 4.0
+    if strength >= 0.85:
+        threshold += 8.0
+    elif strength >= 0.75:
+        threshold += 4.0
+    return threshold
+
+
+def _fresh_reversal_gate_details(direction: str, total: float, reversal: dict) -> dict[str, float | int | bool]:
+    signal_type = str(reversal.get("signal_type") or "")
+    signal_days_ago_value = reversal.get("signal_days_ago")
+    signal_days_ago = int(signal_days_ago_value) if signal_days_ago_value is not None else (0 if reversal.get("has_signal") else None)
+    strength = float(reversal.get("signal_strength") or 0.0)
+    details: dict[str, float | int | bool] = {
+        "fresh_signal": False,
+        "score_gate_passed": False,
+        "signal_days_ago": signal_days_ago if signal_days_ago is not None else -1,
+        "signal_strength": strength,
+        "soft_countertrend_threshold": 0.0,
+    }
+    if not reversal.get("has_signal"):
+        return details
+    if signal_type not in {"Spring", "SOS", "UT", "SOW"}:
+        return details
+    if signal_days_ago is None or signal_days_ago > REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO:
+        return details
+    details["fresh_signal"] = True
+    if strength < 0.65:
+        return details
+    if _score_gate(direction, total):
+        details["score_gate_passed"] = True
+        return details
+    threshold = _fresh_reversal_soft_countertrend_threshold(reversal)
+    details["soft_countertrend_threshold"] = float(threshold)
+    details["score_gate_passed"] = bool(_soft_countertrend_score_gate(direction, total, threshold=threshold))
+    return details
+
+
+def _reversal_signal_is_fresh(reversal_status: dict) -> bool:
+    signal_days_ago_value = reversal_status.get("signal_days_ago")
+    if not reversal_status.get("has_signal"):
+        return False
+    if signal_days_ago_value is None:
+        return True
+    return int(signal_days_ago_value) <= REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO
+
+
+def _trend_hold_gate(direction: str, total: float, trend_status: dict) -> bool:
+    if not trend_status.get("phase_ok"):
+        return False
+    if trend_status.get("slope_ok") or trend_status.get("trend_indicator_ok"):
+        return True
+    return _soft_countertrend_score_gate(direction, total, threshold=10.0)
 
 
 def _build_reversal_candidate_plan(
@@ -373,6 +452,7 @@ def _build_reversal_candidate_plan(
 ) -> dict | None:
     if not reversal.get("has_signal"):
         return None
+    gate_details = _fresh_reversal_gate_details(direction, total, reversal)
 
     sig_bar = reversal["signal_bar"]
     entry = last
@@ -394,7 +474,6 @@ def _build_reversal_candidate_plan(
         tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
         tp2 = min(tp2_candidates) if tp2_candidates else tp1 * 1.02
 
-        rr = (tp1 - entry) / (entry - stop + 1e-12)
     else:
         stop = sig_bar["high"] + 0.5 * atr
 
@@ -412,17 +491,24 @@ def _build_reversal_candidate_plan(
         tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
         tp2 = max(tp2_candidates) if tp2_candidates else tp1 * 0.98
 
-        rr = (entry - tp1) / (stop - entry + 1e-12)
+    rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
+    admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
 
-    rr_ok = rr >= 1.0
-    score_ok = _score_gate(direction, total)
+    rr_ok = admission_rr >= 1.0
+    score_ok = bool(gate_details["score_gate_passed"])
     return {
         "entry": float(entry),
         "stop": float(stop),
         "tp1": float(tp1),
         "tp2": float(tp2),
         "rr": float(rr),
+        "admission_rr": float(admission_rr),
         "actionable": bool(score_ok and rr_ok),
+        "phase2_score_gate_passed": score_ok,
+        "phase2_rr_gate_passed": rr_ok,
+        "reversal_signal_fresh": bool(gate_details["fresh_signal"]),
+        "reversal_signal_days_ago": int(gate_details["signal_days_ago"]),
+        "reversal_signal_strength": float(gate_details["signal_strength"]),
         "entry_family": "reversal",
         "entry_signal_type": reversal.get("signal_type", ""),
         "entry_signal_detail": reversal.get("signal_detail", ""),
@@ -542,7 +628,6 @@ def _build_trend_candidate_plan(
         tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
         tp2 = min(tp2_candidates) if tp2_candidates else tp1 * 1.02
 
-        rr = (tp1 - entry) / (entry - stop + 1e-12)
     else:
         above_price = [v for v in ma_values if v > entry]
         if signal_type == "TrendBreak":
@@ -565,9 +650,10 @@ def _build_trend_candidate_plan(
         tp2_candidates = [v for v in [tp2_sr, tp2_fib] if v is not None]
         tp2 = max(tp2_candidates) if tp2_candidates else tp1 * 0.98
 
-        rr = (entry - tp1) / (stop - entry + 1e-12)
+    rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
+    admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
 
-    rr_ok = rr >= 1.0
+    rr_ok = admission_rr >= 1.0
     score_ok = _score_gate(direction, total)
     return {
         "entry": float(entry),
@@ -575,10 +661,90 @@ def _build_trend_candidate_plan(
         "tp1": float(tp1),
         "tp2": float(tp2),
         "rr": float(rr),
+        "admission_rr": float(admission_rr),
         "actionable": bool(score_ok and rr_ok),
+        "phase2_score_gate_passed": bool(score_ok),
+        "phase2_rr_gate_passed": bool(rr_ok),
         "entry_family": "trend",
         "entry_signal_type": signal_type,
         "entry_signal_detail": trend_status.get("signal_detail", ""),
+    }
+
+
+def assess_active_trend_hold_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+) -> dict | None:
+    """Evaluate whether an active trend trade should remain valid on the next day."""
+    if df is None or df.empty:
+        return None
+    if len(df) < _phase2_min_history(cfg):
+        return None
+
+    close = df["close"]
+    last = float(close.iloc[-1])
+    atr = float(calc_atr(df, cfg.get("atr_window", 14)).iloc[-1])
+    scores = score_signals(df, direction, cfg)
+    total = float(sum(scores.values()))
+    phase_info = wyckoff_phase(df)
+    trend_status = _assess_trend_continuation(
+        close=close,
+        last=last,
+        direction=direction,
+        scores=scores,
+        total=total,
+        atr=atr,
+        wk_phase=phase_info.phase,
+        cfg=cfg,
+    )
+    hold_valid = _trend_hold_gate(direction, total, trend_status)
+    return {
+        "hold_valid": hold_valid,
+        "score": total,
+        "trend_status": trend_status,
+    }
+
+
+def assess_active_reversal_hold_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+) -> dict | None:
+    """Evaluate whether an active reversal trade should remain valid on the next day."""
+    if df is None or df.empty:
+        return None
+    if len(df) < _phase2_min_history(cfg):
+        return None
+
+    ctx = _build_plan_context(direction=direction, df=df, cfg=cfg)
+    reversal = assess_reversal_status(df, direction, lookback=60)
+    trend_status = _assess_trend_continuation(
+        close=ctx["close"],
+        last=float(ctx["last"]),
+        direction=direction,
+        scores=ctx["scores"],
+        total=float(ctx["total"]),
+        atr=float(ctx["atr"]),
+        wk_phase=str(ctx["wk_phase"]),
+        cfg=cfg,
+    )
+    trend_followthrough = bool(
+        trend_status.get("phase_ok")
+        and trend_status.get("slope_ok")
+        and trend_status.get("trend_indicator_ok")
+    )
+    return {
+        "hold_valid": bool(reversal.get("has_signal") or trend_followthrough),
+        "score": float(ctx["total"]),
+        "reversal_status": reversal,
+        "trend_status": trend_status,
     }
 
 
@@ -589,22 +755,14 @@ def _choose_trade_candidate(candidates: list[dict | None]) -> dict | None:
     return max(available, key=lambda item: (bool(item.get("actionable")), float(item.get("rr", 0.0))))
 
 
-def build_trade_plan_from_daily_df(
-    *,
-    symbol: str,
-    name: str,
-    direction: str,
-    df: pd.DataFrame | None,
-    cfg: dict,
-) -> dict | None:
-    """Build the Phase 2 trade plan from an already-fetched daily DataFrame."""
+def _build_plan_context(*, direction: str, df: pd.DataFrame, cfg: dict) -> dict[str, object]:
     if df is None or df.empty:
-        return None
+        return {}
     if len(df) < _phase2_min_history(cfg):
-        return None
+        return {}
 
     close = df["close"]
-    last = close.iloc[-1]
+    last = float(close.iloc[-1])
 
     scores = score_signals(df, direction, cfg)
     total = float(sum(scores.values()))
@@ -633,88 +791,285 @@ def build_trade_plan_from_daily_df(
     recent_low = df.tail(120)["low"].min()
     fib_targets = calc_fibonacci(recent_high, recent_low, direction, fib_levels)
 
-    atr = calc_atr(df, cfg.get("atr_window", 14)).iloc[-1]
-    reversal = assess_reversal_status(df, direction, lookback=60)
-    trend_status = _assess_trend_continuation(
-        close=close,
-        last=float(last),
-        direction=direction,
-        scores=scores,
-        total=float(total),
-        atr=float(atr),
-        wk_phase=wk_phase,
-        cfg=cfg,
-    )
-    reversal_candidate = _build_reversal_candidate_plan(
-        direction=direction,
-        last=float(last),
-        atr=float(atr),
-        total=float(total),
-        reversal=reversal,
-        supports=supports,
-        resistances=resistances,
-        fib_low=float(fib_low),
-        fib_high=float(fib_high),
-        fib_range=float(fib_range),
-    )
-    trend_candidate = _build_trend_candidate_plan(
-        direction=direction,
-        last=float(last),
-        atr=float(atr),
-        total=float(total),
-        trend_status=trend_status,
-        supports=supports,
-        resistances=resistances,
-        fib_low=float(fib_low),
-        fib_high=float(fib_high),
-        fib_range=float(fib_range),
-    )
-    selected_candidate = _choose_trade_candidate([reversal_candidate, trend_candidate])
+    atr = float(calc_atr(df, cfg.get("atr_window", 14)).iloc[-1])
+    return {
+        "close": close,
+        "last": last,
+        "scores": scores,
+        "total": total,
+        "classical_total": float(classical_total),
+        "wyckoff_total": float(wyckoff_total),
+        "oi_total": float(oi_total),
+        "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
+        "wk_phase": wk_phase,
+        "fib_high": float(fib_high),
+        "fib_low": float(fib_low),
+        "fib_range": float(fib_range),
+        "fib_targets": fib_targets,
+        "supports": supports,
+        "resistances": resistances,
+        "atr": atr,
+    }
 
-    if selected_candidate:
-        entry = selected_candidate["entry"]
-        stop = selected_candidate["stop"]
-        tp1 = selected_candidate["tp1"]
-        tp2 = selected_candidate["tp2"]
-        rr = selected_candidate["rr"]
-        actionable = bool(selected_candidate["actionable"])
-        entry_family = selected_candidate["entry_family"]
-        entry_signal_type = selected_candidate["entry_signal_type"]
-        entry_signal_detail = selected_candidate["entry_signal_detail"]
+
+def _build_plan_payload(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    ctx: dict[str, object],
+    candidate: dict | None,
+    strategy_family: str,
+    reversal_status: dict,
+    trend_status: dict,
+) -> dict:
+    if candidate:
+        entry = float(candidate["entry"])
+        stop = float(candidate["stop"])
+        tp1 = float(candidate["tp1"])
+        tp2 = float(candidate["tp2"])
+        rr = float(candidate["rr"])
+        admission_rr = float(candidate.get("admission_rr", rr))
+        actionable = bool(candidate["actionable"])
+        phase2_score_gate_passed = bool(candidate.get("phase2_score_gate_passed"))
+        phase2_rr_gate_passed = bool(candidate.get("phase2_rr_gate_passed"))
+        reversal_signal_fresh = bool(candidate.get("reversal_signal_fresh"))
+        entry_family = str(candidate.get("entry_family") or "")
+        entry_signal_type = str(candidate.get("entry_signal_type") or "")
+        entry_signal_detail = str(candidate.get("entry_signal_detail") or "")
+        strategy_value = strategy_family
     else:
-        entry, stop, tp1, tp2, rr = last, 0.0, 0.0, 0.0, 0.0
+        entry = float(ctx["last"])
+        stop = 0.0
+        tp1 = 0.0
+        tp2 = 0.0
+        rr = 0.0
+        admission_rr = 0.0
         actionable = False
+        phase2_score_gate_passed = False
+        phase2_rr_gate_passed = False
+        reversal_signal_fresh = _reversal_signal_is_fresh(reversal_status)
         entry_family = ""
         entry_signal_type = ""
         entry_signal_detail = ""
+        strategy_value = ""
 
     return {
         "symbol": symbol,
         "name": name,
         "direction": direction,
-        "score": float(total),
+        "strategy_family": strategy_value,
+        "score": float(ctx["total"]),
         "actionable": actionable,
-        "price": float(last),
-        "entry": float(entry),
-        "stop": float(stop),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "rr": float(rr),
-        "classical_score": float(classical_total),
-        "wyckoff_score": float(wyckoff_total),
-        "oi_score": float(oi_total),
-        "wyckoff_phase": wk_phase,
-        "reason": ", ".join(reason_parts) if reason_parts else "综合中性",
+        "price": float(ctx["last"]),
+        "entry": entry,
+        "stop": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "admission_rr": admission_rr,
+        "phase2_score_gate_passed": phase2_score_gate_passed,
+        "phase2_rr_gate_passed": phase2_rr_gate_passed,
+        "reversal_signal_fresh": reversal_signal_fresh,
+        "classical_score": float(ctx["classical_total"]),
+        "wyckoff_score": float(ctx["wyckoff_total"]),
+        "oi_score": float(ctx["oi_total"]),
+        "wyckoff_phase": str(ctx["wk_phase"]),
+        "reason": str(ctx["reason"]),
         "entry_family": entry_family,
         "entry_signal_type": entry_signal_type,
         "entry_signal_detail": entry_signal_detail,
-        "reversal_status": reversal,
+        "reversal_status": reversal_status,
         "trend_status": trend_status,
-        "support_levels": supports,
-        "resistance_levels": resistances,
-        "fib_targets": fib_targets,
-        "scores": scores,
+        "support_levels": list(ctx["supports"]),
+        "resistance_levels": list(ctx["resistances"]),
+        "fib_targets": dict(ctx["fib_targets"]),
+        "scores": dict(ctx["scores"]),
     }
+
+
+def build_reversal_trade_plan_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+    allow_watch_plan: bool = False,
+) -> dict | None:
+    """Build a reversal-only Phase 2 trade plan from daily bars."""
+    if df is None or df.empty:
+        return None
+    if len(df) < _phase2_min_history(cfg):
+        return None
+
+    ctx = _build_plan_context(direction=direction, df=df, cfg=cfg)
+    reversal = assess_reversal_status(df, direction, lookback=60)
+    trend_status = _assess_trend_continuation(
+        close=ctx["close"],
+        last=float(ctx["last"]),
+        direction=direction,
+        scores=ctx["scores"],
+        total=float(ctx["total"]),
+        atr=float(ctx["atr"]),
+        wk_phase=str(ctx["wk_phase"]),
+        cfg=cfg,
+    )
+    reversal_candidate = _build_reversal_candidate_plan(
+        direction=direction,
+        last=float(ctx["last"]),
+        atr=float(ctx["atr"]),
+        total=float(ctx["total"]),
+        reversal=reversal,
+        supports=ctx["supports"],
+        resistances=ctx["resistances"],
+        fib_low=float(ctx["fib_low"]),
+        fib_high=float(ctx["fib_high"]),
+        fib_range=float(ctx["fib_range"]),
+    )
+    if reversal_candidate is None:
+        if not allow_watch_plan:
+            return None
+        return _build_plan_payload(
+            symbol=symbol,
+            name=name,
+            direction=direction,
+            ctx=ctx,
+            candidate=None,
+            strategy_family=STRATEGY_REVERSAL,
+            reversal_status=reversal,
+            trend_status=trend_status,
+        )
+    return _build_plan_payload(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        ctx=ctx,
+        candidate=reversal_candidate,
+        strategy_family=STRATEGY_REVERSAL,
+        reversal_status=reversal,
+        trend_status=trend_status,
+    )
+
+
+def build_trend_trade_plan_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+    allow_watch_plan: bool = False,
+) -> dict | None:
+    """Build a trend-only Phase 2 trade plan from daily bars."""
+    if df is None or df.empty:
+        return None
+    if len(df) < _phase2_min_history(cfg):
+        return None
+
+    ctx = _build_plan_context(direction=direction, df=df, cfg=cfg)
+    reversal = assess_reversal_status(df, direction, lookback=60)
+    trend_status = _assess_trend_continuation(
+        close=ctx["close"],
+        last=float(ctx["last"]),
+        direction=direction,
+        scores=ctx["scores"],
+        total=float(ctx["total"]),
+        atr=float(ctx["atr"]),
+        wk_phase=str(ctx["wk_phase"]),
+        cfg=cfg,
+    )
+    trend_candidate = _build_trend_candidate_plan(
+        direction=direction,
+        last=float(ctx["last"]),
+        atr=float(ctx["atr"]),
+        total=float(ctx["total"]),
+        trend_status=trend_status,
+        supports=ctx["supports"],
+        resistances=ctx["resistances"],
+        fib_low=float(ctx["fib_low"]),
+        fib_high=float(ctx["fib_high"]),
+        fib_range=float(ctx["fib_range"]),
+    )
+    if trend_candidate is None:
+        if not allow_watch_plan:
+            return None
+        return _build_plan_payload(
+            symbol=symbol,
+            name=name,
+            direction=direction,
+            ctx=ctx,
+            candidate=None,
+            strategy_family=STRATEGY_TREND,
+            reversal_status=reversal,
+            trend_status=trend_status,
+        )
+    return _build_plan_payload(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        ctx=ctx,
+        candidate=trend_candidate,
+        strategy_family=STRATEGY_TREND,
+        reversal_status=reversal,
+        trend_status=trend_status,
+    )
+
+
+def build_trade_plan_from_daily_df(
+    *,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame | None,
+    cfg: dict,
+) -> dict | None:
+    """Build the legacy mixed Phase 2 trade plan from an already-fetched daily DataFrame."""
+    if df is None or df.empty:
+        return None
+    if len(df) < _phase2_min_history(cfg):
+        return None
+
+    reversal_plan = build_reversal_trade_plan_from_daily_df(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        df=df,
+        cfg=cfg,
+    )
+    trend_plan = build_trend_trade_plan_from_daily_df(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        df=df,
+        cfg=cfg,
+    )
+    selected_plan = _choose_trade_candidate([reversal_plan, trend_plan])
+    if selected_plan is not None:
+        return selected_plan
+
+    ctx = _build_plan_context(direction=direction, df=df, cfg=cfg)
+    reversal = assess_reversal_status(df, direction, lookback=60)
+    trend_status = _assess_trend_continuation(
+        close=ctx["close"],
+        last=float(ctx["last"]),
+        direction=direction,
+        scores=ctx["scores"],
+        total=float(ctx["total"]),
+        atr=float(ctx["atr"]),
+        wk_phase=str(ctx["wk_phase"]),
+        cfg=cfg,
+    )
+    return _build_plan_payload(
+        symbol=symbol,
+        name=name,
+        direction=direction,
+        ctx=ctx,
+        candidate=None,
+        strategy_family="",
+        reversal_status=reversal,
+        trend_status=trend_status,
+    )
 
 
 def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | None:
@@ -936,10 +1291,12 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         log.info(f"     止损位:   {plan['stop']:.0f} ({stop_basis})")
         log.info(f"     止盈1:    {plan['tp1']:.0f}")
         log.info(f"     止盈2:    {plan['tp2']:.0f}")
-        log.info(f"     盈亏比:   {plan['rr']:.2f}")
+        log.info(f"     第一止盈盈亏比: {plan['rr']:.2f}")
+        log.info(f"     准入盈亏比:     {plan.get('admission_rr', plan['rr']):.2f}")
         if not plan["actionable"]:
-            if plan["rr"] < 1.0:
-                log.info(f"  ⚠️ 顺势信号存在，但盈亏比({plan['rr']:.2f})不足1.0，谨慎入场")
+            if not plan.get("phase2_rr_gate_passed", False):
+                admission_rr = plan.get("admission_rr", plan["rr"])
+                log.info(f"  ⚠️ 顺势信号存在，但准入盈亏比({admission_rr:.2f})不足1.0，谨慎入场")
             if (direction == "long" and plan["score"] <= 20) or (direction == "short" and plan["score"] >= -20):
                 log.info(f"  ⚠️ 顺势信号存在，但评分({plan['score']:+.0f})未达标，谨慎入场")
     elif reversal["has_signal"]:
@@ -956,12 +1313,14 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         log.info(f"     止损位:   {plan['stop']:.0f} ({stop_basis})")
         log.info(f"     止盈1:    {plan['tp1']:.0f}")
         log.info(f"     止盈2:    {plan['tp2']:.0f}")
-        log.info(f"     盈亏比:   {plan['rr']:.2f}")
+        log.info(f"     第一止盈盈亏比: {plan['rr']:.2f}")
+        log.info(f"     准入盈亏比:     {plan.get('admission_rr', plan['rr']):.2f}")
         log.info(f"     置信度:   {reversal['confidence']:.0%}")
 
         if not plan["actionable"]:
-            if plan["rr"] < 1.0:
-                log.info(f"  ⚠️ 有入场信号但盈亏比({plan['rr']:.2f})不足1.0，谨慎入场")
+            if not plan.get("phase2_rr_gate_passed", False):
+                admission_rr = plan.get("admission_rr", plan["rr"])
+                log.info(f"  ⚠️ 有入场信号但准入盈亏比({admission_rr:.2f})不足1.0，谨慎入场")
             if (direction == "long" and plan["score"] <= 20) or (direction == "short" and plan["score"] >= -20):
                 log.info(f"  ⚠️ 有入场信号但评分({plan['score']:+.0f})未达标，谨慎入场")
     else:

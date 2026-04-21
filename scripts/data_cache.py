@@ -23,7 +23,7 @@
 import time
 import socket
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from contextlib import contextmanager
 
 import pandas as pd
@@ -31,8 +31,8 @@ import numpy as np
 import akshare as aks
 import yaml
 
-from ctp_log import get_logger
-from market_data_tq import (
+from shared.ctp_log import get_logger
+from market.tq import (
     create_tq_api as _create_tq_api,
     fetch_daily_from_tq as _tq_fetch_daily_from_tq,
 )
@@ -225,6 +225,21 @@ def _live_cache_stale() -> bool:
     return now.weekday() >= 5 or _is_after_close()
 
 
+def _normalize_as_of_date(as_of_date: date | datetime | pd.Timestamp | None) -> date | None:
+    if as_of_date is None:
+        return None
+    if isinstance(as_of_date, datetime):
+        return as_of_date.date()
+    if isinstance(as_of_date, pd.Timestamp):
+        return as_of_date.date()
+    return as_of_date
+
+
+def _is_historical_replay(as_of_date: date | datetime | pd.Timestamp | None) -> bool:
+    normalized = _normalize_as_of_date(as_of_date)
+    return normalized is not None and normalized < datetime.now().date()
+
+
 # ============================================================
 #  日线数据
 # ============================================================
@@ -245,7 +260,7 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
     if final_path.exists():
         try:
             df = pd.read_parquet(final_path)
-            if len(df) > 0:
+            if len(df) >= days:
                 return df.tail(days)
         except Exception:
             final_path.unlink(missing_ok=True)
@@ -399,7 +414,7 @@ INVENTORY_NAME_MAP = {
 }
 
 
-def get_inventory(symbol: str) -> dict | None:
+def get_inventory(symbol: str, as_of_date: date | datetime | pd.Timestamp | None = None) -> dict | None:
     """
     获取库存数据（东方财富API）。
 
@@ -413,11 +428,12 @@ def get_inventory(symbol: str) -> dict | None:
     inv_name = INVENTORY_NAME_MAP.get(symbol)
     if not inv_name:
         return None
+    if _is_historical_replay(as_of_date):
+        return None
     try:
         df = aks.futures_inventory_em(symbol=inv_name)
         if df.empty or len(df) < 10:
             return None
-
         df["库存"] = pd.to_numeric(df["库存"], errors="coerce")
         df["增减"] = pd.to_numeric(df["增减"], errors="coerce")
         df = df.dropna(subset=["库存"])
@@ -472,7 +488,7 @@ _shfe_receipt_cache: dict | None = None
 _gfex_receipt_cache: dict | None = None
 
 
-def get_warehouse_receipt(symbol: str) -> dict | None:
+def get_warehouse_receipt(symbol: str, as_of_date: date | datetime | pd.Timestamp | None = None) -> dict | None:
     """
     获取仓单数据（支持上期所 + 广期所）。
 
@@ -482,50 +498,46 @@ def get_warehouse_receipt(symbol: str) -> dict | None:
       exchange: 交易所来源
     """
     global _shfe_receipt_cache, _gfex_receipt_cache
+    anchor_date = _anchor_date(as_of_date)
+    if _shfe_receipt_cache is None or not isinstance(_shfe_receipt_cache, dict):
+        _shfe_receipt_cache = {}
+    if _gfex_receipt_cache is None or not isinstance(_gfex_receipt_cache, dict):
+        _gfex_receipt_cache = {}
 
     # SHFE
     shfe_name = SHFE_RECEIPT_MAP.get(symbol)
     if shfe_name:
-        if _shfe_receipt_cache is None:
-            for _shfe_attempt in range(2):
+        for _offset in range(10):
+            date_str = (anchor_date - timedelta(days=_offset)).strftime("%Y%m%d")
+            if date_str not in _shfe_receipt_cache:
                 try:
-                    _shfe_receipt_cache = aks.futures_shfe_warehouse_receipt()
-                    if _shfe_receipt_cache:
-                        break
+                    _shfe_receipt_cache[date_str] = aks.futures_shfe_warehouse_receipt(date=date_str) or {}
                 except Exception:
-                    if _shfe_attempt == 0:
-                        time.sleep(3)
-            if _shfe_receipt_cache is None:
-                _shfe_receipt_cache = {}
-
-        df = _shfe_receipt_cache.get(shfe_name)
-        if df is not None and hasattr(df, "empty") and not df.empty:
+                    _shfe_receipt_cache[date_str] = {}
+            df = (_shfe_receipt_cache.get(date_str) or {}).get(shfe_name)
+            if df is None or not hasattr(df, "empty") or df.empty:
+                continue
             try:
                 total = pd.to_numeric(df["WRTWGHTS"], errors="coerce").sum()
                 change = pd.to_numeric(df["WRTCHANGE"], errors="coerce").sum()
                 return {"receipt_total": float(total), "receipt_change": float(change),
                         "exchange": "SHFE"}
             except Exception:
-                pass
+                continue
 
     # GFEX
     gfex_key = GFEX_RECEIPT_MAP.get(symbol)
     if gfex_key:
-        if _gfex_receipt_cache is None:
-            for _offset in range(4):
+        for _offset in range(10):
+            date_str = (anchor_date - timedelta(days=_offset)).strftime("%Y%m%d")
+            if date_str not in _gfex_receipt_cache:
                 try:
-                    _d = (datetime.now() - timedelta(days=_offset)).strftime("%Y%m%d")
-                    _cache = aks.futures_gfex_warehouse_receipt(date=_d)
-                    if _cache:
-                        _gfex_receipt_cache = _cache
-                        break
+                    _gfex_receipt_cache[date_str] = aks.futures_gfex_warehouse_receipt(date=date_str) or {}
                 except Exception:
-                    continue
-            if _gfex_receipt_cache is None:
-                _gfex_receipt_cache = {}
-
-        df = _gfex_receipt_cache.get(gfex_key)
-        if df is not None and hasattr(df, "empty") and not df.empty:
+                    _gfex_receipt_cache[date_str] = {}
+            df = (_gfex_receipt_cache.get(date_str) or {}).get(gfex_key)
+            if df is None or not hasattr(df, "empty") or df.empty:
+                continue
             try:
                 today_col = "今日仓单量"
                 change_col = "增减"
@@ -534,7 +546,7 @@ def get_warehouse_receipt(symbol: str) -> dict | None:
                 return {"receipt_total": float(total), "receipt_change": float(change),
                         "exchange": "GFEX"}
             except Exception:
-                pass
+                continue
 
     return None
 
@@ -546,7 +558,61 @@ def get_warehouse_receipt(symbol: str) -> dict | None:
 _hog_cache: dict | None = None
 
 
-def get_hog_fundamentals() -> dict | None:
+def _anchor_date(as_of_date: date | datetime | pd.Timestamp | None = None) -> date:
+    return _normalize_as_of_date(as_of_date) or datetime.now().date()
+
+
+def _normalize_factor_frame(
+    df: pd.DataFrame | None,
+    *,
+    date_col: str = "date",
+    value_col: str | None = None,
+) -> pd.DataFrame | None:
+    if df is None or getattr(df, "empty", False):
+        return None
+    frame = df.copy()
+    if date_col not in frame.columns:
+        return None
+    frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce").dt.date
+    frame = frame.dropna(subset=[date_col])
+    if value_col is not None:
+        if value_col not in frame.columns:
+            return None
+        frame[value_col] = pd.to_numeric(frame[value_col], errors="coerce")
+        frame = frame.dropna(subset=[value_col])
+    if frame.empty:
+        return None
+    return frame.sort_values(by=[date_col]).reset_index(drop=True)
+
+
+def _filter_frame_as_of(
+    df: pd.DataFrame | None,
+    *,
+    anchor_date: date,
+    date_col: str = "date",
+) -> pd.DataFrame | None:
+    if df is None or getattr(df, "empty", False):
+        return None
+    frame = df.loc[df[date_col] <= anchor_date].copy()
+    if frame.empty:
+        return None
+    return frame.reset_index(drop=True)
+
+
+def _latest_factor_value(
+    df: pd.DataFrame | None,
+    *,
+    anchor_date: date,
+    date_col: str = "date",
+    value_col: str = "value",
+) -> float | None:
+    frame = _filter_frame_as_of(df, anchor_date=anchor_date, date_col=date_col)
+    if frame is None or frame.empty:
+        return None
+    return float(frame[value_col].iloc[-1])
+
+
+def get_hog_fundamentals(as_of_date: date | datetime | pd.Timestamp | None = None) -> dict | None:
     """
     获取生猪专项基本面数据。
 
@@ -554,35 +620,56 @@ def get_hog_fundamentals() -> dict | None:
       price: 最新猪价 (元/kg)
       price_5d_ago: 相对最新值约 5 个数据点之前的猪价；序列不足 6 条时取最早可用值
       price_trend: 价格趋势 (%)
+      spot_price_percentile: 当前现货价在历史样本区间中的位置 (%)
       cost: 养殖成本 (元/头)，仅在成本接口成功时存在
       profit_margin: 利润率估算 (正值=盈利)，仅在与 cost 同时可用时计算
       supply: （可选）供应指数最新值；供应接口失败时不返回该字段
       data_status: "full" 核心价与成本均成功；"partial" 仅核心价成功、成本失败
     """
     global _hog_cache
-    if _hog_cache is not None:
-        return _hog_cache
+    anchor_date = _anchor_date(as_of_date)
+    if _hog_cache is None or not isinstance(_hog_cache, dict):
+        _hog_cache = {}
+
+    def _series(cache_key: str, fetcher) -> pd.DataFrame | None:
+        if cache_key in _hog_cache:
+            return _hog_cache[cache_key]
+        try:
+            frame = _normalize_factor_frame(fetcher(), date_col="date", value_col="value")
+        except Exception:
+            frame = None
+        _hog_cache[cache_key] = frame
+        return frame
 
     result: dict = {}
-    try:
-        core_df = aks.futures_hog_core()
-        core_df["value"] = pd.to_numeric(core_df["value"], errors="coerce")
-        result["price"] = float(core_df["value"].iloc[-1])
-        n5 = min(len(core_df), 6)
-        result["price_5d_ago"] = float(core_df["value"].iloc[-n5])
-        p5 = result["price_5d_ago"]
-        result["price_trend"] = (result["price"] / (p5 + 1e-12) - 1) * 100 if p5 > 0 else 0.0
-    except Exception:
+    core_df = _filter_frame_as_of(
+        _series("core", lambda: aks.futures_hog_core(symbol="外三元")),
+        anchor_date=anchor_date,
+        date_col="date",
+    )
+    if core_df is None or core_df.empty:
         return None
+    price_series = core_df["value"].dropna()
+    if price_series.empty:
+        return None
+    result["price"] = float(price_series.iloc[-1])
+    n5 = min(len(price_series), 6)
+    result["price_5d_ago"] = float(price_series.iloc[-n5])
+    p5 = result["price_5d_ago"]
+    result["price_trend"] = (result["price"] / (p5 + 1e-12) - 1) * 100 if p5 > 0 else 0.0
+    low = float(price_series.min())
+    high = float(price_series.max())
+    result["spot_price_percentile"] = (result["price"] - low) / (high - low + 1e-12) * 100
 
-    cost_ok = False
-    try:
-        cost_df = aks.futures_hog_cost()
-        cost_df["value"] = pd.to_numeric(cost_df["value"], errors="coerce")
-        result["cost"] = float(cost_df["value"].iloc[-1])
-        cost_ok = True
-    except Exception:
-        pass
+    cost = _latest_factor_value(
+        _series("cost", lambda: aks.futures_hog_cost(symbol="玉米")),
+        anchor_date=anchor_date,
+        date_col="date",
+        value_col="value",
+    )
+    cost_ok = cost is not None
+    if cost_ok:
+        result["cost"] = float(cost)
 
     result["data_status"] = "full" if cost_ok else "partial"
     price = result.get("price")
@@ -591,14 +678,15 @@ def get_hog_fundamentals() -> dict | None:
         est_revenue = price * 120
         result["profit_margin"] = (est_revenue / cost - 1) * 100
 
-    try:
-        supply_df = aks.futures_hog_supply()
-        supply_df["value"] = pd.to_numeric(supply_df["value"], errors="coerce")
-        result["supply"] = float(supply_df["value"].iloc[-1])
-    except Exception:
-        pass
+    supply = _latest_factor_value(
+        _series("supply", lambda: aks.futures_hog_supply(symbol="猪肉批发价")),
+        anchor_date=anchor_date,
+        date_col="date",
+        value_col="value",
+    )
+    if supply is not None:
+        result["supply"] = float(supply)
 
-    _hog_cache = result
     return result
 
 
@@ -606,7 +694,10 @@ def get_hog_fundamentals() -> dict | None:
 #  季节性分析（从历史日线数据计算）
 # ============================================================
 
-def get_seasonality(df: pd.DataFrame) -> dict | None:
+def get_seasonality(
+    df: pd.DataFrame,
+    as_of_date: date | datetime | pd.Timestamp | None = None,
+) -> dict | None:
     """
     从日线数据中计算季节性特征。
 
@@ -623,8 +714,12 @@ def get_seasonality(df: pd.DataFrame) -> dict | None:
         return None
 
     try:
+        anchor_date = _normalize_as_of_date(as_of_date) or datetime.now().date()
         d = df.copy()
         d["date"] = pd.to_datetime(d["date"])
+        d = d.loc[d["date"].dt.date <= anchor_date].copy()
+        if len(d) < 250:
+            return None
         d["month"] = d["date"].dt.month
         d["year"] = d["date"].dt.year
 
@@ -633,9 +728,13 @@ def get_seasonality(df: pd.DataFrame) -> dict | None:
         monthly["ret"] = (monthly["last"] / monthly["first"] - 1) * 100
         monthly = monthly.dropna(subset=["ret"])
 
-        now = datetime.now()
-        cur_month = now.month
-        hist = monthly.loc[monthly.index.get_level_values("month") == cur_month, "ret"]
+        cur_month = anchor_date.month
+        cur_year = anchor_date.year
+        hist = monthly.loc[
+            (monthly.index.get_level_values("month") == cur_month)
+            & (monthly.index.get_level_values("year") < cur_year),
+            "ret",
+        ]
 
         if len(hist) < 2:
             return None
@@ -645,7 +744,7 @@ def get_seasonality(df: pd.DataFrame) -> dict | None:
 
         cur_data = d[
             (d["date"].dt.month == cur_month)
-            & (d["date"].dt.year == now.year)
+            & (d["date"].dt.year == cur_year)
         ]
         if len(cur_data) >= 2:
             first_close = float(cur_data["close"].iloc[0])

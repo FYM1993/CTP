@@ -887,13 +887,16 @@ def _find_events_with_bars(df: pd.DataFrame, lookback: int = 60):
     return events
 
 
+REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO = 2
+
+
 def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60) -> dict:
     """
     综合评估反转信号状态，决定是否有足够的入场依据。
 
     信号质量要求:
       - 只有 priority >= 2 的事件才算有效（疑似信号 priority=0 不算）
-      - 只有最近3个交易日内的信号才算"新鲜"，可作为入场依据
+      - 只有含当日最近3根日线内的信号才算"新鲜"（signal_days_ago <= 2）
       - 入场价 = 当前价（不是信号K线价），止损 = 信号K线极端价
     """
     events = _find_events_with_bars(df, lookback=lookback)
@@ -918,7 +921,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
 
     current_price = float(df["close"].iloc[-1])
 
-    # --- 信号时效性: 只有近3天内的信号才算新鲜 ---
+    # --- 信号时效性: 只有含当日最近3根日线内的信号才算新鲜 ---
     fresh_entry = None
     if entry_events:
         last_date_str = str(df.iloc[-1].get("date", df.index[-1]))[:10]
@@ -929,7 +932,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
                 try:
                     evt_date = _dt.strptime(evt["date"], "%Y-%m-%d")
                     days_ago = (last_date - evt_date).days
-                    if days_ago <= 3:
+                    if days_ago <= REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO:
                         fresh_entry = evt
                         fresh_entry["days_ago"] = days_ago
                         break
@@ -941,6 +944,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
     _no_signal = {
         "has_signal": False,
         "signal_type": None, "signal_date": None,
+        "signal_days_ago": None,
         "signal_bar": None, "signal_detail": None,
         "current_stage": "", "next_expected": "",
         "confidence": 0.0,
@@ -981,6 +985,7 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             "signal_strength": strength,
             "signal_type": fresh_entry["signal"],
             "signal_date": fresh_entry["date"],
+            "signal_days_ago": days_ago,
             "signal_bar": fresh_entry["bar"],
             "signal_detail": fresh_entry["detail"],
             "current_stage": stage,

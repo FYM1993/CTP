@@ -9,7 +9,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-import tqsdk_live  # noqa: E402
+from phase3 import live as tqsdk_live  # noqa: E402
 
 
 def test_wait_interval_keeps_waiting_until_deadline(monkeypatch):

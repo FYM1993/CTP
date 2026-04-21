@@ -51,7 +51,7 @@ def get_logger(name: str) -> logging.Logger:
 
     Example
     -------
-    >>> from ctp_log import get_logger
+    >>> from shared.ctp_log import get_logger
     >>> log = get_logger("pre_market")
     >>> log.info("...")
     """

@@ -18,13 +18,13 @@
 
 使用方法:
     # 实时监控（每分钟刷新）
-    python scripts/intraday.py
+    PYTHONPATH=scripts python -m phase3.intraday
 
     # 只跑一次分析
-    python scripts/intraday.py --once
+    PYTHONPATH=scripts python -m phase3.intraday --once
 
     # 指定K线周期
-    python scripts/intraday.py --period 15
+    PYTHONPATH=scripts python -m phase3.intraday --period 15
 """
 
 import time
@@ -38,16 +38,16 @@ import pandas as pd
 
 from pathlib import Path
 
-from ctp_log import get_log_path, get_logger
+from shared.ctp_log import get_log_path, get_logger
 from data_cache import get_minute
 
 log = get_logger("intraday")
 from wyckoff import vsa_scan, classify_vsa_bar, relative_volume, close_position
-from tqsdk_live import TqPhase3Monitor, tqsdk_configured
+from phase3.live import TqPhase3Monitor, tqsdk_configured
 
 
 def load_config() -> dict:
-    cfg_path = Path(__file__).parent.parent / "config.yaml"
+    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
     with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 

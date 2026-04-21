@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from fundamental_edb_map import EDB_FIELD_MAP
+from market.fundamental_edb_map import EDB_FIELD_MAP
 
 
 @dataclass(slots=True)
