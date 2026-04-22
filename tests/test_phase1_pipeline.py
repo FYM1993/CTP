@@ -1075,27 +1075,71 @@ def test_phase_0_prefetch_logs_structured_source_summary(monkeypatch) -> None:
     assert all("全部命中本地缓存" not in message for message in infos)
 
 
-def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
+def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_highlights_actionable_upgrade(
     monkeypatch,
     capsys,
 ) -> None:
-    assessments = iter(
+    trading_states = iter([True, False])
+    live_plans = iter(
         [
             {
-                "has_signal": True,
-                "signal_type": "SOS",
-                "signal_bar": {"low": 1985.0},
-                "confidence": 0.76,
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "strategy_family": "trend_following",
+                "score": 42.2,
+                "actionable": False,
+                "price": 2034.0,
+                "entry": 2034.0,
+                "stop": 2006.0,
+                "tp1": 2051.0,
+                "tp2": 2058.0,
+                "rr": 0.61,
+                "admission_rr": 0.86,
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
+                "entry_signal_detail": "markup 阶段趋势突破",
+                "reversal_status": {
+                    "has_signal": True,
+                    "signal_type": "SOS",
+                    "signal_bar": {"low": 1985.0},
+                    "confidence": 0.76,
+                },
+                "trend_status": {
+                    "has_signal": True,
+                    "signal_type": "TrendBreak",
+                },
             },
             {
-                "has_signal": True,
-                "signal_type": "SOS",
-                "signal_bar": {"low": 1985.0},
-                "confidence": 0.76,
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "strategy_family": "trend_following",
+                "score": 42.2,
+                "actionable": True,
+                "price": 2034.0,
+                "entry": 2034.0,
+                "stop": 2012.0,
+                "tp1": 2062.0,
+                "tp2": 2068.0,
+                "rr": 1.27,
+                "admission_rr": 1.55,
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
+                "entry_signal_detail": "markup 阶段趋势突破",
+                "reversal_status": {
+                    "has_signal": True,
+                    "signal_type": "SOS",
+                    "signal_bar": {"low": 1985.0},
+                    "confidence": 0.76,
+                },
+                "trend_status": {
+                    "has_signal": True,
+                    "signal_type": "TrendBreak",
+                },
             },
         ]
     )
-    trading_states = iter([True, False])
 
     monkeypatch.setattr(daily_workflow, "get_log_path", lambda: "/tmp/test.log")
     monkeypatch.setattr(daily_workflow, "try_create_phase3_monitor", lambda *args, **kwargs: None)
@@ -1119,13 +1163,13 @@ def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
     )
     monkeypatch.setattr(
         daily_workflow,
-        "assess_reversal_status",
-        lambda *args, **kwargs: next(assessments),
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: next(live_plans),
     )
 
     daily_workflow.phase_3_intraday(
         [],
-        {"intraday": {}},
+        {"intraday": {}, "pre_market": {}},
         period="5",
         interval=0,
         watchlist=[
@@ -1133,12 +1177,12 @@ def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
                 "symbol": "UR0",
                 "name": "尿素",
                 "direction": "long",
-                "entry": 1999.0,
-                "stop": 1985.0,
-                "tp1": 2018.0,
-                "tp2": 2042.0,
-                "rr": 1.36,
-                "admission_rr": 3.07,
+                "entry": 2005.0,
+                "stop": 1970.0,
+                "tp1": 2026.0,
+                "tp2": 2029.0,
+                "rr": 0.61,
+                "admission_rr": 0.68,
                 "entry_family": "trend",
                 "entry_signal_type": "TrendBreak",
                 "entry_signal_detail": "markup 阶段趋势突破",
@@ -1152,7 +1196,10 @@ def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
     assert "🔔🔔 尿素 出现顺势信号" in out
     assert "信号: 顺势突破 | 计划方向: 做多" in out
     assert "🟢 尿素: 顺势突破信号持续" in out
-    assert out.count("交易计划: 入场1999 止损1985 止盈1 2018 止盈2 2042 第一止盈RR 1.36 准入RR 3.07") == 2
+    assert "交易计划: 入场2005 止损1970 止盈1 2026 止盈2 2029 第一止盈RR 0.61 准入RR 0.68" not in out
+    assert "交易计划: 入场2034 止损2006 止盈1 2051 止盈2 2058 第一止盈RR 0.61 准入RR 0.86" in out
+    assert "交易计划: 入场2034 止损2012 止盈1 2062 止盈2 2068 第一止盈RR 1.27 准入RR 1.55" in out
+    assert "✅ 盘中重评后转为可操作：评分+42 准入RR 1.55" in out
 
 
 def test_run_trend_strategy_phase2_accepts_trend_universe_without_labels(monkeypatch) -> None:

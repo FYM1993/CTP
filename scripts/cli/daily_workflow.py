@@ -44,7 +44,12 @@ from data_cache import (
     format_prefetch_summary,
     get_daily_with_live_bar,
 )
-from phase2.pre_market import analyze_one, resolve_phase2_direction, score_signals
+from phase2.pre_market import (
+    analyze_one,
+    build_trade_plan_from_daily_df,
+    resolve_phase2_direction,
+    score_signals,
+)
 from phase3.intraday import print_dashboard
 from wyckoff import assess_reversal_status
 from phase3.live import try_create_phase3_monitor
@@ -772,9 +777,11 @@ def phase_3_intraday(
     SIG_CN = {"Spring": "弹簧", "SOS": "强势突破", "UT": "上冲回落", "SOW": "弱势跌破",
               "SC": "卖方高潮", "BC": "买方高潮", "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)",
               "Pullback": "顺势回撤", "TrendBreak": "顺势突破"}
+    pre_cfg = config.get("pre_market", {})
 
     # 记录上轮每个品种的信号状态，用于检测信号出现/消失
     prev_signals: dict[str, bool] = {}
+    prev_watch_rows: dict[str, dict] = {}
 
     cycle = 0
     ended_after_trading_hours = False
@@ -824,6 +831,7 @@ def phase_3_intraday(
                     for w in watchlist:
                         sym = w["symbol"]
                         has_signal = False
+                        current_watch = _normalize_phase2_plan_row(w)
                         try:
                             if tq_mon:
                                 live_df = tq_mon.daily_df(sym)
@@ -833,9 +841,23 @@ def phase_3_intraday(
                                 log.warning("  ⚠️ %s: 无数据", w["name"])
                                 continue
 
-                            rev = assess_reversal_status(live_df, w["direction"], lookback=60)
-                            has_signal = bool(rev.get("has_signal", False))
+                            previous_watch = prev_watch_rows.get(sym, _normalize_phase2_plan_row(w))
+                            live_plan = build_trade_plan_from_daily_df(
+                                symbol=sym,
+                                name=w["name"],
+                                direction=w["direction"],
+                                df=live_df,
+                                cfg=pre_cfg,
+                            )
+                            current_watch = _merge_intraday_watch_plan(w, live_plan)
+                            rev = current_watch.get("reversal_status")
+                            if not isinstance(rev, dict):
+                                rev = {}
+                            entry_signal = _resolve_entry_signal(current_watch)
+                            has_signal = bool(entry_signal["has_signal"])
                             had_signal = prev_signals.get(sym, False)
+                            plan_changed = _intraday_watch_plan_changed(previous_watch, current_watch)
+                            actionable_upgraded = bool(current_watch.get("actionable")) and not bool(previous_watch.get("actionable"))
 
                             # 当日 K 线信息（TqSdk 日线末根为盘中未完成时即「实时日线」）
                             live_row = live_df.iloc[-1]
@@ -844,33 +866,47 @@ def phase_3_intraday(
                                          f"C:{live_row['close']:.0f}")
 
                             if has_signal and not had_signal:
-                                signal_noun, sig_cn = _intraday_watch_signal_text(w, str(rev.get("signal_type") or ""))
+                                signal_noun, sig_cn = _intraday_watch_signal_text(current_watch, str(rev.get("signal_type") or ""))
                                 sig_bar = rev.get("signal_bar", {})
-                                dir_cn = "做多" if w["direction"] == "long" else "做空"
+                                dir_cn = "做多" if current_watch["direction"] == "long" else "做空"
 
-                                if w["direction"] == "long":
+                                if current_watch["direction"] == "long":
                                     confirm = f"收盘维持在 {sig_bar.get('low', 0):.0f} 以上"
                                 else:
                                     confirm = f"收盘维持在 {sig_bar.get('high', 0):.0f} 以下"
 
-                                pool_r = w.get("entry_pool_reason") or ""
+                                pool_r = current_watch.get("entry_pool_reason") or ""
                                 pool_line = f"       入池理由: {pool_r}" if pool_r else ""
-                                print(f"  🔔🔔 {w['name']} 出现{signal_noun}")
+                                print(f"  🔔🔔 {current_watch['name']} 出现{signal_noun}")
                                 print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
                                 if pool_line:
                                     print(pool_line)
                                 print(f"       {live_info}")
-                                print(f"       {_format_intraday_trade_plan(w)}")
+                                print(f"       {_format_intraday_trade_plan(current_watch)}")
+                                if plan_changed:
+                                    print("       🔄 盘中重评后交易计划已更新")
+                                if actionable_upgraded:
+                                    print(
+                                        f"       ✅ 盘中重评后转为可操作：评分{float(current_watch.get('score', 0.0)):+.0f} "
+                                        f"准入RR {float(current_watch.get('admission_rr', current_watch.get('rr', 0.0))):.2f}"
+                                    )
                                 print(f"       确认条件: {confirm}")
                                 print(f"       置信度: {rev['confidence']:.0%}")
 
                             elif has_signal and had_signal:
-                                _, sig_cn = _intraday_watch_signal_text(w, str(rev.get("signal_type") or ""))
-                                print(f"  🟢 {w['name']}: {sig_cn}信号持续 | {live_info}")
-                                print(f"       {_format_intraday_trade_plan(w)}")
+                                _, sig_cn = _intraday_watch_signal_text(current_watch, str(rev.get("signal_type") or ""))
+                                print(f"  🟢 {current_watch['name']}: {sig_cn}信号持续 | {live_info}")
+                                print(f"       {_format_intraday_trade_plan(current_watch)}")
+                                if plan_changed:
+                                    print("       🔄 盘中重评后交易计划已更新")
+                                if actionable_upgraded:
+                                    print(
+                                        f"       ✅ 盘中重评后转为可操作：评分{float(current_watch.get('score', 0.0)):+.0f} "
+                                        f"准入RR {float(current_watch.get('admission_rr', current_watch.get('rr', 0.0))):.2f}"
+                                    )
 
                             elif not has_signal and had_signal:
-                                print(f"  ❌ {w['name']}: 信号已消失（价格回落），继续观望")
+                                print(f"  ❌ {current_watch['name']}: 信号已消失（价格回落），继续观望")
                                 print(f"       {live_info}")
 
                             else:
@@ -895,6 +931,7 @@ def phase_3_intraday(
                             log.warning("  ⚠️ %s: %s", w["name"], e)
                         finally:
                             prev_signals[sym] = has_signal
+                            prev_watch_rows[sym] = current_watch
 
                 if not is_trading_hours():
                     ended_after_trading_hours = True
@@ -1112,6 +1149,18 @@ def _intraday_watch_signal_text(row: dict, fallback_signal_type: str) -> tuple[s
     if entry_family == "reversal":
         return "反转信号", str(fallback_label or entry_signal["display_label"] or "反转")
     return "入场信号", str(entry_signal["display_label"] or fallback_label or "入场")
+
+
+def _merge_intraday_watch_plan(base_row: dict, live_plan: dict | None) -> dict:
+    merged = _normalize_phase2_plan_row(base_row)
+    if not isinstance(live_plan, dict):
+        return merged
+    merged.update(live_plan)
+    return _normalize_phase2_plan_row(merged)
+
+
+def _intraday_watch_plan_changed(previous_row: dict, current_row: dict) -> bool:
+    return _format_intraday_trade_plan(previous_row) != _format_intraday_trade_plan(current_row)
 
 
 def save_targets(
