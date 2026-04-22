@@ -42,7 +42,7 @@ PHASE2_STRATEGY_FAMILY_KEYS = (
 BACKTEST_ANCHOR_OFFSETS = (1, 2, 3, 5, 7, 10, 14)
 BACKTEST_MINUTE_CHUNK_DAYS = 7
 BACKTEST_MINUTE_DATA_LENGTH = 10_000
-BACKTEST_CACHE_VERSION = "v2"
+BACKTEST_CACHE_VERSION = "v3"
 BACKTEST_CACHE_DIR = CACHE_DIR / "backtest"
 
 
@@ -189,6 +189,7 @@ def _load_daily_frame_with_tqbacktest(
     case: BacktestCase,
     tq_symbol: str,
     warmup_bars: int,
+    in_case_daily_bars: int,
     account: str,
     password: str,
 ) -> pd.DataFrame:
@@ -199,8 +200,7 @@ def _load_daily_frame_with_tqbacktest(
             account=account,
             password=password,
         )
-        day_count = max((case.end_dt - case.start_dt).days + 1, 1)
-        daily_length = max(day_count + warmup_bars + 10, 30)
+        daily_length = max(int(in_case_daily_bars) + warmup_bars + 10, 30)
         daily_klines = api.get_kline_serial(tq_symbol, 86400, data_length=daily_length)
         return _filter_daily_range(klines_to_daily_frame(daily_klines), case)
     finally:
@@ -277,6 +277,13 @@ def _filter_minute_range(frame: pd.DataFrame, case: BacktestCase) -> pd.DataFram
     return out.reset_index(drop=True)
 
 
+def _in_case_trade_day_count(*, case: BacktestCase, minute_df: pd.DataFrame) -> int:
+    if minute_df.empty:
+        return max(len(pd.bdate_range(case.start_dt, case.end_dt)), 1)
+    trade_dates = pd.to_datetime(minute_df["datetime"]).dt.date.nunique()
+    return max(int(trade_dates), 1)
+
+
 def _load_cached_case_frames(
     *,
     case: BacktestCase,
@@ -345,13 +352,6 @@ def load_case_frames_with_tqbacktest(
         except Exception:
             pass
 
-    daily_df = _load_daily_frame_with_tqbacktest(
-        case=case,
-        tq_symbol=tq_symbol,
-        warmup_bars=warmup_bars,
-        account=account,
-        password=password,
-    )
     minute_df = _load_minute_frame_with_tqbacktest(
         case=case,
         tq_symbol=tq_symbol,
@@ -359,6 +359,14 @@ def load_case_frames_with_tqbacktest(
         password=password,
     )
     minute_df = _filter_minute_range(minute_df, case)
+    daily_df = _load_daily_frame_with_tqbacktest(
+        case=case,
+        tq_symbol=tq_symbol,
+        warmup_bars=warmup_bars,
+        in_case_daily_bars=_in_case_trade_day_count(case=case, minute_df=minute_df),
+        account=account,
+        password=password,
+    )
     _write_cached_case_frames(
         case=case,
         warmup_bars=warmup_bars,

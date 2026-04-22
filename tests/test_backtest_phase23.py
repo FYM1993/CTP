@@ -1554,8 +1554,8 @@ def test_load_case_frames_with_tqbacktest_uses_case_range_and_closes_api(monkeyp
 
     assert created["calls"][0] == (case.start_dt - timedelta(days=120), case.end_dt, "acct", "pwd")
     assert created["calls"][1] == (date(2025, 1, 5), date(2025, 1, 5), "acct", "pwd")
-    assert created["calls"][2] == (date(2025, 1, 5), date(2025, 1, 5), "acct", "pwd")
-    assert created["calls"][3] == (date(2025, 1, 3), date(2025, 1, 3), "acct", "pwd")
+    assert created["calls"][2] == (date(2025, 1, 3), date(2025, 1, 3), "acct", "pwd")
+    assert created["calls"][3] == (date(2025, 1, 5), date(2025, 1, 5), "acct", "pwd")
     assert list(daily_df.columns) == ["date", "open", "high", "low", "close", "volume", "oi"]
     assert len(daily_df) == 3
     assert float(daily_df.iloc[1]["oi"]) == 800.0
@@ -1634,6 +1634,98 @@ def test_load_case_frames_with_tqbacktest_keeps_pre_start_daily_warmup(monkeypat
         date(2025, 1, 6),
     ]
     assert list(minute_df["datetime"].dt.date) == [date(2025, 1, 6), date(2025, 1, 6)]
+
+
+def test_load_case_frames_with_tqbacktest_keeps_pre_start_history_stable_when_end_date_moves(monkeypatch, tmp_path):
+    short_case = BacktestCase(
+        case_id="ao_short_window",
+        symbol="AO0",
+        name="氧化铝",
+        direction="long",
+        start_dt=date(2024, 7, 8),
+        end_dt=date(2024, 7, 19),
+    )
+    long_case = BacktestCase(
+        case_id="ao_long_window",
+        symbol="AO0",
+        name="氧化铝",
+        direction="long",
+        start_dt=date(2024, 7, 8),
+        end_dt=date(2024, 7, 31),
+    )
+
+    short_trade_days = pd.bdate_range(short_case.start_dt, short_case.end_dt)
+    long_trade_days = pd.bdate_range(long_case.start_dt, long_case.end_dt)
+
+    def _minute_serial(trade_days: pd.DatetimeIndex) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "datetime": trade_days + pd.Timedelta(hours=9, minutes=31),
+                "open": [100.0 + idx for idx in range(len(trade_days))],
+                "high": [101.0 + idx for idx in range(len(trade_days))],
+                "low": [99.0 + idx for idx in range(len(trade_days))],
+                "close": [100.5 + idx for idx in range(len(trade_days))],
+                "volume": [10.0] * len(trade_days),
+            }
+        )
+
+    minute_serial_by_anchor = {
+        date(2024, 7, 20): _minute_serial(short_trade_days),
+        date(2024, 8, 1): _minute_serial(long_trade_days),
+    }
+
+    class FakeApi:
+        def __init__(self, anchor_dt):
+            self.anchor_dt = anchor_dt
+
+        def get_kline_serial(self, symbol, duration_seconds, data_length=None):
+            if duration_seconds == 86400:
+                daily_dates = pd.bdate_range(
+                    end=pd.Timestamp(self.anchor_dt) - pd.Timedelta(days=1),
+                    periods=int(data_length or 0),
+                )
+                return pd.DataFrame(
+                    {
+                        "datetime": daily_dates,
+                        "open": [100.0 + idx for idx in range(len(daily_dates))],
+                        "high": [101.0 + idx for idx in range(len(daily_dates))],
+                        "low": [99.0 + idx for idx in range(len(daily_dates))],
+                        "close": [100.5 + idx for idx in range(len(daily_dates))],
+                        "volume": [1000.0] * len(daily_dates),
+                        "close_oi": [5000.0 + idx for idx in range(len(daily_dates))],
+                    }
+                )
+            if duration_seconds == 60:
+                return minute_serial_by_anchor[self.anchor_dt]
+            raise AssertionError(f"unexpected duration: {duration_seconds}")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
+    monkeypatch.setattr("backtest.phase23._create_backtest_api", lambda **kwargs: FakeApi(kwargs["end_dt"]))
+    monkeypatch.setattr("backtest.phase23.BACKTEST_ANCHOR_OFFSETS", (1,))
+    monkeypatch.setattr("backtest.phase23.BACKTEST_MINUTE_CHUNK_DAYS", 40)
+    monkeypatch.setattr(
+        "backtest.phase23.resolve_case_tq_symbol",
+        lambda case, api=None: "KQ.m@SHFE.ao",
+    )
+
+    short_daily, _ = load_case_frames_with_tqbacktest(
+        case=short_case,
+        config={"tqsdk": {"account": "acct", "password": "pwd"}},
+    )
+    long_daily, _ = load_case_frames_with_tqbacktest(
+        case=long_case,
+        config={"tqsdk": {"account": "acct", "password": "pwd"}},
+    )
+
+    short_visible = short_daily.loc[short_daily["date"].dt.date < short_case.start_dt].copy()
+    long_visible = long_daily.loc[long_daily["date"].dt.date < long_case.start_dt].copy()
+
+    assert len(short_visible) == len(long_visible)
+    assert short_visible["date"].min() == long_visible["date"].min()
+    assert short_visible["date"].max() == long_visible["date"].max()
 
 
 def test_load_case_frames_with_tqbacktest_returns_cached_frames_without_tqsdk(monkeypatch, tmp_path):
