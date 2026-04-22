@@ -1038,6 +1038,119 @@ def test_main_builds_reversal_and_trend_universes_separately(monkeypatch) -> Non
     ]
 
 
+def test_phase_0_prefetch_logs_structured_source_summary(monkeypatch) -> None:
+    infos: list[str] = []
+
+    monkeypatch.setattr(
+        daily_workflow,
+        "prefetch_all_with_stats",
+        lambda symbols: (
+            {"LH0": "lh", "RM0": "rm"},
+            type(
+                "Stats",
+                (),
+                {
+                    "cache_hits": 0,
+                    "tq_fetches": 2,
+                    "akshare_fetches": 0,
+                    "latest_bar_not_today": 2,
+                    "intraday_live": 0,
+                    "missing": 0,
+                },
+            )(),
+        ),
+    )
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+
+    out = daily_workflow.phase_0_prefetch()
+
+    assert out == {"LH0": "lh", "RM0": "rm"}
+    assert any("TqSdk拉取2" in message for message in infos)
+    assert any("AkShare拉取0" in message for message in infos)
+    assert any("最新bar非今日2" in message for message in infos)
+    assert all("全部命中本地缓存" not in message for message in infos)
+
+
+def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
+    monkeypatch,
+    capsys,
+) -> None:
+    assessments = iter(
+        [
+            {
+                "has_signal": True,
+                "signal_type": "SOS",
+                "signal_bar": {"low": 1985.0},
+                "confidence": 0.76,
+            },
+            {
+                "has_signal": True,
+                "signal_type": "SOS",
+                "signal_bar": {"low": 1985.0},
+                "confidence": 0.76,
+            },
+        ]
+    )
+    trading_states = iter([True, False])
+
+    monkeypatch.setattr(daily_workflow, "get_log_path", lambda: "/tmp/test.log")
+    monkeypatch.setattr(daily_workflow, "try_create_phase3_monitor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow, "time_to_next_session", lambda: 0)
+    monkeypatch.setattr(daily_workflow, "is_trading_hours", lambda: next(trading_states))
+    monkeypatch.setattr(daily_workflow.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daily_workflow.log, "info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow,
+        "get_daily_with_live_bar",
+        lambda symbol, period: pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-22"]),
+                "open": [1993.0],
+                "high": [2018.0],
+                "low": [1985.0],
+                "close": [1999.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "assess_reversal_status",
+        lambda *args, **kwargs: next(assessments),
+    )
+
+    daily_workflow.phase_3_intraday(
+        [],
+        {"intraday": {}},
+        period="5",
+        interval=0,
+        watchlist=[
+            {
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "entry": 1999.0,
+                "stop": 1985.0,
+                "tp1": 2018.0,
+                "tp2": 2042.0,
+                "rr": 1.36,
+                "admission_rr": 3.07,
+                "entry_pool_reason": "顺势突破观察",
+            }
+        ],
+    )
+
+    out = capsys.readouterr().out
+
+    assert "🔔🔔 尿素 出现反转信号" in out
+    assert "🟢 尿素: 强势突破信号持续" in out
+    assert out.count("交易计划: 入场1999 止损1985 止盈1 2018 止盈2 2042 第一止盈RR 1.36 准入RR 3.07") == 2
+
+
 def test_run_trend_strategy_phase2_accepts_trend_universe_without_labels(monkeypatch) -> None:
     calls: list[dict] = []
 

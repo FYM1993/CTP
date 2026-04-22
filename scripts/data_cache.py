@@ -22,6 +22,7 @@
 
 import time
 import socket
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from contextlib import contextmanager
@@ -54,6 +55,16 @@ NIGHT_SESSION_START = (21, 0)
 NIGHT_SESSION_END = (23, 30)
 
 _cache_cleaned = False
+
+
+@dataclass
+class PrefetchStats:
+    cache_hits: int = 0
+    tq_fetches: int = 0
+    akshare_fetches: int = 0
+    latest_bar_not_today: int = 0
+    intraday_live: int = 0
+    missing: int = 0
 
 
 def _load_config() -> dict:
@@ -174,6 +185,13 @@ def _cache_paths(symbol: str, data_type: str = "daily") -> tuple[Path, Path]:
     )
 
 
+def _latest_bar_is_today(df: pd.DataFrame) -> bool:
+    if df is None or len(df) == 0:
+        return False
+    latest = pd.Timestamp(df["date"].iloc[-1]).strftime("%Y%m%d")
+    return latest == datetime.now().strftime("%Y%m%d")
+
+
 def _choose_cache_suffix(df: pd.DataFrame) -> str:
     """
     根据数据内容决定缓存类型。
@@ -182,18 +200,41 @@ def _choose_cache_suffix(df: pd.DataFrame) -> str:
     工作日收盘前，当天 bar 仍可能未完成，因此即使最新日期是今天也继续记为 live。
     只有在最新日期是今天且已收盘后，才标记为 final（永久缓存）。
     """
-    today_str = datetime.now().strftime("%Y%m%d")
     is_weekend = datetime.now().weekday() >= 5
 
     if is_weekend:
         return "final"
 
-    if df is not None and len(df) > 0:
-        latest = pd.Timestamp(df["date"].iloc[-1]).strftime("%Y%m%d")
-        if latest == today_str:
-            return "live" if _is_trading_session_active() else "final"
+    if _latest_bar_is_today(df):
+        return "live" if _is_trading_session_active() else "final"
 
     return "live"
+
+
+def _update_prefetch_freshness(stats: PrefetchStats, df: pd.DataFrame, *, suffix: str | None = None) -> None:
+    if df is None or len(df) == 0:
+        return
+    if _latest_bar_is_today(df):
+        if suffix == "live":
+            stats.intraday_live += 1
+        return
+    stats.latest_bar_not_today += 1
+
+
+def format_prefetch_summary(loaded_count: int, stats: PrefetchStats) -> str:
+    parts = [
+        f"加载{loaded_count}个品种",
+        f"缓存命中{stats.cache_hits}",
+        f"TqSdk拉取{stats.tq_fetches}",
+        f"AkShare拉取{stats.akshare_fetches}",
+    ]
+    if stats.latest_bar_not_today > 0:
+        parts.append(f"最新bar非今日{stats.latest_bar_not_today}")
+    if stats.intraday_live > 0:
+        parts.append(f"盘中live缓存{stats.intraday_live}")
+    if stats.missing > 0:
+        parts.append(f"无可用数据{stats.missing}")
+    return "，".join(parts)
 
 
 def _ensure_cache_dir():
@@ -279,7 +320,7 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
     tq_configured = _has_configured_tq_daily_source(symbol)
     df = fetch_daily_from_tq(symbol, days) if tq_configured else None
     if tq_configured and (df is None or len(df) == 0):
-        _log.warning("%s TqSdk无数据，跳过AkShare回退", symbol)
+        _log.warning("%s TqSdk无数据，跳过AkShare回退（按当前策略）", symbol)
         return None
     if df is None or len(df) == 0:
         df = _fetch_daily_from_api(symbol, days)
@@ -902,21 +943,19 @@ def get_all_symbols() -> list[dict]:
     return [s for s in BUILTIN_SYMBOLS if s["symbol"] not in EXCLUDE]
 
 
-def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
+def prefetch_all_with_stats(symbols: list[dict] | None = None) -> tuple[dict[str, pd.DataFrame], PrefetchStats]:
     """
     批量预加载所有品种日线数据。
 
-    首次调用从API获取并缓存，后续调用直接读本地文件。
-    返回: {symbol: DataFrame}
+    首次调用从远端抓取并缓存，后续调用优先读本地文件。
+    返回: ({symbol: DataFrame}, PrefetchStats)
     """
     if symbols is None:
         symbols = get_all_symbols()
 
     _ensure_cache_dir()
     data = {}
-    api_calls = 0
-    cache_hits = 0
-    live_count = 0
+    stats = PrefetchStats()
     config = _load_config()
     tq_credentials = _tq_credentials(config)
     tq_api = None
@@ -947,7 +986,8 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
 
             if cached_df is not None:
                 data[sym] = cached_df
-                cache_hits += 1
+                stats.cache_hits += 1
+                _update_prefetch_freshness(stats, cached_df)
                 continue
 
             if tq_available and tq_api is None and not tq_init_attempted:
@@ -971,21 +1011,26 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
                 df = None
             if df is None or len(df) == 0:
                 if tq_attempted:
-                    _log.warning("%s TqSdk无数据，跳过AkShare回退", sym)
+                    _log.warning("%s TqSdk无数据，跳过AkShare回退（按当前策略）", sym)
+                    stats.missing += 1
                     continue
-                _log.warning("%s TqSdk无数据，回退AkShare日线接口", sym)
+                _log.warning("%s TqSdk不可用，回退AkShare日线接口", sym)
                 df = _fetch_daily_from_api(sym, days=400)
-                api_calls += 1
             if df is not None and len(df) > 0:
+                if tq_attempted:
+                    stats.tq_fetches += 1
+                else:
+                    stats.akshare_fetches += 1
                 suffix = _choose_cache_suffix(df)
                 save_path = final_path if suffix == "final" else live_path
-                if suffix == "live":
-                    live_count += 1
+                _update_prefetch_freshness(stats, df, suffix=suffix)
                 try:
                     df.to_parquet(save_path, index=False)
                 except Exception:
                     pass
                 data[sym] = df
+            else:
+                stats.missing += 1
     finally:
         if tq_api is not None:
             try:
@@ -993,9 +1038,15 @@ def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
             except Exception:
                 pass
 
-    msg = f"加载完成: {len(data)}个品种 (缓存{cache_hits}, API{api_calls}"
-    if live_count > 0:
-        msg += f", {live_count}个尚无今日数据"
-    msg += ")"
-    _log.info(msg)
+    _log.info("加载完成: %s", format_prefetch_summary(len(data), stats))
+    return data, stats
+
+
+def prefetch_all(symbols: list[dict] | None = None) -> dict[str, pd.DataFrame]:
+    """
+    批量预加载所有品种日线数据。
+
+    保持向后兼容，仅返回数据字典。
+    """
+    data, _ = prefetch_all_with_stats(symbols)
     return data

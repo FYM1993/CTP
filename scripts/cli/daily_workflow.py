@@ -6,13 +6,13 @@
 完整流水线:
   Phase 0 — 数据预加载 (盘前)
     一次性拉取所有品种日线，缓存到本地 parquet
-    当日首次运行走API (~60个请求)，后续运行零API调用
+    当日首次运行会远端抓取日线，后续优先复用当日缓存
 
   Phase 1 — 全市场筛选 (盘前)
-    基于缓存数据分析，零API调用
+    基于已加载的日线数据分析，不再重复抓取日线
 
   Phase 2 — 盘前深度分析 (盘前)
-    对筛选出的品种做深度分析，零API调用
+    对筛选出的品种做深度分析，不再重复抓取日线
 
   Phase 3 — 盘中实时监控 (09:00-15:00 / 21:00-23:30)
     分钟K线实时拉取（无法缓存）
@@ -40,7 +40,8 @@ from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
 
 from data_cache import (
     get_all_symbols, get_daily, get_minute,
-    prefetch_all, get_request_count,
+    prefetch_all_with_stats, get_request_count,
+    format_prefetch_summary,
     get_daily_with_live_bar,
 )
 from phase2.pre_market import analyze_one, resolve_phase2_direction, score_signals
@@ -101,14 +102,8 @@ def phase_0_prefetch() -> dict[str, pd.DataFrame]:
     log.info("▓  Phase 0: 数据预加载")
     log.info("▓" * 60)
 
-    before = get_request_count()
-    data = prefetch_all(symbols)
-    after = get_request_count()
-
-    if after == before:
-        log.info("  ✅ 全部命中本地缓存，零API调用")
-    else:
-        log.info("  ✅ 完成，本次API调用 %s 次", after - before)
+    data, stats = prefetch_all_with_stats(symbols)
+    log.info("  ✅ %s", format_prefetch_summary(len(data), stats))
 
     return data
 
@@ -864,12 +859,14 @@ def phase_3_intraday(
                                 if pool_line:
                                     print(pool_line)
                                 print(f"       {live_info}")
+                                print(f"       {_format_intraday_trade_plan(w)}")
                                 print(f"       确认条件: {confirm}")
                                 print(f"       置信度: {rev['confidence']:.0%}")
 
                             elif has_signal and had_signal:
                                 sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
                                 print(f"  🟢 {w['name']}: {sig_cn}信号持续 | {live_info}")
+                                print(f"       {_format_intraday_trade_plan(w)}")
 
                             elif not has_signal and had_signal:
                                 print(f"  ❌ {w['name']}: 信号已消失（价格回落），继续观望")
@@ -1082,6 +1079,26 @@ def _default_waiting_hint(row: dict) -> str:
     if entry_family == "reversal":
         return "等待反转信号"
     return "等待入场信号"
+
+
+def _format_intraday_trade_plan(row: dict) -> str:
+    try:
+        entry = float(row["entry"])
+        stop = float(row["stop"])
+        tp1 = float(row["tp1"])
+        tp2 = float(row["tp2"])
+        rr = float(row["rr"])
+        admission_rr = float(row.get("admission_rr", rr))
+    except (KeyError, TypeError, ValueError):
+        return "交易计划: 盘前未生成完整交易计划"
+
+    if min(entry, stop, tp1, tp2) <= 0:
+        return "交易计划: 盘前未生成完整交易计划"
+
+    return (
+        f"交易计划: 入场{entry:.0f} 止损{stop:.0f} 止盈1 {tp1:.0f} "
+        f"止盈2 {tp2:.0f} 第一止盈RR {rr:.2f} 准入RR {admission_rr:.2f}"
+    )
 
 
 def save_targets(
@@ -1659,7 +1676,7 @@ def main():
     if args.no_monitor:
         log.info("\n  ⏩ 跳过盘中监控 (--no-monitor)")
         api_total = get_request_count()
-        log.info("  📊 本次运行总API调用: %s 次", api_total)
+        log.info("  📊 本次运行累计AkShare请求: %s 次", api_total)
         return
 
     phase_3_intraday(actionable, config, args.period, args.interval, watchlist=top_watch)

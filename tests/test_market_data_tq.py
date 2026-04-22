@@ -737,6 +737,63 @@ def test_prefetch_all_logs_when_global_tq_is_unavailable_and_falls_back_to_aksha
     assert any("TqSdk 初始化失败" in message for message in warnings)
 
 
+def test_prefetch_all_with_stats_reports_tq_fetches_and_non_today_bars(monkeypatch, tmp_path):
+    infos = []
+
+    class FakeApi:
+        def close(self):
+            pass
+
+    class FakeDatetime:
+        @classmethod
+        def now(cls):
+            return pd.Timestamp("2026-04-22 09:23:39").to_pydatetime()
+
+    fetched = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-04-21"]),
+            "open": [100.0],
+            "high": [110.0],
+            "low": [90.0],
+            "close": [105.0],
+            "volume": [1234.0],
+            "oi": [888.0],
+        }
+    )
+
+    monkeypatch.setattr(data_cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(data_cache, "_cache_cleaned", False)
+    monkeypatch.setattr(data_cache, "datetime", FakeDatetime)
+    monkeypatch.setattr(data_cache, "_load_config", lambda: {"tqsdk": {"account": "acct", "password": "pwd"}})
+    monkeypatch.setattr(data_cache, "_create_tq_api", lambda account, password: FakeApi(), raising=False)
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_tq_with_api",
+        lambda *args, **kwargs: fetched.copy(),
+    )
+    monkeypatch.setattr(
+        data_cache,
+        "_fetch_daily_from_api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not fallback to AkShare")),
+    )
+    monkeypatch.setattr(data_cache._log, "info", lambda msg, *args: infos.append(msg % args if args else msg))
+
+    out, stats = data_cache.prefetch_all_with_stats(
+        symbols=[
+            {"symbol": "LH0", "name": "生猪", "exchange": "dce"},
+            {"symbol": "M0", "name": "豆粕", "exchange": "dce"},
+        ]
+    )
+
+    assert set(out) == {"LH0", "M0"}
+    assert stats.cache_hits == 0
+    assert stats.tq_fetches == 2
+    assert stats.akshare_fetches == 0
+    assert stats.latest_bar_not_today == 2
+    assert any("TqSdk拉取2" in message for message in infos)
+    assert any("最新bar非今日2" in message for message in infos)
+
+
 def test_get_hog_fundamentals_includes_spot_price_percentile(monkeypatch):
     monkeypatch.setattr(data_cache, "_hog_cache", None)
     monkeypatch.setattr(
