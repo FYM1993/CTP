@@ -703,7 +703,7 @@ def phase_3_intraday(
     watchlist: list[dict] | None = None,
 ):
     """
-    盘中实时监控：对「可操作」品种拉分钟 K 并打印仪表盘；对「观望」品种用日线检测反转信号。
+    盘中实时监控：对「可操作」品种拉分钟 K 并打印仪表盘；对「观望」品种做日线级信号检测。
 
     Parameters
     ----------
@@ -711,7 +711,8 @@ def phase_3_intraday(
         Phase 2 判定为可操作的品种列表（分钟级 K 线 + `print_dashboard`）。
     watchlist
         观望列表（可选）。非空时对每个品种做日线级 `assess_reversal_status`，
-        并与上一轮 `prev_signals` 对比打印「新出现 / 持续 / 消失 / 无信号」等提示。
+        并与上一轮 `prev_signals` 对比打印「新出现 / 持续 / 消失 / 无信号」等提示；
+        具体文案会按 Phase 2 的 `entry_family` 区分顺势/反转。
     config
         全局配置，读取 `intraday` 段传入 `print_dashboard`。
         若配置 `tqsdk.account` / `tqsdk.password` 且已安装 tqsdk，则 Phase 3 使用 TqSdk
@@ -734,7 +735,7 @@ def phase_3_intraday(
 
     intraday_cfg = config.get("intraday", {})
 
-    print(f"盘中监控：终端仅打印观望品种反转/信号持续/消失；其余见 {get_log_path()}")
+    print(f"盘中监控：终端仅打印观望品种信号出现/持续/消失；其余见 {get_log_path()}")
     log.info("\n" + "▓" * 60)
     log.info("▓  Phase 3: 盘中实时监控")
     log.info("▓" * 60)
@@ -817,9 +818,9 @@ def phase_3_intraday(
                     except Exception as e:
                         log.info("\n  %s: ❌ %s", t["name"], e)
 
-                # --- 观望品种: 日线反转检测（TqSdk 用交易所日线序列含当日未完成K线；否则合成日线）---
+                # --- 观望品种: 日线信号检测（TqSdk 用交易所日线序列含当日未完成K线；否则合成日线）---
                 if watchlist:
-                    log.info("\n  ── 盘中反转检测 ──")
+                    log.info("\n  ── 盘中信号检测 ──")
                     for w in watchlist:
                         sym = w["symbol"]
                         has_signal = False
@@ -843,7 +844,7 @@ def phase_3_intraday(
                                          f"C:{live_row['close']:.0f}")
 
                             if has_signal and not had_signal:
-                                sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
+                                signal_noun, sig_cn = _intraday_watch_signal_text(w, str(rev.get("signal_type") or ""))
                                 sig_bar = rev.get("signal_bar", {})
                                 dir_cn = "做多" if w["direction"] == "long" else "做空"
 
@@ -854,7 +855,7 @@ def phase_3_intraday(
 
                                 pool_r = w.get("entry_pool_reason") or ""
                                 pool_line = f"       入池理由: {pool_r}" if pool_r else ""
-                                print(f"  🔔🔔 {w['name']} 出现反转信号")
+                                print(f"  🔔🔔 {w['name']} 出现{signal_noun}")
                                 print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
                                 if pool_line:
                                     print(pool_line)
@@ -864,7 +865,7 @@ def phase_3_intraday(
                                 print(f"       置信度: {rev['confidence']:.0%}")
 
                             elif has_signal and had_signal:
-                                sig_cn = SIG_CN.get(rev["signal_type"], rev["signal_type"])
+                                _, sig_cn = _intraday_watch_signal_text(w, str(rev.get("signal_type") or ""))
                                 print(f"  🟢 {w['name']}: {sig_cn}信号持续 | {live_info}")
                                 print(f"       {_format_intraday_trade_plan(w)}")
 
@@ -1099,6 +1100,18 @@ def _format_intraday_trade_plan(row: dict) -> str:
         f"交易计划: 入场{entry:.0f} 止损{stop:.0f} 止盈1 {tp1:.0f} "
         f"止盈2 {tp2:.0f} 第一止盈RR {rr:.2f} 准入RR {admission_rr:.2f}"
     )
+
+
+def _intraday_watch_signal_text(row: dict, fallback_signal_type: str) -> tuple[str, str]:
+    entry_signal = _resolve_entry_signal(row)
+    entry_family = str(entry_signal["entry_family"])
+    fallback_label = ENTRY_SIGNAL_CN.get(fallback_signal_type, fallback_signal_type)
+
+    if entry_family == "trend":
+        return "顺势信号", str(entry_signal["display_label"] or fallback_label or "顺势")
+    if entry_family == "reversal":
+        return "反转信号", str(fallback_label or entry_signal["display_label"] or "反转")
+    return "入场信号", str(entry_signal["display_label"] or fallback_label or "入场")
 
 
 def save_targets(

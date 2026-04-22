@@ -1139,6 +1139,9 @@ def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
                 "tp2": 2042.0,
                 "rr": 1.36,
                 "admission_rr": 3.07,
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
+                "entry_signal_detail": "markup 阶段趋势突破",
                 "entry_pool_reason": "顺势突破观察",
             }
         ],
@@ -1146,8 +1149,9 @@ def test_phase_3_intraday_watchlist_signal_output_repeats_trade_plan(
 
     out = capsys.readouterr().out
 
-    assert "🔔🔔 尿素 出现反转信号" in out
-    assert "🟢 尿素: 强势突破信号持续" in out
+    assert "🔔🔔 尿素 出现顺势信号" in out
+    assert "信号: 顺势突破 | 计划方向: 做多" in out
+    assert "🟢 尿素: 顺势突破信号持续" in out
     assert out.count("交易计划: 入场1999 止损1985 止盈1 2018 止盈2 2042 第一止盈RR 1.36 准入RR 3.07") == 2
 
 
