@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -1079,6 +1080,7 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
     monkeypatch,
     capsys,
 ) -> None:
+    infos: list[str] = []
     trading_states = iter([True, False])
     live_plans = iter(
         [
@@ -1099,15 +1101,15 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
                 "entry_family": "trend",
                 "entry_signal_type": "TrendBreak",
                 "entry_signal_detail": "markup 阶段趋势突破",
-                "reversal_status": {
-                    "has_signal": True,
-                    "signal_type": "SOS",
-                    "signal_bar": {"low": 1985.0},
-                    "confidence": 0.76,
-                },
+                "reversal_status": {},
                 "trend_status": {
                     "has_signal": True,
                     "signal_type": "TrendBreak",
+                    "signal_detail": "markup 阶段趋势突破",
+                    "phase": "markup",
+                    "phase_ok": True,
+                    "slope_ok": True,
+                    "trend_indicator_ok": True,
                 },
             },
             {
@@ -1127,15 +1129,15 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
                 "entry_family": "trend",
                 "entry_signal_type": "TrendBreak",
                 "entry_signal_detail": "markup 阶段趋势突破",
-                "reversal_status": {
-                    "has_signal": True,
-                    "signal_type": "SOS",
-                    "signal_bar": {"low": 1985.0},
-                    "confidence": 0.76,
-                },
+                "reversal_status": {},
                 "trend_status": {
                     "has_signal": True,
                     "signal_type": "TrendBreak",
+                    "signal_detail": "markup 阶段趋势突破",
+                    "phase": "markup",
+                    "phase_ok": True,
+                    "slope_ok": True,
+                    "trend_indicator_ok": True,
                 },
             },
         ]
@@ -1146,7 +1148,11 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
     monkeypatch.setattr(daily_workflow, "time_to_next_session", lambda: 0)
     monkeypatch.setattr(daily_workflow, "is_trading_hours", lambda: next(trading_states))
     monkeypatch.setattr(daily_workflow.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(daily_workflow.log, "info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
     monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         daily_workflow,
@@ -1164,7 +1170,18 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
     monkeypatch.setattr(
         daily_workflow,
         "build_trade_plan_from_daily_df",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should use trend-specific builder")),
+    )
+    monkeypatch.setattr(
+        daily_workflow.trend_pre_market,
+        "build_trade_plan_from_daily_df",
         lambda **kwargs: next(live_plans),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_phase_4_holdings",
+        lambda *args, **kwargs: {},
+        raising=False,
     )
 
     daily_workflow.phase_3_intraday(
@@ -1193,13 +1210,217 @@ def test_phase_3_intraday_watchlist_signal_output_recomputes_trade_plan_and_high
 
     out = capsys.readouterr().out
 
-    assert "🔔🔔 尿素 出现顺势信号" in out
-    assert "信号: 顺势突破 | 计划方向: 做多" in out
-    assert "🟢 尿素: 顺势突破信号持续" in out
+    assert "🔔🔔 尿素 出现顺势确认" in out
+    assert "确认: 顺势突破 | 计划方向: 做多" in out
+    assert "确认条件: 价格继续站稳入场2034上方，且不跌破止损2006" in out
+    assert "🟢 尿素: 顺势突破确认持续" in out
     assert "交易计划: 入场2005 止损1970 止盈1 2026 止盈2 2029 第一止盈RR 0.61 准入RR 0.68" not in out
     assert "交易计划: 入场2034 止损2006 止盈1 2051 止盈2 2058 第一止盈RR 0.61 准入RR 0.86" in out
     assert "交易计划: 入场2034 止损2012 止盈1 2062 止盈2 2068 第一止盈RR 1.27 准入RR 1.55" in out
-    assert "✅ 盘中重评后转为可操作：评分+42 准入RR 1.55" in out
+    assert "✅ 盘中重评后转为可执行：评分+42 准入RR 1.55" in out
+    assert any("🔔🔔 尿素 出现顺势确认" in message for message in infos)
+    assert any("🟢 尿素: 顺势突破确认持续 | 当日 O:1993 H:2018 L:1985 C:1999" in message for message in infos)
+    assert any("确认条件: 价格继续站稳入场2034上方，且不跌破止损2006" in message for message in infos)
+    assert any("交易计划: 入场2034 止损2012 止盈1 2062 止盈2 2068 第一止盈RR 1.27 准入RR 1.55" in message for message in infos)
+    assert any("✅ 盘中重评后转为可执行：评分+42 准入RR 1.55" in message for message in infos)
+
+
+def test_phase_3_intraday_watchlist_signal_fallback_reverts_to_waiting_confirmation(monkeypatch, capsys) -> None:
+    infos: list[str] = []
+    trading_states = iter([True, True, False])
+    live_plans = iter(
+        [
+            {
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "strategy_family": "trend_following",
+                "score": 42.2,
+                "actionable": False,
+                "price": 2034.0,
+                "entry": 2034.0,
+                "stop": 2006.0,
+                "tp1": 2051.0,
+                "tp2": 2058.0,
+                "rr": 0.61,
+                "admission_rr": 0.86,
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
+                "entry_signal_detail": "markup 阶段趋势突破",
+                "reversal_status": {},
+                "trend_status": {
+                    "has_signal": True,
+                    "signal_type": "TrendBreak",
+                },
+            },
+            {
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "strategy_family": "trend_following",
+                "score": 12.0,
+                "actionable": False,
+                "price": 2018.0,
+                "entry": 2034.0,
+                "stop": 2006.0,
+                "tp1": 2051.0,
+                "tp2": 2058.0,
+                "rr": 0.61,
+                "admission_rr": 0.86,
+                "entry_family": "trend",
+                "entry_signal_type": "",
+                "entry_signal_detail": "",
+                "reversal_status": {},
+                "trend_status": {
+                    "has_signal": False,
+                    "signal_type": "",
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(daily_workflow, "get_log_path", lambda: "/tmp/test.log")
+    monkeypatch.setattr(daily_workflow, "try_create_phase3_monitor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow, "time_to_next_session", lambda: 0)
+    monkeypatch.setattr(daily_workflow, "is_trading_hours", lambda: next(trading_states))
+    monkeypatch.setattr(daily_workflow.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow,
+        "get_daily_with_live_bar",
+        lambda symbol, period: pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-04-22"]),
+                "open": [1993.0],
+                "high": [2018.0],
+                "low": [1985.0],
+                "close": [1999.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should use trend-specific builder")),
+    )
+    monkeypatch.setattr(
+        daily_workflow.trend_pre_market,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: next(live_plans),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_phase_4_holdings",
+        lambda *args, **kwargs: {},
+        raising=False,
+    )
+
+    daily_workflow.phase_3_intraday(
+        [],
+        {"intraday": {}, "pre_market": {}},
+        period="5",
+        interval=0,
+        watchlist=[
+            {
+                "symbol": "UR0",
+                "name": "尿素",
+                "direction": "long",
+                "entry": 2005.0,
+                "stop": 1970.0,
+                "tp1": 2026.0,
+                "tp2": 2029.0,
+                "rr": 0.61,
+                "admission_rr": 0.68,
+                "entry_family": "trend",
+                "entry_signal_type": "",
+                "entry_signal_detail": "",
+                "entry_pool_reason": "顺势突破观察",
+            }
+        ],
+    )
+
+    out = capsys.readouterr().out
+
+    assert "确认已回退，重新等待顺势确认" in out
+    assert "继续观望" not in out
+    assert any("确认已回退，重新等待顺势确认" in message for message in infos)
+
+
+def test_phase_2_premarket_summary_uses_confirmation_wording(monkeypatch) -> None:
+    messages: list[str] = []
+
+    monkeypatch.setattr(daily_workflow, "get_daily", lambda symbol: {"symbol": symbol})
+    monkeypatch.setattr(
+        daily_workflow,
+        "score_signals",
+        lambda df, direction, cfg: {"trend": 18.0, "volume": 6.0, "wyckoff": 8.0},
+    )
+    monkeypatch.setattr(daily_workflow, "resolve_phase2_direction", lambda **kwargs: "long")
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: messages.append(msg % args if args else msg),
+    )
+
+    def fake_analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict:
+        return {
+            "symbol": symbol,
+            "name": name,
+            "direction": direction,
+            "price": 100.0,
+            "score": 32.0,
+            "actionable": True,
+            "entry": 101.0,
+            "stop": 95.0,
+            "tp1": 110.0,
+            "tp2": 118.0,
+            "rr": 1.5,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 1,
+            "fund_screen_score": 66.0,
+            "signal_strength": 0.7,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "markup 阶段顺势回踩",
+            "reversal_status": {
+                "signal_strength": 0.7,
+                "next_expected": "等待顺势确认",
+            },
+        }
+
+    monkeypatch.setattr(daily_workflow, "analyze_one", fake_analyze_one)
+
+    actionable, watchlist = daily_workflow.phase_2_premarket(
+        [
+            {
+                "symbol": "LH0",
+                "name": "生猪",
+                "score": 66.0,
+                "attention_score": 66.0,
+                "reversal_score": 55.0,
+                "trend_score": 61.0,
+                "labels": ["趋势候选"],
+                "state_labels": ["高关注"],
+                "data_coverage": 0.75,
+                "reason_summary": "库存下降",
+                "entry_pool_reason": "趋势机会分达标",
+            }
+        ],
+        {"pre_market": {"direction_delta": 12.0}},
+        max_picks=3,
+    )
+
+    assert len(actionable) == 1
+    assert watchlist == []
+    assert any("Phase 2 汇总: 1 个可执行, 0 个等待确认" in msg for msg in messages)
+    assert any("确认" in msg and "执行价" in msg for msg in messages)
+    assert not any("信号" in msg and "入场" in msg for msg in messages if "Phase 2 汇总" not in msg)
 
 
 def test_run_trend_strategy_phase2_accepts_trend_universe_without_labels(monkeypatch) -> None:
@@ -1273,3 +1494,328 @@ def test_run_trend_strategy_phase2_accepts_trend_universe_without_labels(monkeyp
             "reason": "趋势筛选+78, 趋势机会分达标",
         }
     ]
+
+
+def test_run_reversal_strategy_phase2_downgrades_counter_fundamental_direction(monkeypatch) -> None:
+    monkeypatch.setattr(
+        daily_workflow,
+        "get_daily",
+        lambda symbol: pd.DataFrame({"close": [100.0, 101.0, 102.0]}),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "score_signals",
+        lambda df, direction, cfg: {"technical_long": 30.0},
+    )
+    monkeypatch.setattr(daily_workflow, "resolve_phase2_direction", lambda **kwargs: "long")
+
+    def fake_build_trade_plan_from_daily_df(**kwargs) -> dict:
+        return {
+            "symbol": kwargs["symbol"],
+            "name": kwargs["name"],
+            "direction": kwargs["direction"],
+            "score": 30.0,
+            "actionable": True,
+            "entry": 43125.0,
+            "stop": 40988.0,
+            "tp1": 50175.0,
+            "tp2": 52842.0,
+            "rr": 3.30,
+            "admission_rr": 4.55,
+            "reversal_status": {"signal_strength": 0.65, "next_expected": "继续观察"},
+        }
+
+    monkeypatch.setattr(
+        daily_workflow.reversal_pre_market,
+        "build_trade_plan_from_daily_df",
+        fake_build_trade_plan_from_daily_df,
+    )
+
+    actionable, watchlist = daily_workflow.run_reversal_strategy_phase2(
+        [
+            {
+                "symbol": "PS0",
+                "name": "多晶硅",
+                "labels": ["反转候选"],
+                "reversal_score": 65.0,
+                "trend_score": 47.0,
+                "attention_score": 57.8,
+                "strategy_score": 65.0,
+                "reversal_direction": "short",
+                "reason_summary": "库存处于高位100%；最近8周有6周累库",
+                "entry_pool_reason": "反转机会分达标",
+            }
+        ],
+        {
+            "pre_market": {"direction_delta": 12.0},
+            "positions": {"PS0": {"direction": "short"}},
+        },
+        max_picks=3,
+    )
+
+    assert actionable == []
+    assert len(watchlist) == 1
+    assert watchlist[0]["direction"] == "long"
+    assert bool(watchlist[0]["actionable"]) is False
+    assert watchlist[0]["fundamental_conflict"] is True
+    assert "基本面方向" in watchlist[0]["downgrade_reason"]
+
+
+def test_main_no_monitor_runs_phase_4_holdings_even_without_new_candidates(monkeypatch) -> None:
+    calls: list[tuple] = []
+
+    monkeypatch.setattr(daily_workflow, "load_config", lambda: {"pre_market": {}, "intraday": {}})
+    monkeypatch.setattr(daily_workflow, "phase_0_prefetch", lambda: {})
+    monkeypatch.setattr(daily_workflow, "phase_1_screen", lambda all_data, threshold=10: [])
+    monkeypatch.setattr(daily_workflow, "build_trend_universe", lambda all_data, config: [])
+    monkeypatch.setattr(daily_workflow, "run_dual_strategy_phase2", lambda *args, **kwargs: ([], [], {}))
+    monkeypatch.setattr(daily_workflow, "save_targets", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_phase_4_holdings",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daily_workflow.argparse.ArgumentParser,
+        "parse_args",
+        lambda self: argparse.Namespace(
+            no_monitor=True,
+            skip_screen=False,
+            resume=False,
+            threshold=10,
+            max_picks=6,
+            period="5",
+            interval=60,
+        ),
+    )
+    monkeypatch.setattr(daily_workflow.log, "info", lambda *args, **kwargs: None)
+
+    daily_workflow.main()
+
+    assert calls, "expected Phase 4 holdings advice to run even when there are no new candidates"
+    assert calls[0][1]["period"] == "5"
+    assert calls[0][1]["emit_terminal"] is False
+
+
+def test_phase_3_intraday_emits_holdings_alert_only_on_action_change(monkeypatch, capsys) -> None:
+    trading_states = iter([True, False])
+
+    monkeypatch.setattr(daily_workflow, "get_log_path", lambda: "/tmp/test.log")
+    monkeypatch.setattr(daily_workflow, "time_to_next_session", lambda: 0)
+    monkeypatch.setattr(daily_workflow, "try_create_phase3_monitor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow, "is_trading_hours", lambda: next(trading_states))
+    monkeypatch.setattr(daily_workflow.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daily_workflow.log, "info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_phase_4_holdings",
+        lambda *args, **kwargs: print("  🔔 H001 生猪: 继续持有（原有顺势逻辑仍成立；保护止损上移 11142 -> 11151） | 当前价 11540 止损 11151 第一止盈 12265") or {"H001": "上移止损"},
+        raising=False,
+    )
+
+    daily_workflow.phase_3_intraday(
+        [],
+        {"intraday": {}, "pre_market": {}},
+        period="5",
+        interval=0,
+        watchlist=[],
+    )
+
+    out = capsys.readouterr().out
+    assert "H001 生猪: 继续持有（原有顺势逻辑仍成立；保护止损上移 11142 -> 11151）" in out
+
+
+def test_run_phase_4_holdings_reuses_supplied_live_frame(monkeypatch) -> None:
+    infos: list[str] = []
+    supplied_df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2026-04-23"]),
+            "open": [11475.0],
+            "high": [11585.0],
+            "low": [11385.0],
+            "close": [11500.0],
+        }
+    )
+
+    monkeypatch.setattr(daily_workflow, "find_daily_holdings_workbook", lambda **kwargs: Path("/tmp/holdings.xlsx"))
+    monkeypatch.setattr(
+        daily_workflow,
+        "load_holding_contexts",
+        lambda path: [
+            {
+                "record_id": "H001",
+                "holding": {
+                    "record_id": "H001",
+                    "symbol": "LH0",
+                    "name": "生猪",
+                    "direction": "long",
+                    "size": 1,
+                    "entry_price": 11450.0,
+                },
+                "recommendation": {
+                    "record_id": "H001",
+                    "symbol": "LH0",
+                    "name": "生猪",
+                    "direction": "long",
+                    "entry_family": "trend",
+                    "entry": 11450.0,
+                    "first_stop": 11128.0,
+                    "stop": 11128.0,
+                    "tp1": 12265.0,
+                    "tp2": 12445.0,
+                    "rr": 2.70,
+                    "admission_rr": 3.29,
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "get_daily_with_live_bar",
+        lambda symbol, period: (_ for _ in ()).throw(AssertionError("should reuse supplied live frame")),
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "assess_active_trend_hold_from_daily_df",
+        lambda **kwargs: {"hold_valid": True},
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should use trend-specific builder")),
+    )
+    monkeypatch.setattr(
+        daily_workflow.trend_pre_market,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: {
+            "entry": float(kwargs["df"].iloc[-1]["close"]),
+            "first_stop": 11141.0,
+            "stop": 11141.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.13,
+            "admission_rr": 2.63,
+        },
+    )
+    monkeypatch.setattr(
+        daily_workflow.log,
+        "info",
+        lambda msg, *args: infos.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
+
+    actions = daily_workflow.run_phase_4_holdings(
+        {"pre_market": {}},
+        period="5",
+        emit_terminal=False,
+        live_frames={"LH0": supplied_df},
+    )
+
+    assert actions == {"H001": "继续持有|上移止损|11141"}
+    assert any("当前重评: 入场11500" in message for message in infos)
+
+
+def test_phase_3_intraday_passes_watchlist_live_frame_to_phase_4(monkeypatch) -> None:
+    trading_states = iter([True, False])
+    captured_live_frames: dict[str, pd.DataFrame] = {}
+
+    class DummyMonitor:
+        def describe_subscription(self) -> str:
+            return "LH0 daily"
+
+        def daily_df(self, symbol: str) -> pd.DataFrame:
+            assert symbol == "LH0"
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2026-04-23"]),
+                    "open": [11475.0],
+                    "high": [11585.0],
+                    "low": [11385.0],
+                    "close": [11500.0],
+                }
+            )
+
+        def wait_interval(self, seconds: float) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(daily_workflow, "get_log_path", lambda: "/tmp/test.log")
+    monkeypatch.setattr(daily_workflow, "time_to_next_session", lambda: 0)
+    monkeypatch.setattr(daily_workflow, "try_create_phase3_monitor", lambda *args, **kwargs: DummyMonitor())
+    monkeypatch.setattr(daily_workflow, "is_trading_hours", lambda: next(trading_states))
+    monkeypatch.setattr(daily_workflow.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daily_workflow.log, "info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(daily_workflow.log, "warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        daily_workflow,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should use trend-specific builder")),
+    )
+    monkeypatch.setattr(
+        daily_workflow.trend_pre_market,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "strategy_family": "trend_following",
+            "score": 42.0,
+            "actionable": True,
+            "price": 11500.0,
+            "entry": 11500.0,
+            "stop": 11141.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.13,
+            "admission_rr": 2.63,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "趋势回撤",
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Pullback",
+                "signal_bar": {"low": 11385.0},
+                "confidence": 0.72,
+            },
+            "trend_status": {
+                "has_signal": True,
+                "signal_type": "Pullback",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        daily_workflow,
+        "run_phase_4_holdings",
+        lambda *args, **kwargs: captured_live_frames.update(kwargs.get("live_frames") or {}) or {},
+        raising=False,
+    )
+
+    daily_workflow.phase_3_intraday(
+        [],
+        {"intraday": {}, "pre_market": {}},
+        period="5",
+        interval=0,
+        watchlist=[
+            {
+                "symbol": "LH0",
+                "name": "生猪",
+                "direction": "long",
+                "entry": 11450.0,
+                "stop": 11128.0,
+                "tp1": 12265.0,
+                "tp2": 12445.0,
+                "rr": 2.70,
+                "admission_rr": 3.29,
+                "entry_family": "trend",
+                "entry_signal_type": "Pullback",
+                "entry_signal_detail": "趋势回撤",
+            }
+        ],
+    )
+
+    assert "LH0" in captured_live_frames
+    assert float(captured_live_frames["LH0"].iloc[-1]["close"]) == 11500.0

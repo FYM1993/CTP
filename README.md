@@ -65,7 +65,7 @@ python scripts/daily_workflow.py --resume
 # 调整 Phase 1 基本面 threshold 原始值
 python scripts/daily_workflow.py --threshold 25
 
-# 聚合后最多保留 N 个 actionable
+# 聚合后最多保留 N 个可执行目标
 python scripts/daily_workflow.py --max-picks 4
 
 # 指定 Phase 3 使用的分钟周期
@@ -182,20 +182,20 @@ Universe 规则：
 - 多头目标信号：`SC`、`StopVol_Bull`、`Spring`、`SOS`
 - 空头目标信号：`BC`、`StopVol_Bear`、`UT`、`SOW`
 
-其中真正的 entry-class 信号是：
+其中真正的确认型事件是：
 
 - 多头：`Spring`、`SOS`
 - 空头：`UT`、`SOW`
 
-当前新鲜度定义：
+当前确认新鲜度定义：
 
 - `REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO = 2`
-- 也就是 `signal_days_ago <= 2` 才算 fresh reversal signal
+- 也就是 `signal_days_ago <= 2` 才算新鲜反转确认
 
-当前 Phase 2A 的 actionable 条件：
+当前 Phase 2A 的可执行条件：
 
-- 存在有效 reversal signal
-- 信号类型属于 `Spring/SOS/UT/SOW`
+- 存在有效反转确认
+- 确认类型属于 `Spring/SOS/UT/SOW`
 - `signal_strength >= 0.65`
 - 分数 gate 通过
 - `rr >= 1.0`
@@ -203,14 +203,14 @@ Universe 规则：
 其中分数 gate 不是一个固定阈值：
 
 - 先尝试常规 `_score_gate()`
-- 如果常规分数不过，但属于 fresh reversal，则允许走 soft countertrend gate
+- 如果常规分数不过，但属于新鲜反转确认，则允许走 soft countertrend gate
 - soft threshold 会随 `signal_type` 和 `signal_strength` 提高或放宽
   - `SOS/SOW` 比 `Spring/UT` 更强
   - `signal_strength >= 0.85` 比 `0.75` 更强
 
-输出字段包括：
+底层返回里还会带这些技术字段，供聚合、调试和回测复用：
 
-- `actionable`
+- `actionable`：是否已进入可执行状态
 - `entry / stop / tp1 / tp2 / rr`
 - `entry_family = reversal`
 - `entry_signal_type`
@@ -220,12 +220,12 @@ Universe 规则：
 - `reversal_status.current_stage`
 - `reversal_status.next_expected`
 
-这意味着 Phase 2A 不只是给一个 yes/no，它还会保留 watch 级别诊断，说明当前卡在：
+这意味着 Phase 2A 不只是给一个 yes/no，它还会保留观察级别诊断，说明当前卡在：
 
-- 没信号
-- fresh signal 但分数 gate 没过
-- fresh signal 但 rr 没过
-- 已有旧信号但过了入场窗口
+- 还没有确认
+- 确认新鲜，但分数 gate 没过
+- 确认新鲜，但 rr 没过
+- 已有旧确认，但过了执行窗口
 
 #### A-3. Phase 3 共享日内执行
 
@@ -236,9 +236,10 @@ Strategy A 的盘中执行不再自己写一套日内开仓逻辑，而是复用
 
 当前 Phase 3 的做法是：
 
-- 先拿到 Phase 2A 的 actionable 日线计划
-- 再在分钟线里调用 `generate_signals()`
-- 只有出现 `开多` 或 `开空` 时才真正开仓
+- 先拿到 Phase 2A 的日线计划
+- 对已经可执行的目标，固定按“日线计划 -> 执行状态 -> 分钟级执行辅助观察”输出
+- 分钟级观察只负责补充短线节奏和执行风险，不再充当独立下单判断
+- 对观察名单，会提示“确认出现 / 确认持续 / 确认回退”
 
 共享日内信号当前主要基于：
 
@@ -277,7 +278,7 @@ Strategy B 不依赖 Phase 1。
 - `trend_score >= 60`
 - `resolved_direction != watch`
 
-输出字段：
+候选列表里的关键技术字段：
 
 - `trend_score`
 - `attention_score = trend_score`
@@ -306,14 +307,14 @@ Strategy B 的 universe 只基于价格/技术结构，不读 Phase 1 的 `label
 - `score_ok`
   - 总分 gate 通过
 
-当前 signal type 只有两类：
+当前确认类型只有两类：
 
 - `Pullback`
 - `TrendBreak`
 
-趋势计划的 actionable 条件：
+趋势计划的可执行条件：
 
-- 有趋势 continuation signal
+- 有趋势延续确认
 - `score_ok`
 - `rr >= 1.0`
 
@@ -331,7 +332,7 @@ Strategy B 的 universe 只基于价格/技术结构，不读 Phase 1 的 `label
 
 1. 分别跑 A 的 `Phase 1 -> Phase 2A`
 2. 分别跑 B 的 `trend universe -> Phase 2B`
-3. 合并两条策略线的 actionable / watchlist
+3. 合并两条策略线的可执行目标和等待确认列表
 4. 保留 `strategy_family`、`entry_family`、`entry_signal_type` 等归因字段
 
 盘前深度分析阶段：
@@ -339,14 +340,14 @@ Strategy B 的 universe 只基于价格/技术结构，不读 Phase 1 的 `label
 - A 策略先从 reversal candidates 里取前 `max(2*max_picks, max_picks)` 个做 P2A
 - B 策略先从 trend candidates 里取前 `max(2*max_picks, max_picks)` 个做 P2B
 - 每条策略线内部会用 RRF 融合 screen 分数和 Phase 2 分数
-- 最终全局 actionable 再按 `rrf_score` 合并，并截断到 `max_picks`
+- 最终全局可执行目标再按 `rrf_score` 合并，并截断到 `max_picks`
 
-聚合后保留的关键字段包括：
+聚合结果里保留的关键技术字段包括：
 
 - `strategy_family`
 - `direction`
 - `score`
-- `actionable`
+- `actionable`：是否已进入可执行状态
 - `entry_family`
 - `entry_signal_type`
 - `entry_signal_detail`
@@ -360,16 +361,14 @@ Strategy B 的 universe 只基于价格/技术结构，不读 Phase 1 的 `label
 
 盘中分成两类对象：
 
-- actionable：拉分钟线，跑共享日内信号面板
-- watchlist：拉日线，打印 reversal signal 的出现 / 持续 / 消失
+- 可执行目标：拉分钟线，按“日线计划 -> 执行状态 -> 分钟级执行辅助观察”输出
+- 观察名单：拉日线，提示对应交易故事的“确认出现 / 持续 / 回退”
 
-当前实现有一个重要事实：
+当前实现里，观察名单已经按交易故事分流：
 
-- watchlist 的终端提示目前统一走 `assess_reversal_status()`
-- 也就是说，盘中 watchlist 提示更偏向“反转预警”
-- 它不是一套独立的 trend watch monitor
-
-这点是当前代码实现，不是文档抽象。
+- 顺势机会输出顺势确认和顺势确认条件
+- 反转机会输出反转确认和反转确认条件
+- 分钟级提示只保留为执行辅助观察，不再和日线级主判断抢角色
 
 ## 回测
 
@@ -405,15 +404,15 @@ python scripts/run_backtest.py --case ps0_reversal_short --rolling --debug-phase
 
 当前诊断会打印：
 
-- `phase2_actionable_days`
-- `phase2_non_actionable_days`
+- `phase2_actionable_days`：进入可执行状态的交易日数
+- `phase2_non_actionable_days`：仍在等待确认的交易日数
 - `phase2_reject_*`
 - `trades_opened*`
 - rolling 模式下每个 window 的 Phase 2 / Phase 3 汇总
 
 当前 `phase2_state` 取值来自回测 debug 汇总，常见包括：
 
-- `actionable`
+- `actionable`：当天进入可执行状态
 - `no_signal`
 - `score_gate`
 - `rr_gate`
@@ -431,9 +430,9 @@ python scripts/run_backtest.py --case ps0_reversal_short --rolling --debug-phase
 
 回测当前逻辑是：
 
-- 先用日线计划判断当天是否 actionable
+- 先用日线计划判断当天是否已经达到可执行条件
 - 再把当日分钟线逐 bar 喂给 `generate_signals()`
-- 只有分钟信号真正出现 `开多` / `开空` 才会开仓
+- 分钟级结果只作为执行辅助观察，真正的开仓仍以前面已经成立的日线计划为前提
 
 当前回测 exit reason 主要包括：
 

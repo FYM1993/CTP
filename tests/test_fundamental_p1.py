@@ -207,7 +207,117 @@ def test_save_targets_does_not_emit_obsolete_phase1_direction_risk_flags(
     daily_workflow.save_targets(targets, [], phase1_summary=summary)
 
     md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "**交易故事确认**: [反转] 弹簧(Spring) (2026-04-15)" in md_text
+    assert "- 确认详情: 测试信号" in md_text
+    assert "- 入场依据: 当前价（确认于2026-04-15触发，新鲜可执行）" in md_text
     assert "⚠️P1P2异号/逆势" not in md_text
+
+
+def test_save_targets_renders_downgrade_and_extended_target_notes(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    targets = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 66.0,
+            "price": 100.0,
+            "entry": 101.0,
+            "stop": 95.0,
+            "tp1": 104.0,
+            "tp2": 118.0,
+            "rr": 0.50,
+            "admission_rr": 2.83,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 2,
+            "fund_screen_score": 66.0,
+            "attention_score": 72.0,
+            "signal_strength": 0.75,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "库存下降",
+            "reason_summary": "库存下降",
+            "entry_pool_reason": "反转机会分达标",
+            "actionable": True,
+            "entry_family": "reversal",
+            "entry_plan_type": "extended_target",
+            "management_note": "第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈",
+            "phase2_rr_gate_passed": True,
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Spring",
+                "signal_date": "2026-04-15",
+                "signal_strength": 0.75,
+                "current_stage": "accumulation",
+                "confidence": 0.8,
+                "signal_detail": "测试信号",
+            },
+        }
+    ]
+    watchlist = [
+        {
+            "symbol": "PS0",
+            "name": "多晶硅",
+            "direction": "long",
+            "score": 30.0,
+            "price": 43125.0,
+            "entry": 43125.0,
+            "stop": 40988.0,
+            "tp1": 50175.0,
+            "tp2": 52842.0,
+            "rr": 3.30,
+            "admission_rr": 4.55,
+            "rrf_score": 0.1000,
+            "rank_p1": 2,
+            "rank_p2": 2,
+            "fund_screen_score": 65.0,
+            "attention_score": 57.8,
+            "signal_strength": 0.65,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "库存处于高位100%",
+            "reason_summary": "库存处于高位100%",
+            "entry_pool_reason": "反转机会分达标",
+            "actionable": False,
+            "entry_family": "reversal",
+            "downgrade_reason": "价格跌回突破位44350下方；基本面方向做空与交易方向做多冲突",
+            "phase2_price_gate_passed": False,
+            "phase2_risk_gate_passed": True,
+            "phase2_rr_gate_passed": True,
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "SOS",
+                "signal_date": "2026-04-15",
+                "signal_strength": 0.65,
+                "current_stage": "反转确认",
+                "confidence": 0.7,
+                "signal_detail": "测试弱确认",
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(targets, watchlist, phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "- 计划类型: 依赖第二止盈的延展计划" in md_text
+    assert "- 仓位管理: 第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈" in md_text
+    assert "价格跌回突破位44350下方；基本面方向做空与交易方向做多冲突" in md_text
+    assert "确认于2026-04-15触发，但未达执行条件" in md_text
+    assert "测试弱确认" in md_text
+    downgraded_section = md_text.split("### 多晶硅(主力)", 1)[1]
+    assert "新鲜可执行" not in downgraded_section
 
 
 def test_save_targets_renders_trend_plan_from_entry_family(monkeypatch, tmp_path) -> None:
@@ -265,9 +375,118 @@ def test_save_targets_renders_trend_plan_from_entry_family(monkeypatch, tmp_path
     daily_workflow.save_targets(targets, [], phase1_summary=summary)
 
     md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
-    assert "**入场信号**: [顺势] 顺势回撤(Pullback)" in md_text
-    assert "- 信号详情: markup 阶段顺势回踩" in md_text
+    assert "## 可执行品种一览" in md_text
+    assert "| ✅可执行 | 生猪(主力) |" in md_text
+    assert "**交易故事确认**: [顺势] 顺势回撤(Pullback)" in md_text
+    assert "- 确认详情: markup 阶段顺势回踩" in md_text
+    assert "- 入场依据: 当前价（顺势回撤(Pullback)条件满足，按顺势计划执行）" in md_text
+    assert "**入场信号**:" not in md_text
     assert "尚无有效入场信号" not in md_text
+
+
+def test_save_targets_uses_trade_story_wording_for_watchlist(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    watchlist = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "score": 18.0,
+            "price": 100.0,
+            "entry": 101.0,
+            "stop": 97.0,
+            "tp1": 109.0,
+            "tp2": 113.0,
+            "rr": 0.8,
+            "admission_rr": 0.8,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 2,
+            "fund_screen_score": 66.0,
+            "attention_score": 72.0,
+            "signal_strength": 0.7,
+            "labels": ["趋势候选"],
+            "phase1_labels": ["趋势候选"],
+            "phase1_reason_summary": "库存下降",
+            "reason_summary": "库存下降",
+            "entry_pool_reason": "趋势机会分达标",
+            "actionable": False,
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "entry_signal_detail": "markup 阶段顺势回踩",
+            "reversal_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_date": "",
+                "signal_strength": 0.0,
+                "current_stage": "markup",
+                "confidence": 0.0,
+                "signal_detail": "",
+            },
+        },
+        {
+            "symbol": "RB0",
+            "name": "螺纹钢",
+            "direction": "long",
+            "score": 12.0,
+            "price": 3200.0,
+            "entry": 0.0,
+            "stop": 0.0,
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "rr": 0.0,
+            "rrf_score": 0.0833,
+            "rank_p1": 2,
+            "rank_p2": 5,
+            "fund_screen_score": 60.0,
+            "attention_score": 68.0,
+            "signal_strength": 0.2,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "基差偏强",
+            "reason_summary": "基差偏强",
+            "entry_pool_reason": "反转机会待确认",
+            "actionable": False,
+            "entry_family": "reversal",
+            "entry_signal_type": "",
+            "entry_signal_detail": "",
+            "reversal_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_date": "",
+                "signal_strength": 0.0,
+                "current_stage": "accumulation",
+                "confidence": 0.0,
+                "signal_detail": "",
+                "next_expected": "",
+            },
+        },
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets([], watchlist, phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "## 今日等待确认（尚无可执行品种）" in md_text
+    assert "已出现顺势确认（顺势回撤），待执行条件改善" in md_text
+    assert "**交易故事确认**: ⏳ 等待反转确认" in md_text
+    assert "- ⚠️ 未达执行条件: 交易故事尚未确认" in md_text
+    assert "- 反转确认: Spring(假跌破收回) 或 SOS(放量突破)" in md_text
+    assert "- 顺势确认: 缩量回踩MA20企稳 或 放量突破前高" in md_text
+    assert "### 螺纹钢(主力) — 做多 — 等待确认" in md_text
+    assert "今日观望" not in md_text
+    assert "待入场条件改善" not in md_text
+    assert "无有效入场信号" not in md_text
 
 
 def test_save_targets_cleans_nested_numpy_in_strategy_results(monkeypatch, tmp_path) -> None:

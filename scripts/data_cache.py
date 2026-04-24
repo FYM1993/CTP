@@ -30,9 +30,8 @@ from contextlib import contextmanager
 import pandas as pd
 import numpy as np
 import akshare as aks
-import yaml
-
 from shared.ctp_log import get_logger
+from shared.config_loader import load_yaml_config
 from market.tq import (
     create_tq_api as _create_tq_api,
     fetch_daily_from_tq as _tq_fetch_daily_from_tq,
@@ -68,13 +67,7 @@ class PrefetchStats:
 
 
 def _load_config() -> dict:
-    cfg_path = Path(__file__).parent.parent / "config.yaml"
-    try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-            return data or {}
-    except Exception:
-        return {}
+    return load_yaml_config(__file__, required=False)
 
 
 def _exchange_for_symbol(symbol: str) -> str | None:

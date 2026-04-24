@@ -8,14 +8,17 @@
     一次性拉取所有品种日线，缓存到本地 parquet
     当日首次运行会远端抓取日线，后续优先复用当日缓存
 
-  Phase 1 — 全市场筛选 (盘前)
-    基于已加载的日线数据分析，不再重复抓取日线
+  Phase 1 — 机会发现 (盘前)
+    负责缩小观察范围，找出值得继续跟踪的品种
 
-  Phase 2 — 盘前深度分析 (盘前)
-    对筛选出的品种做深度分析，不再重复抓取日线
+  Phase 2 — 交易计划 (盘前)
+    负责确定交易方向、策略类型和原始交易计划
 
-  Phase 3 — 盘中实时监控 (09:00-15:00 / 21:00-23:30)
-    分钟K线实时拉取（无法缓存）
+  Phase 3 — 盘中计划更新 (09:00-15:00 / 21:00-23:30)
+    负责在盘中更新第二阶段已经确定的计划，不改换策略
+
+  Phase 4 — 持仓管理
+    负责基于盘中快照和持仓成本给出持仓建议
 
 使用方法:
     python scripts/daily_workflow.py                  # 完整流程
@@ -31,12 +34,18 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import yaml
 import numpy as np
 import pandas as pd
 
 from shared.ctp_log import get_log_path, get_logger
+from shared.config_loader import load_yaml_config
 from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
+from shared.workflow_contract import build_workflow_contract_lines, build_workflow_contract_summary
+from shared.workflow_wording import (
+    daily_entry_plan_label,
+    phase3_terminal_scope,
+    watchlist_update_header,
+)
 
 from data_cache import (
     get_all_symbols, get_daily, get_minute,
@@ -46,6 +55,8 @@ from data_cache import (
 )
 from phase2.pre_market import (
     analyze_one,
+    assess_active_reversal_hold_from_daily_df,
+    assess_active_trend_hold_from_daily_df,
     build_trade_plan_from_daily_df,
     resolve_phase2_direction,
     score_signals,
@@ -58,14 +69,24 @@ from strategy_reversal.screen import select_reversal_candidates
 from strategy_trend.screen import build_trend_universe as build_trend_universe_candidates, select_trend_candidates
 from strategy_reversal import pre_market as reversal_pre_market
 from strategy_trend import pre_market as trend_pre_market
+from holdings_advice import (
+    analyze_holding_record,
+    build_holdings_summary_line,
+    default_holdings_root,
+    find_daily_holdings_workbook,
+    format_holding_log_block,
+    format_holding_terminal_alert,
+    format_plan_line,
+    holding_alert_state_key,
+    load_holding_contexts,
+    should_emit_terminal_alert,
+)
 
 log = get_logger("workflow")
 
 
 def load_config() -> dict:
-    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml_config(__file__)
 
 
 # ============================================================
@@ -353,12 +374,69 @@ def _build_fund_reason(cand: dict) -> str:
     return ", ".join(fund_parts) if fund_parts else ""
 
 
+def _normalize_plan_direction(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"long", "多", "做多"}:
+        return "long"
+    if text in {"short", "空", "做空"}:
+        return "short"
+    return ""
+
+
+def _direction_cn(direction: str) -> str:
+    return "做多" if direction == "long" else "做空"
+
+
+def _append_downgrade_reason(existing: str, reason: str) -> str:
+    if not reason:
+        return existing
+    if not existing:
+        return reason
+    return f"{existing}；{reason}"
+
+
+def _fundamental_conflict_reason(
+    *,
+    cand: dict,
+    result: dict,
+    strategy_family: str,
+    config: dict,
+) -> str:
+    trade_direction = _normalize_plan_direction(result.get("direction"))
+    if trade_direction not in {"long", "short"}:
+        return ""
+
+    if strategy_family == STRATEGY_REVERSAL:
+        phase1_direction = _normalize_plan_direction(cand.get("reversal_direction"))
+    else:
+        phase1_direction = _normalize_plan_direction(cand.get("trend_direction"))
+
+    reasons: list[str] = []
+    if phase1_direction in {"long", "short"} and phase1_direction != trade_direction:
+        reasons.append(
+            f"基本面方向{_direction_cn(phase1_direction)}与交易方向{_direction_cn(trade_direction)}冲突"
+        )
+
+    symbol = str(cand.get("symbol") or result.get("symbol") or "")
+    configured_direction = ""
+    position_cfg = (config.get("positions") or {}).get(symbol)
+    if isinstance(position_cfg, dict):
+        configured_direction = _normalize_plan_direction(position_cfg.get("direction"))
+    if configured_direction in {"long", "short"} and configured_direction != trade_direction:
+        reasons.append(
+            f"配置方向{_direction_cn(configured_direction)}与交易方向{_direction_cn(trade_direction)}冲突"
+        )
+
+    return "；".join(reasons)
+
+
 def _merge_strategy_result(
     *,
     cand: dict,
     result: dict,
     resolved_direction: str,
     strategy_family: str,
+    config: dict,
 ) -> dict:
     merged = dict(result)
     merged["strategy_family"] = merged.get("strategy_family") or strategy_family
@@ -384,6 +462,19 @@ def _merge_strategy_result(
     merged["signal_strength"] = merged.get("reversal_status", {}).get("signal_strength", 0.0)
     merged["phase2_decision"] = resolved_direction
     merged["entry_pool_reason"] = cand.get("entry_pool_reason", "")
+    conflict_reason = _fundamental_conflict_reason(
+        cand=cand,
+        result=merged,
+        strategy_family=strategy_family,
+        config=config,
+    )
+    merged["fundamental_conflict"] = bool(conflict_reason)
+    if conflict_reason:
+        merged["actionable"] = False
+        merged["downgrade_reason"] = _append_downgrade_reason(
+            str(merged.get("downgrade_reason") or ""),
+            conflict_reason,
+        )
     return merged
 
 
@@ -462,6 +553,7 @@ def _run_strategy_phase2(
             result=result,
             resolved_direction=resolved_direction,
             strategy_family=strategy_family,
+            config=config,
         )
         if merged_result["actionable"]:
             actionable.append(merged_result)
@@ -538,8 +630,8 @@ def phase_2_premarket(
 ) -> tuple[list[dict], list[dict]]:
     """
     返回 (actionable, watchlist)：
-      actionable: 满足入场条件（评分达标 + 盈亏比 >= 1.0）
-      watchlist:  评分有倾向但不满足入场条件（今日观望）
+      actionable: 底层字段名沿用 actionable，含义是“今天已进入可执行状态”
+      watchlist:  评分有倾向，但今天仍在等待确认
     """
     log.info("\n" + "▓" * 60)
     log.info("▓  Phase 2: 盘前深度分析")
@@ -644,11 +736,11 @@ def phase_2_premarket(
     log.info(f"\n{'='*60}")
     act_count = len(actionable)
     watch_count = len(watchlist)
-    log.info("  📋 Phase 2 汇总: %s 个可操作, %s 个观望", act_count, watch_count)
+    log.info("  📋 Phase 2 汇总: %s 个可执行, %s 个等待确认", act_count, watch_count)
     log.info("%s", "=" * 60)
 
     if actionable:
-        log.info(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'信号':>6s} {'强度':>5s} {'入场':>8s} {'盈亏比':>6s}")
+        log.info(f"\n  {'':2s}{'品种':8s} {'代码':6s} {'方向':4s} {'RRF':>7s} {'#P1':>4s} {'#P2':>4s} {'基本面':>6s} {'技术面':>6s} {'确认':>6s} {'强度':>5s} {'执行价':>8s} {'盈亏比':>6s}")
         log.info(f"  {'─'*88}")
         for a in actionable:
             entry_signal = _resolve_entry_signal(a)
@@ -669,14 +761,7 @@ def phase_2_premarket(
         log.info(f"  {'─'*88}")
         top_watch = watchlist[:max(3, max_picks - act_count)]
         for w in top_watch:
-            rev = w.get("reversal_status", {})
-            entry_signal = _resolve_entry_signal(w)
-            if entry_signal["has_signal"]:
-                family_cn = entry_signal["family_cn"]
-                signal_label = entry_signal["display_label"]
-                next_exp = f"已有{family_cn}{signal_label}，待入场条件改善"
-            else:
-                next_exp = rev.get("next_expected", _default_waiting_hint(w))
+            next_exp = _format_watchlist_story_status(w)
             dir_str = "做多" if w["direction"] == "long" else "做空"
             rrf = w.get("rrf_score", 0)
             r1 = w.get("rank_p1", 0)
@@ -708,16 +793,20 @@ def phase_3_intraday(
     watchlist: list[dict] | None = None,
 ):
     """
-    盘中实时监控：对「可操作」品种拉分钟 K 并打印仪表盘；对「观望」品种做日线级信号检测。
+    盘中计划更新。
+
+    这一步只负责更新第二阶段已经确定的交易计划，不负责改换策略类型。
+    盘前被定义为顺势的品种，盘中仍按顺势框架更新；盘前被定义为反转的品种，
+    盘中仍按反转框架更新。若盘前没有达到入场条件，但盘中出现了更好的入场时机，
+    也只能在原有策略框架内补抓机会。
 
     Parameters
     ----------
     targets
-        Phase 2 判定为可操作的品种列表（分钟级 K 线 + `print_dashboard`）。
+        Phase 2 判定为可执行的品种列表（分钟级 K 线 + `print_dashboard`）。
     watchlist
-        观望列表（可选）。非空时对每个品种做日线级 `assess_reversal_status`，
-        并与上一轮 `prev_signals` 对比打印「新出现 / 持续 / 消失 / 无信号」等提示；
-        具体文案会按 Phase 2 的 `entry_family` 区分顺势/反转。
+        等待确认列表（可选）。非空时对每个品种用最新盘中日线重评交易计划，
+        并与上一轮状态对比打印“确认新出现 / 持续 / 回退”等提示。
     config
         全局配置，读取 `intraday` 段传入 `print_dashboard`。
         若配置 `tqsdk.account` / `tqsdk.password` 且已安装 tqsdk，则 Phase 3 使用 TqSdk
@@ -731,23 +820,34 @@ def phase_3_intraday(
     --------
     - 开盘前若不在交易时段，先 `time_to_next_session` 等待。
     - 每轮：先处理全部 `targets`，再处理 `watchlist`（若有）。
-    - 观望品种每轮结束时在 ``finally`` 中写入 ``prev_signals[sym]``。
+    - 等待确认品种每轮结束时记录本轮确认状态，供下一轮判断“新出现 / 持续 / 回退”。
+    - 同一轮盘中快照会继续传给第四阶段，保证新开仓计划更新和持仓建议使用同一份输入。
     """
+    prev_hold_actions: dict[str, str] = {}
     all_monitor = targets + (watchlist or [])
     if not all_monitor:
-        log.info("\n  没有可操作/观望品种，跳过盘中监控")
-        return
+        log.info("\n  没有可执行/等待确认品种，先检查持仓建议")
+        prev_hold_actions = run_phase_4_holdings(
+            config,
+            period=period,
+            emit_terminal=True,
+            previous_actions=prev_hold_actions,
+            log_header=True,
+        )
+        if not prev_hold_actions:
+            log.info("\n  没有可执行/等待确认品种，也没有持仓建议，跳过盘中监控")
+            return
 
     intraday_cfg = config.get("intraday", {})
 
-    print(f"盘中监控：终端仅打印观望品种信号出现/持续/消失；其余见 {get_log_path()}")
+    _print_and_log(phase3_terminal_scope(get_log_path()))
     log.info("\n" + "▓" * 60)
     log.info("▓  Phase 3: 盘中实时监控")
     log.info("▓" * 60)
     act_names = ", ".join(t["name"] for t in targets) if targets else "无"
     watch_names = ", ".join(t["name"] for t in (watchlist or [])) if watchlist else "无"
-    log.info("\n  可操作: %s", act_names)
-    log.info("  信号观察: %s", watch_names)
+    log.info("\n  可执行: %s", act_names)
+    log.info("  确认观察: %s", watch_names)
     log.info("  K线周期: %s分钟  |  刷新: %s秒", period, interval)
 
     tq_mon = None
@@ -779,10 +879,9 @@ def phase_3_intraday(
               "Pullback": "顺势回撤", "TrendBreak": "顺势突破"}
     pre_cfg = config.get("pre_market", {})
 
-    # 记录上轮每个品种的信号状态，用于检测信号出现/消失
+    # 记录上轮每个品种的确认状态，用于检测确认出现/回退
     prev_signals: dict[str, bool] = {}
     prev_watch_rows: dict[str, dict] = {}
-
     cycle = 0
     ended_after_trading_hours = False
     try:
@@ -790,6 +889,7 @@ def phase_3_intraday(
             try:
                 cycle += 1
                 now = datetime.now()
+                current_cycle_live_frames: dict[str, pd.DataFrame] = {}
                 log.info(f"\n{'═'*60}")
                 log.info(
                     "  盘中监控 #%s  %s  K线:%s分钟",
@@ -799,7 +899,7 @@ def phase_3_intraday(
                 )
                 log.info("%s", "═" * 60)
 
-                # --- 可操作品种: 分钟级监控 ---
+                # --- 可执行品种: 分钟级监控 ---
                 for t in targets:
                     try:
                         if tq_mon:
@@ -809,25 +909,29 @@ def phase_3_intraday(
                         if df is None or df.empty:
                             log.info("\n  %s: 无数据", t["name"])
                             continue
-                        print_dashboard(t["symbol"], t["name"], t["direction"], df, intraday_cfg)
                         entry_signal = _resolve_entry_signal(t)
                         if entry_signal["has_signal"]:
                             signal_date = str(entry_signal["signal_date"])
                             signal_date_part = f" {signal_date}" if signal_date else ""
                             log.info(
-                                "│ 📌 入场信号: %s %s  入场%s  止损%s  目标%s",
+                                "│ 📌 %s: %s %s  入场%s  止损%s  目标%s",
+                                daily_entry_plan_label(),
                                 entry_signal["display_label"],
                                 signal_date_part,
                                 f"{t['entry']:.0f}",
                                 f"{t['stop']:.0f}",
                                 f"{t['tp1']:.0f}",
                             )
+                            execution_line = _format_intraday_execution_line(t, df)
+                            if execution_line:
+                                log.info(execution_line)
+                        print_dashboard(t["symbol"], t["name"], t["direction"], df, intraday_cfg)
                     except Exception as e:
                         log.info("\n  %s: ❌ %s", t["name"], e)
 
-                # --- 观望品种: 日线信号检测（TqSdk 用交易所日线序列含当日未完成K线；否则合成日线）---
+                # --- 等待确认品种: 日线确认检测（TqSdk 用交易所日线序列含当日未完成K线；否则合成日线）---
                 if watchlist:
-                    log.info("\n  ── 盘中信号检测 ──")
+                    log.info("\n  ── %s ──", watchlist_update_header())
                     for w in watchlist:
                         sym = w["symbol"]
                         has_signal = False
@@ -840,14 +944,17 @@ def phase_3_intraday(
                             if live_df is None or live_df.empty:
                                 log.warning("  ⚠️ %s: 无数据", w["name"])
                                 continue
+                            current_cycle_live_frames[sym] = live_df
 
                             previous_watch = prev_watch_rows.get(sym, _normalize_phase2_plan_row(w))
-                            live_plan = build_trade_plan_from_daily_df(
+                            live_plan = _build_strategy_scoped_trade_plan(
+                                base_row=w,
                                 symbol=sym,
                                 name=w["name"],
                                 direction=w["direction"],
                                 df=live_df,
                                 cfg=pre_cfg,
+                                allow_watch_plan=True,
                             )
                             current_watch = _merge_intraday_watch_plan(w, live_plan)
                             rev = current_watch.get("reversal_status")
@@ -867,47 +974,44 @@ def phase_3_intraday(
 
                             if has_signal and not had_signal:
                                 signal_noun, sig_cn = _intraday_watch_signal_text(current_watch, str(rev.get("signal_type") or ""))
-                                sig_bar = rev.get("signal_bar", {})
                                 dir_cn = "做多" if current_watch["direction"] == "long" else "做空"
-
-                                if current_watch["direction"] == "long":
-                                    confirm = f"收盘维持在 {sig_bar.get('low', 0):.0f} 以上"
-                                else:
-                                    confirm = f"收盘维持在 {sig_bar.get('high', 0):.0f} 以下"
+                                confirm = _intraday_watch_confirmation_text(current_watch)
 
                                 pool_r = current_watch.get("entry_pool_reason") or ""
                                 pool_line = f"       入池理由: {pool_r}" if pool_r else ""
-                                print(f"  🔔🔔 {current_watch['name']} 出现{signal_noun}")
-                                print(f"       信号: {sig_cn} | 计划方向: {dir_cn}")
+                                _print_and_log(f"  🔔🔔 {current_watch['name']} 出现{signal_noun}")
+                                _print_and_log(f"       确认: {sig_cn} | 计划方向: {dir_cn}")
                                 if pool_line:
-                                    print(pool_line)
-                                print(f"       {live_info}")
-                                print(f"       {_format_intraday_trade_plan(current_watch)}")
+                                    _print_and_log(pool_line)
+                                _print_and_log(f"       {live_info}")
+                                _print_and_log(f"       {_format_intraday_trade_plan(current_watch)}")
                                 if plan_changed:
-                                    print("       🔄 盘中重评后交易计划已更新")
+                                    _print_and_log("       🔄 盘中重评后交易计划已更新")
                                 if actionable_upgraded:
-                                    print(
-                                        f"       ✅ 盘中重评后转为可操作：评分{float(current_watch.get('score', 0.0)):+.0f} "
+                                    _print_and_log(
+                                        f"       ✅ 盘中重评后转为可执行：评分{float(current_watch.get('score', 0.0)):+.0f} "
                                         f"准入RR {float(current_watch.get('admission_rr', current_watch.get('rr', 0.0))):.2f}"
                                     )
-                                print(f"       确认条件: {confirm}")
-                                print(f"       置信度: {rev['confidence']:.0%}")
+                                _print_and_log(f"       确认条件: {confirm}")
+                                if entry_signal["entry_family"] == "reversal" and rev.get("confidence") is not None:
+                                    _print_and_log(f"       置信度: {float(rev['confidence']):.0%}")
 
                             elif has_signal and had_signal:
                                 _, sig_cn = _intraday_watch_signal_text(current_watch, str(rev.get("signal_type") or ""))
-                                print(f"  🟢 {current_watch['name']}: {sig_cn}信号持续 | {live_info}")
-                                print(f"       {_format_intraday_trade_plan(current_watch)}")
+                                _print_and_log(f"  🟢 {current_watch['name']}: {sig_cn}确认持续 | {live_info}")
+                                _print_and_log(f"       {_format_intraday_trade_plan(current_watch)}")
                                 if plan_changed:
-                                    print("       🔄 盘中重评后交易计划已更新")
+                                    _print_and_log("       🔄 盘中重评后交易计划已更新")
                                 if actionable_upgraded:
-                                    print(
-                                        f"       ✅ 盘中重评后转为可操作：评分{float(current_watch.get('score', 0.0)):+.0f} "
+                                    _print_and_log(
+                                        f"       ✅ 盘中重评后转为可执行：评分{float(current_watch.get('score', 0.0)):+.0f} "
                                         f"准入RR {float(current_watch.get('admission_rr', current_watch.get('rr', 0.0))):.2f}"
                                     )
 
                             elif not has_signal and had_signal:
-                                print(f"  ❌ {current_watch['name']}: 信号已消失（价格回落），继续观望")
-                                print(f"       {live_info}")
+                                waiting_text = _default_waiting_hint(current_watch)
+                                _print_and_log(f"  ❌ {current_watch['name']}: 确认已回退，重新{waiting_text}")
+                                _print_and_log(f"       {live_info}")
 
                             else:
                                 stage = rev.get("current_stage", "")
@@ -925,7 +1029,8 @@ def phase_3_intraday(
                                         live_info,
                                     )
                                 else:
-                                    log.info("  ⏳ %s: %s | %s", w["name"], stage, live_info)
+                                    waiting_text = stage or _default_waiting_hint(current_watch)
+                                    log.info("  ⏳ %s: %s | %s", w["name"], waiting_text, live_info)
 
                         except Exception as e:
                             log.warning("  ⚠️ %s: %s", w["name"], e)
@@ -933,9 +1038,18 @@ def phase_3_intraday(
                             prev_signals[sym] = has_signal
                             prev_watch_rows[sym] = current_watch
 
+                prev_hold_actions = run_phase_4_holdings(
+                    config,
+                    period=period,
+                    emit_terminal=True,
+                    previous_actions=prev_hold_actions,
+                    live_frames=current_cycle_live_frames,
+                    log_header=False,
+                )
+
                 if not is_trading_hours():
                     ended_after_trading_hours = True
-                    print("\n  🔔 交易时段已结束，正在关闭行情连接…")
+                    _print_and_log("\n  🔔 交易时段已结束，正在关闭行情连接…")
                     log.info(
                         "  非交易时段：正常结束盘中监控（随后断开 TqSdk，无需当作错误处理）"
                     )
@@ -947,7 +1061,7 @@ def phase_3_intraday(
                 else:
                     time.sleep(interval)
             except KeyboardInterrupt:
-                print("\n\n  🛑 监控已停止")
+                _print_and_log("\n\n  🛑 监控已停止")
                 break
             except Exception as e:
                 log.exception("\n  ❌ 错误: %s", e)
@@ -1100,7 +1214,7 @@ def _format_entry_signal_for_table(row: dict) -> str:
 def _format_entry_signal_for_detail(row: dict) -> str:
     entry_signal = _resolve_entry_signal(row)
     if not entry_signal["has_signal"]:
-        return "⏳ 尚无有效入场信号"
+        return f"⏳ {_default_waiting_hint(row)}"
 
     family_cn = str(entry_signal["family_cn"])
     family_prefix = f"[{family_cn}] " if family_cn else ""
@@ -1113,10 +1227,200 @@ def _format_entry_signal_for_detail(row: dict) -> str:
 def _default_waiting_hint(row: dict) -> str:
     entry_family = _resolve_entry_signal(row)["entry_family"]
     if entry_family == "trend":
-        return "等待顺势信号"
+        return "等待顺势确认"
     if entry_family == "reversal":
-        return "等待反转信号"
-    return "等待入场信号"
+        return "等待反转确认"
+    return "等待交易故事确认"
+
+
+def _format_watchlist_story_status(row: dict) -> str:
+    entry_signal = _resolve_entry_signal(row)
+    if entry_signal["has_signal"]:
+        family_cn = str(entry_signal["family_cn"] or "交易故事")
+        signal_label = str(entry_signal["display_label"] or "")
+        if signal_label:
+            return f"已出现{family_cn}确认（{signal_label}），待执行条件改善"
+        return f"已出现{family_cn}确认，待执行条件改善"
+
+    reversal = row.get("reversal_status")
+    if not isinstance(reversal, dict):
+        reversal = {}
+    return str(reversal.get("next_expected") or _default_waiting_hint(row))
+
+
+def _resolve_strategy_plan_mode(row: dict) -> str:
+    """根据原始计划的中文语义，判断这笔机会属于顺势框架还是反转框架。"""
+    normalized = _normalize_phase2_plan_row(row)
+    strategy_family = str(normalized.get("strategy_family") or "").strip()
+    entry_family = str(normalized.get("entry_family") or "").strip()
+    if strategy_family == STRATEGY_TREND:
+        return "trend"
+    if strategy_family == STRATEGY_REVERSAL:
+        return "reversal"
+    if entry_family in {"trend", "reversal"}:
+        return entry_family
+    return ""
+
+
+def _build_strategy_scoped_trade_plan(
+    *,
+    base_row: dict,
+    symbol: str,
+    name: str,
+    direction: str,
+    df: pd.DataFrame,
+    cfg: dict,
+    allow_watch_plan: bool = False,
+) -> dict | None:
+    """
+    按原始计划所属的策略框架重算交易计划。
+
+    中文原则：
+    - 第二阶段先确定“这笔机会属于哪种策略框架”。
+    - 第三阶段和第四阶段只能在这个既定框架里更新计划。
+    - 只有原始记录缺少策略归属时，才退回通用重评逻辑。
+    """
+    mode = _resolve_strategy_plan_mode(base_row)
+    kwargs = {
+        "symbol": symbol,
+        "name": name,
+        "direction": direction,
+        "df": df,
+        "cfg": cfg,
+    }
+    if mode == "trend":
+        return trend_pre_market.build_trade_plan_from_daily_df(
+            **kwargs,
+            allow_watch_plan=allow_watch_plan,
+        )
+    if mode == "reversal":
+        return reversal_pre_market.build_trade_plan_from_daily_df(
+            **kwargs,
+            allow_watch_plan=allow_watch_plan,
+        )
+    return build_trade_plan_from_daily_df(**kwargs)
+
+
+def run_phase_4_holdings(
+    config: dict,
+    *,
+    period: str,
+    emit_terminal: bool,
+    previous_actions: dict[str, str] | None = None,
+    live_frames: dict[str, pd.DataFrame] | None = None,
+    log_header: bool = True,
+) -> dict[str, str]:
+    """
+    持仓管理阶段。
+
+    这一步不负责重新选品种，也不负责改换策略。它只使用与第三阶段相同的盘中快照，
+    再结合原始计划和真实持仓成本，输出主结论（继续持有 / 减仓观察 / 平仓）
+    以及必要的附加保护动作。
+    """
+    previous_actions = previous_actions or {}
+    live_frames = live_frames or {}
+    workbook_path = find_daily_holdings_workbook(
+        root_dir=default_holdings_root(),
+        trade_date=datetime.now().strftime("%Y-%m-%d"),
+    )
+    if workbook_path is None:
+        if log_header:
+            log.info("\n  未找到今日持仓文件，跳过 Phase 4")
+        return previous_actions
+
+    if log_header:
+        log.info("\n" + "▓" * 60)
+        log.info("▓  Phase 4: 持仓建议")
+        log.info("▓" * 60)
+
+    try:
+        contexts = load_holding_contexts(workbook_path)
+    except Exception as exc:
+        log.warning("  ⚠️ 持仓文件读取失败: %s", exc)
+        return previous_actions
+
+    if not contexts:
+        log.info("  今日持仓文件为空，跳过 Phase 4")
+        return {}
+
+    results: list[dict] = []
+    actions: dict[str, str] = {}
+    pre_cfg = config.get("pre_market", {})
+
+    for context in contexts:
+        recommendation = context.get("recommendation")
+        if not recommendation:
+            log.warning("  ⚠️ %s: 缺少原始推荐，跳过", context.get("record_id"))
+            continue
+
+        holding = dict(context["holding"])
+        symbol = str(holding.get("symbol") or "")
+        name = str(holding.get("name") or recommendation.get("name") or symbol)
+        direction = str(holding.get("direction") or recommendation.get("direction") or "")
+
+        live_df = live_frames.get(symbol)
+        if live_df is None or live_df.empty:
+            live_df = get_daily_with_live_bar(symbol, period)
+        if live_df is None or live_df.empty:
+            log.warning("  ⚠️ %s: 无法获取持仓行情，跳过", name)
+            continue
+
+        plan_mode = _resolve_strategy_plan_mode(recommendation)
+        if plan_mode == "trend":
+            hold_eval = assess_active_trend_hold_from_daily_df(
+                symbol=symbol,
+                name=name,
+                direction=direction,
+                df=live_df,
+                cfg=pre_cfg,
+            )
+        else:
+            hold_eval = assess_active_reversal_hold_from_daily_df(
+                symbol=symbol,
+                name=name,
+                direction=direction,
+                df=live_df,
+                cfg=pre_cfg,
+            )
+
+        current_plan = _build_strategy_scoped_trade_plan(
+            base_row=recommendation,
+            symbol=symbol,
+            name=name,
+            direction=direction,
+            df=live_df,
+            cfg=pre_cfg,
+            allow_watch_plan=True,
+        ) or {}
+
+        holding["name"] = name
+        result = analyze_holding_record(
+            holding=holding,
+            recommendation=recommendation,
+            current_plan=current_plan,
+            hold_eval=hold_eval,
+            current_price=float(live_df.iloc[-1]["close"]),
+            minimum_tick=1.0,
+        )
+        result["original_plan_line"] = format_plan_line("原始计划", result["original_plan"])
+        result["current_plan_line"] = format_plan_line("当前重评", result["current_plan"])
+        for line in format_holding_log_block(result).splitlines():
+            log.info(line)
+        if emit_terminal and should_emit_terminal_alert(result, previous_actions):
+            _print_and_log(format_holding_terminal_alert(result))
+
+        record_id = str(result.get("record_id") or "")
+        actions[record_id] = holding_alert_state_key(result)
+        results.append(result)
+
+    if results:
+        log.info("  %s", build_holdings_summary_line(results))
+    return actions
+
+
+def _print_and_log(message: str) -> None:
+    print(message)
+    log.info(message)
 
 
 def _format_intraday_trade_plan(row: dict) -> str:
@@ -1139,16 +1443,144 @@ def _format_intraday_trade_plan(row: dict) -> str:
     )
 
 
+def _format_intraday_execution_line(row: dict, minute_df: pd.DataFrame) -> str:
+    entry_signal = _resolve_entry_signal(row)
+    entry_family = str(entry_signal["entry_family"])
+    direction = str(row.get("direction") or "")
+    entry = float(row.get("entry") or 0.0)
+    stop = float(row.get("stop") or 0.0)
+    if entry <= 0 or stop <= 0 or minute_df is None or minute_df.empty:
+        return ""
+
+    last = float(minute_df["close"].iloc[-1])
+    session_high = float(minute_df["high"].max())
+    session_low = float(minute_df["low"].min())
+
+    if entry_family == "trend":
+        return "│ 🎯 " + _trend_execution_status_text(
+            direction=direction,
+            signal_type=str(entry_signal["signal_type"] or ""),
+            entry=entry,
+            stop=stop,
+            last=last,
+            session_high=session_high,
+            session_low=session_low,
+        )
+
+    if entry_family == "reversal":
+        reversal = row.get("reversal_status")
+        if not isinstance(reversal, dict):
+            reversal = {}
+        return "│ 🎯 " + _reversal_execution_status_text(
+            direction=direction,
+            entry=entry,
+            stop=stop,
+            last=last,
+            session_high=session_high,
+            session_low=session_low,
+            reversal=reversal,
+        )
+
+    return ""
+
+
+def _trend_execution_status_text(
+    *,
+    direction: str,
+    signal_type: str,
+    entry: float,
+    stop: float,
+    last: float,
+    session_high: float,
+    session_low: float,
+) -> str:
+    if direction == "long":
+        if session_low <= stop:
+            return f"顺势执行: 今日已触及止损{stop:.0f}，原顺势计划暂不执行"
+        if signal_type == "Pullback":
+            if last >= entry:
+                return f"顺势执行: 回踩后已重新站回入场{entry:.0f}上方，可按顺势回踩执行"
+            return f"顺势执行: 等待回踩后重新站回入场{entry:.0f}上方，且不跌破止损{stop:.0f}"
+        if last >= entry or session_high >= entry:
+            return f"顺势执行: 价格已触及入场{entry:.0f}附近，继续观察能否站稳且不跌破止损{stop:.0f}"
+        return f"顺势执行: 等待价格重新站上入场{entry:.0f}，且不跌破止损{stop:.0f}"
+
+    if session_high >= stop:
+        return f"顺势执行: 今日已触及止损{stop:.0f}，原顺势计划暂不执行"
+    if signal_type == "Pullback":
+        if last <= entry:
+            return f"顺势执行: 反弹后已重新压回入场{entry:.0f}下方，可按顺势回撤执行"
+        return f"顺势执行: 等待反弹后重新压回入场{entry:.0f}下方，且不突破止损{stop:.0f}"
+    if last <= entry or session_low <= entry:
+        return f"顺势执行: 价格已触及入场{entry:.0f}附近，继续观察能否压回且不突破止损{stop:.0f}"
+    return f"顺势执行: 等待价格重新回到入场{entry:.0f}下方，且不突破止损{stop:.0f}"
+
+
+def _reversal_execution_status_text(
+    *,
+    direction: str,
+    entry: float,
+    stop: float,
+    last: float,
+    session_high: float,
+    session_low: float,
+    reversal: dict,
+) -> str:
+    signal_bar = reversal.get("signal_bar") or {}
+    if direction == "long":
+        confirm = float(signal_bar.get("low") or stop)
+        if session_low <= stop:
+            return f"反转执行: 今日已触及止损{stop:.0f}，原反转计划失效"
+        if last >= entry and session_low > confirm:
+            return f"反转执行: 已守住确认位{confirm:.0f}并站回入场{entry:.0f}上方，可按反转执行"
+        return f"反转执行: 等待守住确认位{confirm:.0f}后重新站回入场{entry:.0f}上方"
+
+    confirm = float(signal_bar.get("high") or stop)
+    if session_high >= stop:
+        return f"反转执行: 今日已触及止损{stop:.0f}，原反转计划失效"
+    if last <= entry and session_high < confirm:
+        return f"反转执行: 已守住确认位{confirm:.0f}并压回入场{entry:.0f}下方，可按反转执行"
+    return f"反转执行: 等待守住确认位{confirm:.0f}后重新压回入场{entry:.0f}下方"
+
+
 def _intraday_watch_signal_text(row: dict, fallback_signal_type: str) -> tuple[str, str]:
     entry_signal = _resolve_entry_signal(row)
     entry_family = str(entry_signal["entry_family"])
     fallback_label = ENTRY_SIGNAL_CN.get(fallback_signal_type, fallback_signal_type)
 
     if entry_family == "trend":
-        return "顺势信号", str(entry_signal["display_label"] or fallback_label or "顺势")
+        return "顺势确认", str(entry_signal["display_label"] or fallback_label or "顺势")
     if entry_family == "reversal":
-        return "反转信号", str(fallback_label or entry_signal["display_label"] or "反转")
-    return "入场信号", str(entry_signal["display_label"] or fallback_label or "入场")
+        return "反转确认", str(fallback_label or entry_signal["display_label"] or "反转")
+    return "交易故事确认", str(entry_signal["display_label"] or fallback_label or "入场")
+
+
+def _intraday_watch_confirmation_text(row: dict) -> str:
+    entry_signal = _resolve_entry_signal(row)
+    entry_family = str(entry_signal["entry_family"])
+    direction = str(row.get("direction") or "")
+    entry = float(row.get("entry") or 0.0)
+    stop = float(row.get("stop") or 0.0)
+    reversal = row.get("reversal_status")
+    if not isinstance(reversal, dict):
+        reversal = {}
+
+    if entry_family == "trend" and entry > 0 and stop > 0:
+        signal_type = str(entry_signal["signal_type"] or "")
+        if direction == "long":
+            if signal_type == "Pullback":
+                return f"回踩不跌破止损{stop:.0f}，并重新站回入场{entry:.0f}上方"
+            return f"价格继续站稳入场{entry:.0f}上方，且不跌破止损{stop:.0f}"
+        if signal_type == "Pullback":
+            return f"反弹不突破止损{stop:.0f}，并重新压回入场{entry:.0f}下方"
+        return f"价格继续压在入场{entry:.0f}下方，且不突破止损{stop:.0f}"
+
+    signal_bar = reversal.get("signal_bar") or {}
+    if direction == "long" and signal_bar.get("low") is not None:
+        return f"收盘维持在 {float(signal_bar['low']):.0f} 以上"
+    if direction == "short" and signal_bar.get("high") is not None:
+        return f"收盘维持在 {float(signal_bar['high']):.0f} 以下"
+    return _default_waiting_hint(row)
 
 
 def _merge_intraday_watch_plan(base_row: dict, live_plan: dict | None) -> dict:
@@ -1205,12 +1637,12 @@ def save_targets(
     ]
 
     if has_actionable:
-        lines.append("## 可操作品种一览")
+        lines.append("## 可执行品种一览")
     elif has_watchlist:
-        lines.append("## 今日观望（尚无可操作品种）")
+        lines.append("## 今日等待确认（尚无可执行品种）")
         lines.append("")
         lines.append(
-            "> **未满足可操作三要件**：① 有效入场信号 ② Phase 2 达标（做多>+20 / 做空<-20）③ 盈亏比≥1。"
+            "> **未满足可执行三要件**：① 交易故事已确认 ② Phase 2 达标（做多>+20 / 做空<-20）③ 盈亏比≥1。"
         )
         lines.append(
             "> **方向**由 Phase 2 技术面总分解析得到；Phase 1 只负责给出关注候选、关注分与机会标签。"
@@ -1219,7 +1651,7 @@ def save_targets(
     else:
         lines.append("## 今日无信号")
         lines.append("")
-        lines.append("> 全市场无极端品种，今日无操作/观望机会。")
+        lines.append("> 全市场无极端品种，今日无操作/等待确认机会。")
 
     def _md_cell(val) -> str:
         """Markdown 表格单元格内若含 | 会拆列，统一换成全角竖线。"""
@@ -1249,7 +1681,7 @@ def save_targets(
     if targets:
         lines.append("")
         lines.append(
-            "| 状态 | 合约 | 方向 | 关注理由 | 当前价 | 入场信号 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
+            "| 状态 | 合约 | 方向 | 关注理由 | 当前价 | 交易故事确认 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
         )
         lines.append(
             "| :---: | :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |"
@@ -1268,7 +1700,7 @@ def save_targets(
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
             lines.append(
-                f"| {_md_cell('✅入场')} | {name_cell} | {dir_cell} "
+                f"| {_md_cell('✅可执行')} | {name_cell} | {dir_cell} "
                 f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| {rrf_cell} | {r1} | {r2} "
@@ -1283,14 +1715,7 @@ def save_targets(
         )
         lines.append("| :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
         for t in watchlist:
-            rev = t.get("reversal_status", {})
-            entry_signal = _resolve_entry_signal(t)
-            if entry_signal["has_signal"]:
-                family_cn = entry_signal["family_cn"]
-                signal_label = entry_signal["display_label"]
-                next_exp = f"已有{family_cn}{signal_label}，待入场条件改善"
-            else:
-                next_exp = rev.get("next_expected", _default_waiting_hint(t))
+            next_exp = _format_watchlist_story_status(t)
             dir_icon = "🟢 做多" if t["direction"] == "long" else "🔴 做空"
             rrf = t.get("rrf_score", 0)
             r1 = t.get("rank_p1", "-")
@@ -1339,7 +1764,7 @@ def save_targets(
     lines.append("| 持仓面 | ±15 | OI价格四象限、OI背离 |")
     lines.append("")
     lines.append(
-        "可操作条件：① 有新鲜反转/顺势入场信号 ② Phase 2 总分达标(做多>+20/做空<-20) ③ 盈亏比≥1.0。"
+        "可执行条件：① 有新鲜反转/顺势确认 ② Phase 2 总分达标(做多>+20/做空<-20) ③ 盈亏比≥1.0。"
     )
     lines.append(
         "**计划方向**来自 Phase 2 对技术面总分的解析；Phase 1 仅提供关注候选、关注分与机会标签。"
@@ -1359,27 +1784,27 @@ def save_targets(
     lines.append("- 两个 Phase 都排名靠前的品种，RRF 得分最高")
     lines.append("- 只有一个 Phase 排名高的品种，也能保留但排名靠后")
     lines.append("")
-    lines.append("### 入场信号说明")
+    lines.append("### 交易故事确认说明")
     lines.append("")
-    lines.append("系统支持两种入场模式，反转信号优先级高于顺势信号：")
+    lines.append("系统支持两种交易故事确认模式，反转确认优先级高于顺势确认：")
     lines.append("")
-    lines.append("#### 模式一：Wyckoff 反转入场（抓顶抄底）")
+    lines.append("#### 模式一：Wyckoff 反转确认（抓顶抄底）")
     lines.append("")
     lines.append("适用于横盘/筑底/筑顶阶段，等待极端事件确认反转：")
     lines.append("")
     lines.append("**做多反转序列**: 下跌 → SC(卖方高潮) → 停止量 → Spring(弹簧) → SOS(强势突破)")
     lines.append("**做空反转序列**: 上涨 → BC(买方高潮) → 停止量 → UT(上冲回落) → SOW(弱势跌破)")
     lines.append("")
-    lines.append("| 信号 | 含义 | 入场级别 |")
+    lines.append("| 信号 | 含义 | 确认级别 |")
     lines.append("| :--- | :--- | :--- |")
     lines.append("| SC/BC | 放量极端K线，趋势力量耗尽 | 预备信号，不入场 |")
     lines.append("| 停止量 | 放量但幅度窄，对手方被吸收 | 预备信号，不入场 |")
-    lines.append("| Spring/UT | 假突破后收回，经典入场点 | **入场信号** |")
+    lines.append("| Spring/UT | 假突破后收回，经典确认点 | **反转确认** |")
     lines.append("| SOS/SOW | 放量突破确认趋势反转 | **确认信号** |")
     lines.append("")
-    lines.append("入场价 = 当前价（信号新鲜时入场） | 止损 = 信号K线极端价 ± 0.5ATR")
+    lines.append("入场价 = 当前价（确认新鲜时执行） | 止损 = 信号K线极端价 ± 0.5ATR")
     lines.append("")
-    lines.append("#### 模式二：顺势入场（趋势延续）")
+    lines.append("#### 模式二：顺势确认（趋势延续）")
     lines.append("")
     lines.append("适用于趋势已确立（Wyckoff=markup/markdown）且基本面+技术面一致时：")
     lines.append("")
@@ -1418,7 +1843,7 @@ def save_targets(
             lines.append(f"**机会标签（Phase 1）**: {_md_cell('/'.join(phase1_labels))}")
             lines.append("")
 
-        # --- 入场信号状态 ---
+        # --- 交易故事确认状态 ---
         rev = t.get("reversal_status", {})
         entry_signal = _resolve_entry_signal(t)
         if entry_signal["has_signal"]:
@@ -1439,8 +1864,8 @@ def save_targets(
             family_prefix = f"[{family_cn}] " if family_cn else ""
             signal_date = str(entry_signal["signal_date"])
             signal_suffix = f" ({signal_date})" if signal_date else ""
-            lines.append(f"**入场信号**: {family_prefix}{sig_cn}{signal_suffix}")
-            lines.append(f"- 信号详情: {_md_cell(str(entry_signal.get('signal_detail', '') or ''))}")
+            lines.append(f"**交易故事确认**: {family_prefix}{sig_cn}{signal_suffix}")
+            lines.append(f"- 确认详情: {_md_cell(str(entry_signal.get('signal_detail', '') or ''))}")
             lines.append(f"- 阶段判断: {_md_cell(rev.get('current_stage', '未知'))}")
             lines.append(f"- 置信度: {float(rev.get('confidence', 0.0)):.0%}")
             lines.append("")
@@ -1459,18 +1884,30 @@ def save_targets(
                     lines.append(f"- 止损依据: 趋势反弹失效位 + 0.5×ATR")
             else:
                 signal_date = rev.get("signal_date", "")
+                actionable_now = bool(t.get("actionable", True))
                 if signal_date:
-                    lines.append(f"- 入场依据: 当前价（信号{signal_date}触发，新鲜可入）")
+                    if actionable_now:
+                        lines.append(f"- 入场依据: 当前价（确认于{signal_date}触发，新鲜可执行）")
+                    else:
+                        lines.append(f"- 入场依据: 当前价（确认于{signal_date}触发，但未达执行条件）")
                 else:
-                    lines.append(f"- 入场依据: 当前价（反转信号触发，新鲜可入）")
+                    if actionable_now:
+                        lines.append(f"- 入场依据: 当前价（反转确认触发，新鲜可执行）")
+                    else:
+                        lines.append(f"- 入场依据: 当前价（反转确认已触发，但未达执行条件）")
                 if t["direction"] == "long":
                     lines.append(f"- 止损依据: 信号K线最低点 - 0.5×ATR")
                 else:
                     lines.append(f"- 止损依据: 信号K线最高点 + 0.5×ATR")
+            if t.get("entry_plan_type") == "extended_target":
+                lines.append("- 计划类型: 依赖第二止盈的延展计划")
+            management_note = str(t.get("management_note") or "")
+            if management_note:
+                lines.append(f"- 仓位管理: {_md_cell(management_note)}")
         else:
-            lines.append(f"**入场信号**: {_format_entry_signal_for_detail(t)}")
+            lines.append(f"**交易故事确认**: {_format_entry_signal_for_detail(t)}")
             lines.append(f"- 当前阶段: {_md_cell(rev.get('current_stage', '未知'))}")
-            lines.append(f"- 等待条件: {_md_cell(rev.get('next_expected', _default_waiting_hint(t)))}")
+            lines.append(f"- 等待条件: {_md_cell(rev.get('next_expected') or _default_waiting_hint(t))}")
             suspect = rev.get("suspect_events", [])
             if suspect:
                 lines.append(f"- ⚠️ 有{len(suspect)}个疑似信号（未通过上下文验证）:")
@@ -1479,11 +1916,11 @@ def save_targets(
                         f"  - {_md_cell(se.get('date', ''))} {_md_cell(se.get('signal', ''))}: {_md_cell(se.get('detail', ''))}"
                     )
             if t["direction"] == "long":
-                lines.append(f"- 反转入场: Spring(假跌破收回) 或 SOS(放量突破)")
-                lines.append(f"- 顺势入场: 缩量回踩MA20企稳 或 放量突破前高")
+                lines.append(f"- 反转确认: Spring(假跌破收回) 或 SOS(放量突破)")
+                lines.append(f"- 顺势确认: 缩量回踩MA20企稳 或 放量突破前高")
             else:
-                lines.append(f"- 反转入场: UT(假突破回落) 或 SOW(放量跌破)")
-                lines.append(f"- 顺势入场: 缩量反弹MA20失败 或 放量跌破前低")
+                lines.append(f"- 反转确认: UT(假突破回落) 或 SOW(放量跌破)")
+                lines.append(f"- 顺势确认: 缩量反弹MA20失败 或 放量跌破前低")
             lines.append("")
             lines.append("**交易参数**: 无（需等待信号触发后计算）")
 
@@ -1505,11 +1942,13 @@ def save_targets(
         ss = t.get("signal_strength", 0)
         lines.append(f"- 信号强度: {ss:.2f}")
         if not t.get("actionable", True):
-            rev_info = t.get("reversal_status", {})
             entry_signal_now = _resolve_entry_signal(t)
             reasons = []
+            downgrade_reason = str(t.get("downgrade_reason") or "")
+            if downgrade_reason:
+                reasons.append(downgrade_reason)
             if not entry_signal_now["has_signal"]:
-                reasons.append("无有效入场信号")
+                reasons.append("交易故事尚未确认")
             else:
                 rr = t.get("rr", 0)
                 admission_rr = t.get("admission_rr", rr)
@@ -1522,7 +1961,7 @@ def save_targets(
                 elif ddir == "short" and score_val >= -20:
                     reasons.append(f"P2={score_val:+.0f}未达做空阈值(<-20)")
             if reasons:
-                lines.append(f"- ⚠️ 未达入场条件: {_md_cell(', '.join(reasons))}")
+                lines.append(f"- ⚠️ 未达执行条件: {_md_cell(', '.join(reasons))}")
         lines.append("")
 
         lines.append("**基本面数据**")
@@ -1572,7 +2011,7 @@ def save_targets(
     for t in targets:
         _build_detail(t, "")
     for t in watchlist:
-        _build_detail(t, "观望")
+        _build_detail(t, "等待确认")
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
     log.info("\n  💾 报告已保存:")
@@ -1622,11 +2061,14 @@ def main():
     config = load_config()
     now = datetime.now()
 
-    print(f"每日工作流：盘前/筛选/深度分析写入 {get_log_path()}；盘中终端仅输出观望反转警报。")
+    print(f"{build_workflow_contract_summary()} 详细日志见 {get_log_path()}。")
     log.info("╔" + "═" * 58 + "╗")
     log.info("║" + "每日交易工作流".center(48) + "║")
     log.info("║" + f"  {now.strftime('%Y-%m-%d %H:%M')}".ljust(56) + "║")
     log.info("╚" + "═" * 58 + "╝")
+    log.info("  %s", build_workflow_contract_summary())
+    for line in build_workflow_contract_lines():
+        log.info("  - %s", line)
 
     # --- 恢复模式 ---
     if args.resume:
@@ -1634,7 +2076,7 @@ def main():
         if snapshot is not None:
             targets, watchlist_resumed = snapshot
             log.info(
-                "\n  📂 恢复今日目标: %s 个可操作, %s 个观望",
+                "\n  📂 恢复今日目标: %s 个可执行, %s 个等待确认",
                 len(targets),
                 len(watchlist_resumed),
             )
@@ -1654,7 +2096,7 @@ def main():
             for w in watchlist_resumed:
                 dir_str = "做多" if w["direction"] == "long" else "做空"
                 log.info(
-                    "     👀 %s (%s) %s  评分%s [观望]",
+                    "     👀 %s (%s) %s  评分%s [等待确认]",
                     w["name"],
                     w["symbol"],
                     dir_str,
@@ -1668,6 +2110,8 @@ def main():
                     args.interval,
                     watchlist=watchlist_resumed,
                 )
+            else:
+                run_phase_4_holdings(config, period=args.period, emit_terminal=False)
             return
         log.info("\n  ⚠️ 无今日缓存，重新筛选")
 
@@ -1714,6 +2158,9 @@ def main():
 
     if not reversal_candidates and not trend_candidates:
         log.info("\n  😴 今日无可跟踪品种")
+        run_phase_4_holdings(config, period=args.period, emit_terminal=False)
+        if not args.no_monitor:
+            phase_3_intraday([], config, args.period, args.interval, watchlist=[])
         return
 
     # --- Phase 2: 深度分析 ---
@@ -1733,6 +2180,8 @@ def main():
         phase1_summary=phase1_summary,
         grouped_results=grouped_results,
     )
+
+    run_phase_4_holdings(config, period=args.period, emit_terminal=False)
 
     # --- Phase 3: 盘中监控 ---
     if args.no_monitor:

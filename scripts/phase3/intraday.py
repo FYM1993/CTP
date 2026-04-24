@@ -3,18 +3,18 @@
 日内策略监控
 ========================================
 
-盘中实时拉取分钟级数据，基于技术指标发出交易信号。
+盘中实时拉取分钟级数据，为日线级计划提供执行辅助观察。
 
 策略逻辑:
   做多品种 (如生猪):
-    - 布林带下轨反弹 + RSI超卖回升 → 开多
-    - 突破N日高点 + 放量 → 加仓
-    - 跌破止损 或 触及布林上轨 → 平仓
+    - 布林带下轨反弹 + RSI超卖回升 → 辅助确认偏多执行节奏
+    - 突破N日高点 + 放量 → 辅助确认偏多增强
+    - 跌破止损 或 触及布林上轨 → 辅助提示保护或兑现风险
 
   做空品种 (如多晶硅):
-    - 布林带上轨回落 + RSI超买回落 → 开空
-    - 跌破N日低点 + 放量 → 加仓
-    - 涨破止损 或 触及布林下轨 → 平仓
+    - 布林带上轨回落 + RSI超买回落 → 辅助确认偏空执行节奏
+    - 跌破N日低点 + 放量 → 辅助确认偏空增强
+    - 涨破止损 或 触及布林下轨 → 辅助提示保护或兑现风险
 
 使用方法:
     # 实时监控（每分钟刷新）
@@ -32,13 +32,19 @@ import argparse
 from datetime import datetime
 from typing import Optional
 
-import yaml
 import numpy as np
 import pandas as pd
 
 from pathlib import Path
 
 from shared.ctp_log import get_log_path, get_logger
+from shared.config_loader import load_yaml_config
+from shared.workflow_wording import (
+    minute_no_signal_line,
+    minute_signal_display_label,
+    minute_signal_section_header,
+    minute_signal_section_note,
+)
 from data_cache import get_minute
 
 log = get_logger("intraday")
@@ -47,9 +53,7 @@ from phase3.live import TqPhase3Monitor, tqsdk_configured
 
 
 def load_config() -> dict:
-    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml_config(__file__)
 
 
 def fetch_minute_data(symbol: str, period: str = "5") -> pd.DataFrame:
@@ -311,7 +315,7 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
 
 
 def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cfg: dict):
-    """打印单品种日内面板"""
+    """打印单品种分钟级执行辅助观察面板。"""
     close = df["close"]
     last = close.iloc[-1]
     last_time = df["datetime"].iloc[-1]
@@ -354,15 +358,17 @@ def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cf
 
     if signals:
         log.info(f"│")
-        log.info(f"│ ⚡ 信号:")
+        log.info(minute_signal_section_header())
+        log.info(minute_signal_section_note())
         for sig in signals:
             strength_icon = {"强": "🔥", "中": "⚡", "弱": "💡"}.get(sig["strength"], "")
-            log.info(f"│   {strength_icon} [{sig['type']}] {sig['reason']}")
+            signal_label = minute_signal_display_label(str(sig["type"]))
+            log.info(f"│   {strength_icon} [{signal_label}] {sig['reason']}")
             if "entry" in sig:
                 log.info(f"│      入场:{sig['entry']:.0f}  止损:{sig.get('stop', 0):.0f}  目标:{sig.get('target', 0):.0f}")
     else:
         log.info(f"│")
-        log.info(f"│ 🔇 无信号，继续观望")
+        log.info(minute_no_signal_line())
 
     log.info(f"└{'─'*50}┘")
 

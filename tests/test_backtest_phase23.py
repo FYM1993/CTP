@@ -602,7 +602,7 @@ def test_run_case_from_frames_keeps_custom_reversal_trade_when_hold_is_still_val
             "strategy_family": "reversal_fundamental",
             "entry_family": "reversal",
             "entry_signal_type": "Spring",
-            "entry_signal_detail": "反转信号仍然新鲜",
+            "entry_signal_detail": "反转确认仍然新鲜",
         },
     )
 
@@ -1362,8 +1362,8 @@ def test_run_case_from_frames_strategy_specific_debug_keeps_reversal_watch_snaps
                 "signal_type": "Spring",
                 "signal_days_ago": 2,
                 "signal_strength": 0.75,
-                "current_stage": "反转信号出现",
-                "next_expected": "信号新鲜(2天前)，可考虑入场",
+                "current_stage": "反转确认",
+                "next_expected": "确认新鲜(2天前)，可考虑入场",
             },
             "trend_status": {
                 "has_signal": False,
@@ -1411,8 +1411,8 @@ def test_run_case_from_frames_strategy_specific_debug_keeps_reversal_watch_snaps
             "reversal_signal_days_ago": 2,
             "reversal_signal_strength": 0.75,
             "reversal_signal_fresh": True,
-            "reversal_current_stage": "反转信号出现",
-            "reversal_next_expected": "信号新鲜(2天前)，可考虑入场",
+            "reversal_current_stage": "反转确认",
+            "reversal_next_expected": "确认新鲜(2天前)，可考虑入场",
             "trend_has_signal": False,
             "trend_signal_type": "",
             "trend_phase": "markdown",

@@ -16,11 +16,11 @@
 from pathlib import Path
 from datetime import datetime
 
-import yaml
 import numpy as np
 import pandas as pd
 
 from shared.ctp_log import get_log_path, get_logger
+from shared.config_loader import load_yaml_config
 from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
 from data_cache import get_daily
 from phase2.direction import choose_phase2_direction as _choose_phase2_direction
@@ -35,9 +35,7 @@ from wyckoff import (
 
 
 def load_config() -> dict:
-    cfg_path = Path(__file__).resolve().parents[2] / "config.yaml"
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    return load_yaml_config(__file__)
 
 
 def fetch_data(symbol: str, days: int = 500) -> pd.DataFrame:
@@ -371,6 +369,67 @@ def _reward_risk(direction: str, *, entry: float, target: float, stop: float) ->
     return (entry - target) / (stop - entry + 1e-12)
 
 
+def _append_downgrade_reason(existing: str, reason: str) -> str:
+    if not reason:
+        return existing
+    if not existing:
+        return reason
+    return f"{existing}；{reason}"
+
+
+def _stop_risk_pct(direction: str, *, entry: float, stop: float) -> float:
+    if entry <= 0:
+        return 0.0
+    if direction == "long":
+        risk = entry - stop
+    else:
+        risk = stop - entry
+    return max(float(risk), 0.0) / entry
+
+
+def _risk_gate_details(direction: str, *, entry: float, stop: float, cfg: dict) -> dict[str, float | bool | str]:
+    risk_pct = _stop_risk_pct(direction, entry=entry, stop=stop)
+    max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
+    passed = True
+    reason = ""
+    if max_loss_pct > 0 and risk_pct > max_loss_pct:
+        passed = False
+        reason = f"止损距离{risk_pct:.1%}超过单笔风险上限{max_loss_pct:.1%}"
+    return {
+        "risk_pct": float(risk_pct),
+        "max_loss_pct": float(max_loss_pct),
+        "phase2_risk_gate_passed": bool(passed),
+        "risk_gate_reason": reason,
+    }
+
+
+def _reversal_price_gate_details(direction: str, *, last: float, reversal: dict) -> dict[str, bool | str | float]:
+    signal_type = str(reversal.get("signal_type") or "")
+    ref_level = reversal.get("signal_ref_level")
+    if ref_level is None:
+        ref_level = reversal.get("ref_level")
+    try:
+        ref = float(ref_level)
+    except (TypeError, ValueError):
+        return {"phase2_price_gate_passed": True, "price_gate_reason": "", "signal_ref_level": 0.0}
+    if ref <= 0:
+        return {"phase2_price_gate_passed": True, "price_gate_reason": "", "signal_ref_level": 0.0}
+
+    if direction == "long" and signal_type == "SOS" and last < ref:
+        return {
+            "phase2_price_gate_passed": False,
+            "price_gate_reason": f"价格跌回突破位{ref:.0f}下方",
+            "signal_ref_level": ref,
+        }
+    if direction == "short" and signal_type == "SOW" and last > ref:
+        return {
+            "phase2_price_gate_passed": False,
+            "price_gate_reason": f"价格收回跌破位{ref:.0f}上方",
+            "signal_ref_level": ref,
+        }
+    return {"phase2_price_gate_passed": True, "price_gate_reason": "", "signal_ref_level": ref}
+
+
 def _fresh_reversal_score_gate(direction: str, total: float, reversal: dict) -> bool:
     return bool(_fresh_reversal_gate_details(direction, total, reversal)["score_gate_passed"])
 
@@ -432,9 +491,13 @@ def _reversal_signal_is_fresh(reversal_status: dict) -> bool:
 def _trend_hold_gate(direction: str, total: float, trend_status: dict) -> bool:
     if not trend_status.get("phase_ok"):
         return False
-    if trend_status.get("slope_ok") or trend_status.get("trend_indicator_ok"):
+    if trend_status.get("slope_ok") and trend_status.get("trend_indicator_ok"):
         return True
-    return _soft_countertrend_score_gate(direction, total, threshold=10.0)
+    if trend_status.get("slope_ok"):
+        return _score_gate(direction, total, threshold=5.0)
+    if trend_status.get("trend_indicator_ok"):
+        return _score_gate(direction, total, threshold=10.0)
+    return False
 
 
 def _build_reversal_candidate_plan(
@@ -449,10 +512,12 @@ def _build_reversal_candidate_plan(
     fib_low: float,
     fib_high: float,
     fib_range: float,
+    cfg: dict,
 ) -> dict | None:
     if not reversal.get("has_signal"):
         return None
     gate_details = _fresh_reversal_gate_details(direction, total, reversal)
+    price_gate = _reversal_price_gate_details(direction, last=last, reversal=reversal)
 
     sig_bar = reversal["signal_bar"]
     entry = last
@@ -493,9 +558,21 @@ def _build_reversal_candidate_plan(
 
     rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
     admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
+    risk_gate = _risk_gate_details(direction, entry=entry, stop=stop, cfg=cfg)
 
-    rr_ok = admission_rr >= 1.0
+    extended_target = rr < 1.0 and admission_rr >= 1.0
+    weak_reversal = float(gate_details["signal_strength"]) <= 0.65
+    rr_ok = admission_rr >= 1.0 and not (extended_target and weak_reversal)
     score_ok = bool(gate_details["score_gate_passed"])
+    price_ok = bool(price_gate["phase2_price_gate_passed"])
+    risk_ok = bool(risk_gate["phase2_risk_gate_passed"])
+    downgrade_reason = ""
+    downgrade_reason = _append_downgrade_reason(downgrade_reason, str(price_gate["price_gate_reason"]))
+    downgrade_reason = _append_downgrade_reason(downgrade_reason, str(risk_gate["risk_gate_reason"]))
+    if extended_target and weak_reversal:
+        downgrade_reason = _append_downgrade_reason(downgrade_reason, "弱反转不能仅依赖第二止盈准入")
+    entry_plan_type = "extended_target" if extended_target else "standard"
+    management_note = "第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈" if extended_target else ""
     return {
         "entry": float(entry),
         "stop": float(stop),
@@ -503,9 +580,18 @@ def _build_reversal_candidate_plan(
         "tp2": float(tp2),
         "rr": float(rr),
         "admission_rr": float(admission_rr),
-        "actionable": bool(score_ok and rr_ok),
+        "actionable": bool(score_ok and rr_ok and price_ok and risk_ok),
         "phase2_score_gate_passed": score_ok,
         "phase2_rr_gate_passed": rr_ok,
+        "phase2_first_target_rr_gate_passed": bool(rr >= 1.0),
+        "phase2_price_gate_passed": price_ok,
+        "phase2_risk_gate_passed": risk_ok,
+        "risk_pct": float(risk_gate["risk_pct"]),
+        "max_loss_pct": float(risk_gate["max_loss_pct"]),
+        "entry_plan_type": entry_plan_type,
+        "management_note": management_note,
+        "downgrade_reason": downgrade_reason,
+        "signal_ref_level": float(price_gate["signal_ref_level"]),
         "reversal_signal_fresh": bool(gate_details["fresh_signal"]),
         "reversal_signal_days_ago": int(gate_details["signal_days_ago"]),
         "reversal_signal_strength": float(gate_details["signal_strength"]),
@@ -598,6 +684,7 @@ def _build_trend_candidate_plan(
     fib_low: float,
     fib_high: float,
     fib_range: float,
+    cfg: dict,
 ) -> dict | None:
     if not trend_status.get("has_signal"):
         return None
@@ -652,9 +739,15 @@ def _build_trend_candidate_plan(
 
     rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
     admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
+    risk_gate = _risk_gate_details(direction, entry=entry, stop=stop, cfg=cfg)
 
+    extended_target = rr < 1.0 and admission_rr >= 1.0
     rr_ok = admission_rr >= 1.0
     score_ok = _score_gate(direction, total)
+    risk_ok = bool(risk_gate["phase2_risk_gate_passed"])
+    downgrade_reason = _append_downgrade_reason("", str(risk_gate["risk_gate_reason"]))
+    entry_plan_type = "extended_target" if extended_target else "standard"
+    management_note = "第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈" if extended_target else ""
     return {
         "entry": float(entry),
         "stop": float(stop),
@@ -662,9 +755,18 @@ def _build_trend_candidate_plan(
         "tp2": float(tp2),
         "rr": float(rr),
         "admission_rr": float(admission_rr),
-        "actionable": bool(score_ok and rr_ok),
+        "actionable": bool(score_ok and rr_ok and risk_ok),
         "phase2_score_gate_passed": bool(score_ok),
         "phase2_rr_gate_passed": bool(rr_ok),
+        "phase2_first_target_rr_gate_passed": bool(rr >= 1.0),
+        "phase2_price_gate_passed": True,
+        "phase2_risk_gate_passed": risk_ok,
+        "risk_pct": float(risk_gate["risk_pct"]),
+        "max_loss_pct": float(risk_gate["max_loss_pct"]),
+        "entry_plan_type": entry_plan_type,
+        "management_note": management_note,
+        "downgrade_reason": downgrade_reason,
+        "signal_ref_level": 0.0,
         "entry_family": "trend",
         "entry_signal_type": signal_type,
         "entry_signal_detail": trend_status.get("signal_detail", ""),
@@ -705,6 +807,7 @@ def assess_active_trend_hold_from_daily_df(
     return {
         "hold_valid": hold_valid,
         "score": total,
+        "story_family": "trend",
         "trend_status": trend_status,
     }
 
@@ -740,9 +843,12 @@ def assess_active_reversal_hold_from_daily_df(
         and trend_status.get("slope_ok")
         and trend_status.get("trend_indicator_ok")
     )
+    story_transition = "trend_followthrough" if not reversal.get("has_signal") and trend_followthrough else ""
     return {
         "hold_valid": bool(reversal.get("has_signal") or trend_followthrough),
         "score": float(ctx["total"]),
+        "story_family": "reversal",
+        "story_transition": story_transition,
         "reversal_status": reversal,
         "trend_status": trend_status,
     }
@@ -833,6 +939,15 @@ def _build_plan_payload(
         actionable = bool(candidate["actionable"])
         phase2_score_gate_passed = bool(candidate.get("phase2_score_gate_passed"))
         phase2_rr_gate_passed = bool(candidate.get("phase2_rr_gate_passed"))
+        phase2_first_target_rr_gate_passed = bool(candidate.get("phase2_first_target_rr_gate_passed", rr >= 1.0))
+        phase2_price_gate_passed = bool(candidate.get("phase2_price_gate_passed", True))
+        phase2_risk_gate_passed = bool(candidate.get("phase2_risk_gate_passed", True))
+        risk_pct = float(candidate.get("risk_pct", 0.0))
+        max_loss_pct = float(candidate.get("max_loss_pct", 0.0))
+        entry_plan_type = str(candidate.get("entry_plan_type") or "standard")
+        management_note = str(candidate.get("management_note") or "")
+        downgrade_reason = str(candidate.get("downgrade_reason") or "")
+        signal_ref_level = float(candidate.get("signal_ref_level") or 0.0)
         reversal_signal_fresh = bool(candidate.get("reversal_signal_fresh"))
         entry_family = str(candidate.get("entry_family") or "")
         entry_signal_type = str(candidate.get("entry_signal_type") or "")
@@ -848,6 +963,15 @@ def _build_plan_payload(
         actionable = False
         phase2_score_gate_passed = False
         phase2_rr_gate_passed = False
+        phase2_first_target_rr_gate_passed = False
+        phase2_price_gate_passed = False
+        phase2_risk_gate_passed = False
+        risk_pct = 0.0
+        max_loss_pct = 0.0
+        entry_plan_type = ""
+        management_note = ""
+        downgrade_reason = ""
+        signal_ref_level = 0.0
         reversal_signal_fresh = _reversal_signal_is_fresh(reversal_status)
         entry_family = ""
         entry_signal_type = ""
@@ -870,6 +994,15 @@ def _build_plan_payload(
         "admission_rr": admission_rr,
         "phase2_score_gate_passed": phase2_score_gate_passed,
         "phase2_rr_gate_passed": phase2_rr_gate_passed,
+        "phase2_first_target_rr_gate_passed": phase2_first_target_rr_gate_passed,
+        "phase2_price_gate_passed": phase2_price_gate_passed,
+        "phase2_risk_gate_passed": phase2_risk_gate_passed,
+        "risk_pct": risk_pct,
+        "max_loss_pct": max_loss_pct,
+        "entry_plan_type": entry_plan_type,
+        "management_note": management_note,
+        "downgrade_reason": downgrade_reason,
+        "signal_ref_level": signal_ref_level,
         "reversal_signal_fresh": reversal_signal_fresh,
         "classical_score": float(ctx["classical_total"]),
         "wyckoff_score": float(ctx["wyckoff_total"]),
@@ -926,6 +1059,7 @@ def build_reversal_trade_plan_from_daily_df(
         fib_low=float(ctx["fib_low"]),
         fib_high=float(ctx["fib_high"]),
         fib_range=float(ctx["fib_range"]),
+        cfg=cfg,
     )
     if reversal_candidate is None:
         if not allow_watch_plan:
@@ -990,6 +1124,7 @@ def build_trend_trade_plan_from_daily_df(
         fib_low=float(ctx["fib_low"]),
         fib_high=float(ctx["fib_high"]),
         fib_range=float(ctx["fib_range"]),
+        cfg=cfg,
     )
     if trend_candidate is None:
         if not allow_watch_plan:
@@ -1237,27 +1372,27 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
     log.info(f"     {'─'*45}")
     if direction == "long":
         if total > 30:
-            score_hint = "→ ✅ 强多信号，可考虑入场"
+            score_hint = "→ ✅ 强多确认，可考虑执行"
         elif total > 10:
             score_hint = "→ 🟡 偏多，等待确认"
         elif total > -10:
-            score_hint = "→ ⚪ 中性，继续观望"
+            score_hint = "→ ⚪ 中性，等待交易故事确认"
         else:
             score_hint = "→ ❌ 偏空，不宜做多"
     else:
         if total < -30:
-            score_hint = "→ ✅ 强空信号，可考虑入场"
+            score_hint = "→ ✅ 强空确认，可考虑执行"
         elif total < -10:
             score_hint = "→ 🟡 偏空，等待确认"
         elif total < 10:
-            score_hint = "→ ⚪ 中性，继续观望"
+            score_hint = "→ ⚪ 中性，等待交易故事确认"
         else:
             score_hint = "→ ❌ 偏多，不宜做空"
     log.info("     总分:   %+.1f / 105  %s", total, score_hint)
 
     reversal = plan["reversal_status"]
     trend = plan.get("trend_status", {})
-    log.info(f"\n  ┌─ 反转信号评估 ──────────────────────────────┐")
+    log.info(f"\n  ┌─ 反转确认评估 ──────────────────────────────┐")
     log.info(f"  │ 当前阶段: {reversal['current_stage']}")
     log.info(f"  │ 下一步:   {reversal['next_expected']}")
     if reversal["all_events"]:
@@ -1283,9 +1418,9 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
 
     if entry_family == "trend":
         status_icon = "✅" if plan["actionable"] else "🟡"
-        log.info(f"     {status_icon} 顺势入场: {entry_signal_type}")
+        log.info(f"     {status_icon} 顺势确认: {entry_signal_type}")
         if entry_signal_detail:
-            log.info(f"     信号详情: {entry_signal_detail}")
+            log.info(f"     确认详情: {entry_signal_detail}")
         log.info(f"     参考入场: {plan['entry']:.0f} (当前价)")
         stop_basis = "趋势回踩失效位" if direction == "long" else "趋势反弹失效位"
         log.info(f"     止损位:   {plan['stop']:.0f} ({stop_basis})")
@@ -1296,9 +1431,9 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         if not plan["actionable"]:
             if not plan.get("phase2_rr_gate_passed", False):
                 admission_rr = plan.get("admission_rr", plan["rr"])
-                log.info(f"  ⚠️ 顺势信号存在，但准入盈亏比({admission_rr:.2f})不足1.0，谨慎入场")
+                log.info(f"  ⚠️ 顺势确认已出现，但准入盈亏比({admission_rr:.2f})不足1.0，谨慎执行")
             if (direction == "long" and plan["score"] <= 20) or (direction == "short" and plan["score"] >= -20):
-                log.info(f"  ⚠️ 顺势信号存在，但评分({plan['score']:+.0f})未达标，谨慎入场")
+                log.info(f"  ⚠️ 顺势确认已出现，但评分({plan['score']:+.0f})未达标，谨慎执行")
     elif reversal["has_signal"]:
         sig = reversal["signal_type"]
         sig_date = reversal["signal_date"]
@@ -1306,8 +1441,8 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
                   "UT": "上冲回落", "SOW": "弱势跌破", "BC": "买方高潮",
                   "StopVol_Bull": "停止量(多)", "StopVol_Bear": "停止量(空)"}.get(sig, sig)
 
-        log.info(f"     ✅ 入场信号: {sig_cn} ({sig_date})")
-        log.info(f"     信号详情: {reversal['signal_detail']}")
+        log.info(f"     ✅ 反转确认: {sig_cn} ({sig_date})")
+        log.info(f"     确认详情: {reversal['signal_detail']}")
         log.info(f"     参考入场: {plan['entry']:.0f} (当前价)")
         stop_basis = "信号K线最低 - 0.5ATR" if direction == "long" else "信号K线最高 + 0.5ATR"
         log.info(f"     止损位:   {plan['stop']:.0f} ({stop_basis})")
@@ -1320,19 +1455,19 @@ def analyze_one(symbol: str, name: str, direction: str, cfg: dict) -> dict | Non
         if not plan["actionable"]:
             if not plan.get("phase2_rr_gate_passed", False):
                 admission_rr = plan.get("admission_rr", plan["rr"])
-                log.info(f"  ⚠️ 有入场信号但准入盈亏比({admission_rr:.2f})不足1.0，谨慎入场")
+                log.info(f"  ⚠️ 反转确认已出现，但准入盈亏比({admission_rr:.2f})不足1.0，谨慎执行")
             if (direction == "long" and plan["score"] <= 20) or (direction == "short" and plan["score"] >= -20):
-                log.info(f"  ⚠️ 有入场信号但评分({plan['score']:+.0f})未达标，谨慎入场")
+                log.info(f"  ⚠️ 反转确认已出现，但评分({plan['score']:+.0f})未达标，谨慎执行")
     else:
-        log.info(f"     ⏳ 尚无有效反转信号，暂不建议入场")
+        log.info(f"     ⏳ 交易故事尚未确认，暂不建议执行")
         log.info(f"     当前阶段: {reversal['current_stage']}")
-        log.info(f"     等待信号: {reversal['next_expected']}")
+        log.info(f"     等待确认: {reversal['next_expected']}")
         if trend.get("phase"):
             log.info(f"     趋势状态: {trend['phase']}")
         if direction == "long":
-            log.info(f"     入场条件: 出现Spring(假跌破收回)或SOS(放量突破)后再评估")
+            log.info(f"     确认条件: 出现Spring(假跌破收回)或SOS(放量突破)后再评估")
         else:
-            log.info(f"     入场条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
+            log.info(f"     确认条件: 出现UT(假突破回落)或SOW(放量跌破)后再评估")
 
     return plan
 

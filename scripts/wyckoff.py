@@ -592,7 +592,7 @@ def oi_divergence(df: pd.DataFrame, window: int = 20) -> str | None:
 
 
 # ============================================================
-#  5. 反转信号评估（入场信号驱动）
+#  5. 反转确认评估（确认驱动）
 # ============================================================
 
 def _bar_dict(row) -> dict:
@@ -892,7 +892,7 @@ REVERSAL_FRESH_SIGNAL_MAX_DAYS_AGO = 2
 
 def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60) -> dict:
     """
-    综合评估反转信号状态，决定是否有足够的入场依据。
+    综合评估反转确认状态，决定是否有足够的执行依据。
 
     信号质量要求:
       - 只有 priority >= 2 的事件才算有效（疑似信号 priority=0 不算）
@@ -945,6 +945,8 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
         "has_signal": False,
         "signal_type": None, "signal_date": None,
         "signal_days_ago": None,
+        "signal_ref_level": None,
+        "signal_priority": 0,
         "signal_bar": None, "signal_detail": None,
         "current_stage": "", "next_expected": "",
         "confidence": 0.0,
@@ -974,11 +976,11 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
         freshness = "今日" if days_ago == 0 else f"{days_ago}天前"
 
         if direction == "long":
-            stage = "反转确认" if fresh_entry["signal"] == "SOS" else "反转信号出现"
-            next_exp = f"信号新鲜({freshness})，可考虑入场"
+            stage = "反转确认"
+            next_exp = f"确认新鲜({freshness})，可考虑入场"
         else:
-            stage = "反转确认" if fresh_entry["signal"] == "SOW" else "反转信号出现"
-            next_exp = f"信号新鲜({freshness})，可考虑入场"
+            stage = "反转确认"
+            next_exp = f"确认新鲜({freshness})，可考虑入场"
 
         return {
             "has_signal": True,
@@ -986,6 +988,8 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             "signal_type": fresh_entry["signal"],
             "signal_date": fresh_entry["date"],
             "signal_days_ago": days_ago,
+            "signal_ref_level": fresh_entry.get("ref_level"),
+            "signal_priority": int(fresh_entry.get("priority", 0)),
             "signal_bar": fresh_entry["bar"],
             "signal_detail": fresh_entry["detail"],
             "current_stage": stage,
@@ -995,15 +999,15 @@ def assess_reversal_status(df: pd.DataFrame, direction: str, lookback: int = 60)
             "suspect_events": suspect,
         }
 
-    # 有老的入场信号但不新鲜
+    # 有旧确认但已经过了执行窗口
     if entry_events:
         old = entry_events[-1]
         if direction == "long":
-            stage = "有信号但已过入场窗口"
-            next_exp = "等新的Spring或SOS出现"
+            stage = "有确认但已过入场窗口"
+            next_exp = "等新的Spring或SOS确认"
         else:
-            stage = "有信号但已过入场窗口"
-            next_exp = "等新的UT或SOW出现"
+            stage = "有确认但已过入场窗口"
+            next_exp = "等新的UT或SOW确认"
 
         result = dict(_no_signal)
         result["signal_strength"] = 0.45

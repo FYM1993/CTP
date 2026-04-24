@@ -61,7 +61,7 @@ def test_build_trade_plan_from_daily_df_returns_long_plan(monkeypatch) -> None:
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "synthetic long signal",
             "current_stage": "反转确认",
-            "next_expected": "信号新鲜(今日)，可考虑入场",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
             "confidence": 0.8,
             "signal_strength": 0.75,
             "all_events": [],
@@ -112,8 +112,8 @@ def test_build_trade_plan_from_daily_df_allows_fresh_reversal_signal_with_near_n
             "signal_date": "2025-05-10",
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "fresh spring",
-            "current_stage": "反转信号出现",
-            "next_expected": "信号新鲜(今日)，可考虑入场",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
             "confidence": 0.7,
             "signal_strength": 0.75,
             "all_events": [],
@@ -153,8 +153,8 @@ def test_build_trade_plan_from_daily_df_allows_fresh_reversal_signal_with_modera
             "signal_date": "2025-05-10",
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "fresh spring but still countertrend",
-            "current_stage": "反转信号出现",
-            "next_expected": "信号新鲜(今日)，可考虑入场",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
             "confidence": 0.7,
             "signal_strength": 0.75,
             "all_events": [],
@@ -196,7 +196,7 @@ def test_build_trade_plan_from_daily_df_allows_reversal_entry_when_tp1_rr_is_bel
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "fresh breakout with near resistance",
             "current_stage": "反转确认",
-            "next_expected": "信号新鲜(今日)，可考虑入场",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
             "confidence": 0.8,
             "signal_strength": 0.75,
             "all_events": [],
@@ -224,6 +224,8 @@ def test_build_trade_plan_from_daily_df_allows_reversal_entry_when_tp1_rr_is_bel
     assert plan["admission_rr"] == pytest.approx(1.2731707317)
     assert plan["admission_rr"] > plan["rr"]
     assert plan["phase2_rr_gate_passed"] is True
+    assert plan["entry_plan_type"] == "extended_target"
+    assert "第一止盈" in plan["management_note"]
 
 
 def test_build_trade_plan_from_daily_df_allows_fresh_reversal_signal_on_second_follow_through_day(monkeypatch) -> None:
@@ -239,8 +241,8 @@ def test_build_trade_plan_from_daily_df_allows_fresh_reversal_signal_on_second_f
             "signal_days_ago": 2,
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "spring recovered after two days",
-            "current_stage": "反转信号出现",
-            "next_expected": "信号新鲜(2天前)，可考虑入场",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(2天前)，可考虑入场",
             "confidence": 0.7,
             "signal_strength": 0.75,
             "all_events": [],
@@ -291,8 +293,8 @@ def test_assess_reversal_status_marks_three_day_old_entry_signal_as_stale(monkey
     status = wyckoff_module.assess_reversal_status(df, "long", lookback=60)
 
     assert status["has_signal"] is False
-    assert status["current_stage"] == "有信号但已过入场窗口"
-    assert status["next_expected"] == "等新的Spring或SOS出现"
+    assert status["current_stage"] == "有确认但已过入场窗口"
+    assert status["next_expected"] == "等新的Spring或SOS确认"
 
 
 def test_build_reversal_trade_plan_from_daily_df_exposes_fresh_signal_gate_diagnostics(monkeypatch) -> None:
@@ -308,8 +310,8 @@ def test_build_reversal_trade_plan_from_daily_df_exposes_fresh_signal_gate_diagn
             "signal_days_ago": 2,
             "signal_bar": {"low": 110.0, "high": 114.0},
             "signal_detail": "fresh spring but score still weak",
-            "current_stage": "反转信号出现",
-            "next_expected": "信号新鲜(2天前)，可考虑入场",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(2天前)，可考虑入场",
             "confidence": 0.7,
             "signal_strength": 0.75,
             "all_events": [],
@@ -335,6 +337,90 @@ def test_build_reversal_trade_plan_from_daily_df_exposes_fresh_signal_gate_diagn
     assert plan["reversal_signal_fresh"] is True
     assert plan["phase2_score_gate_passed"] is False
     assert plan["phase2_rr_gate_passed"] is True
+
+
+def test_build_reversal_trade_plan_from_daily_df_downgrades_sos_when_breakout_level_is_lost(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": True,
+            "signal_type": "SOS",
+            "signal_date": "2025-05-10",
+            "signal_days_ago": 0,
+            "signal_bar": {"low": 110.0, "high": 116.0},
+            "signal_ref_level": 118.0,
+            "signal_detail": "fresh SOS but price has fallen back below the breakout level",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，但需重新站回突破位",
+            "confidence": 0.8,
+            "signal_strength": 0.75,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([92.0], [118.0, 124.0]))
+    monkeypatch.setattr(pre_market, "score_signals", lambda *args, **kwargs: {"dummy": 25.0})
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+
+    plan = pre_market.build_reversal_trade_plan_from_daily_df(
+        symbol="PS0",
+        name="多晶硅",
+        direction="long",
+        df=df,
+        cfg={"ma_windows": [5, 10, 20]},
+        allow_watch_plan=True,
+    )
+
+    assert plan is not None
+    assert bool(plan["actionable"]) is False
+    assert plan["phase2_price_gate_passed"] is False
+    assert "突破位" in plan["downgrade_reason"]
+
+
+def test_build_reversal_trade_plan_from_daily_df_downgrades_when_stop_width_exceeds_risk_budget(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": True,
+            "signal_type": "Spring",
+            "signal_date": "2025-05-10",
+            "signal_days_ago": 0,
+            "signal_bar": {"low": 100.0, "high": 116.0},
+            "signal_detail": "fresh spring with an overly wide stop",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
+            "confidence": 0.8,
+            "signal_strength": 0.75,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([92.0], [118.0, 124.0]))
+    monkeypatch.setattr(pre_market, "score_signals", lambda *args, **kwargs: {"dummy": 25.0})
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+
+    plan = pre_market.build_reversal_trade_plan_from_daily_df(
+        symbol="PS0",
+        name="多晶硅",
+        direction="long",
+        df=df,
+        cfg={"ma_windows": [5, 10, 20], "max_loss_pct": 0.02},
+        allow_watch_plan=True,
+    )
+
+    assert plan is not None
+    assert bool(plan["actionable"]) is False
+    assert plan["phase2_risk_gate_passed"] is False
+    assert plan["risk_pct"] > 0.02
+    assert "止损距离" in plan["downgrade_reason"]
 
 
 def test_build_trade_plan_from_daily_df_returns_short_plan(monkeypatch) -> None:
@@ -885,7 +971,7 @@ def test_build_trade_plan_from_daily_df_rejects_conflicting_trend_quality(monkey
     assert plan["entry_family"] == ""
 
 
-def test_assess_active_trend_hold_from_daily_df_accepts_phase_valid_soft_countertrend(monkeypatch) -> None:
+def test_assess_active_trend_hold_from_daily_df_rejects_when_all_continuation_evidence_is_lost(monkeypatch) -> None:
     df = _build_daily_frame()
 
     monkeypatch.setattr(
@@ -925,7 +1011,7 @@ def test_assess_active_trend_hold_from_daily_df_accepts_phase_valid_soft_counter
     )
 
     assert hold is not None
-    assert hold["hold_valid"] is True
+    assert hold["hold_valid"] is False
     assert hold["score"] == 5.0
     assert hold["trend_status"]["phase_ok"] is True
 
@@ -1014,7 +1100,7 @@ def test_analyze_one_reports_actionable_trend_entry(monkeypatch) -> None:
     result = pre_market.analyze_one("LH0", "生猪", "long", {"reason": "test", "ma_windows": [5], "sr_lookback": 120})
 
     assert result is not None
-    assert any("顺势入场" in msg for msg in messages)
+    assert any("顺势确认" in msg for msg in messages)
     assert any("Pullback" in msg for msg in messages)
     assert not any("尚无有效反转信号，暂不建议入场" in msg for msg in messages)
 
@@ -1070,7 +1156,7 @@ def test_analyze_one_restores_phase2_section_logging(monkeypatch) -> None:
             "signal_bar": {"low": 98.0, "high": 104.0},
             "signal_detail": "synthetic long signal",
             "current_stage": "反转确认",
-            "next_expected": "信号新鲜(今日)，可考虑入场",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
             "confidence": 0.8,
             "all_events": [],
             "suspect_events": [],
@@ -1113,3 +1199,166 @@ def test_analyze_one_restores_phase2_section_logging(monkeypatch) -> None:
     assert any("关键价位" in msg for msg in messages)
     assert any("斐波那契目标位" in msg for msg in messages)
     assert any("综合评分" in msg for msg in messages)
+    assert any("反转确认" in msg for msg in messages)
+    assert not any("✅ 入场信号:" in msg for msg in messages)
+    assert any("反转确认评估" in msg for msg in messages)
+    assert not any("反转信号评估" in msg for msg in messages)
+
+
+def test_analyze_one_uses_trade_story_waiting_wording_for_neutral_score(monkeypatch) -> None:
+    df = _build_daily_frame()
+    messages: list[str] = []
+
+    def capture_info(message, *args, **kwargs):
+        if args:
+            message = message % args
+        messages.append(str(message))
+
+    monkeypatch.setattr(pre_market.log, "info", capture_info)
+    monkeypatch.setattr(pre_market, "fetch_data", lambda *args, **kwargs: df)
+    monkeypatch.setattr(
+        pre_market,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: {
+            "score": 0.0,
+            "actionable": False,
+            "entry": float(df["close"].iloc[-1]),
+            "stop": 95.0,
+            "tp1": 112.0,
+            "tp2": 118.0,
+            "rr": 1.5,
+            "admission_rr": 1.5,
+            "support_levels": [92.0, 90.0],
+            "resistance_levels": [112.0, 118.0],
+            "fib_targets": {},
+            "scores": {
+                "均线排列": 0.0,
+                "MACD": 0.0,
+                "RSI": 0.0,
+                "布林带": 0.0,
+                "动量": 0.0,
+                "价格位置": 0.0,
+                "Wyckoff阶段": 0.0,
+                "量价关系": 0.0,
+                "VSA信号": 0.0,
+                "持仓信号": 0.0,
+            },
+            "reversal_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_date": "",
+                "signal_bar": {},
+                "signal_detail": "",
+                "current_stage": "等待确认",
+                "next_expected": "等待交易故事确认",
+                "confidence": 0.0,
+                "all_events": [],
+                "suspect_events": [],
+            },
+            "trend_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_detail": "",
+            },
+        },
+    )
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: SimpleNamespace(phase="range", confidence=0.5, description="震荡"))
+    monkeypatch.setattr(pre_market, "analyze_volume_pattern", lambda *args, **kwargs: {"up_down_ratio": 1.0, "vol_trend": 1.0, "price_vol_corr": 0.0})
+    monkeypatch.setattr(pre_market, "vsa_scan", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pre_market, "analyze_oi", lambda *args, **kwargs: SimpleNamespace(bias="neutral", label="中性", strength=0, description="neutral"))
+    monkeypatch.setattr(pre_market, "oi_divergence", lambda *args, **kwargs: "none")
+    monkeypatch.setattr(pre_market, "detect_climax", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pre_market, "detect_spring_upthrust", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pre_market, "detect_sos_sow", lambda *args, **kwargs: [])
+
+    result = pre_market.analyze_one("LH0", "生猪", "long", {"reason": "test", "ma_windows": [5], "sr_lookback": 120})
+
+    assert result is not None
+    assert any("→ ⚪ 中性，等待交易故事确认" in msg for msg in messages)
+    assert not any("继续观望" in msg for msg in messages)
+    assert any("⏳ 交易故事尚未确认，暂不建议执行" in msg for msg in messages)
+    assert any("等待确认: 等待交易故事确认" in msg for msg in messages)
+    assert not any("尚无有效反转信号，暂不建议入场" in msg for msg in messages)
+
+
+def test_analyze_one_uses_confirmation_wording_for_non_actionable_reversal_plan(monkeypatch) -> None:
+    df = _build_daily_frame()
+    messages: list[str] = []
+
+    def capture_info(message, *args, **kwargs):
+        if args:
+            message = message % args
+        messages.append(str(message))
+
+    monkeypatch.setattr(pre_market.log, "info", capture_info)
+    monkeypatch.setattr(pre_market, "fetch_data", lambda *args, **kwargs: df)
+    monkeypatch.setattr(
+        pre_market,
+        "build_trade_plan_from_daily_df",
+        lambda **kwargs: {
+            "score": 9.0,
+            "actionable": False,
+            "entry": float(df["close"].iloc[-1]),
+            "stop": 95.0,
+            "tp1": 112.0,
+            "tp2": 118.0,
+            "rr": 0.8,
+            "admission_rr": 0.8,
+            "support_levels": [92.0, 90.0],
+            "resistance_levels": [112.0, 118.0],
+            "fib_targets": {},
+            "scores": {
+                "均线排列": 10.0,
+                "MACD": 5.0,
+                "RSI": 0.0,
+                "布林带": 0.0,
+                "动量": 2.0,
+                "价格位置": 0.0,
+                "Wyckoff阶段": 8.0,
+                "量价关系": 5.0,
+                "VSA信号": 0.0,
+                "持仓信号": 0.0,
+            },
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Spring",
+                "signal_date": "2025-05-10",
+                "signal_bar": {"low": 98.0, "high": 104.0},
+                "signal_detail": "synthetic spring",
+                "current_stage": "反转确认",
+                "next_expected": "确认新鲜(今日)，可考虑入场",
+                "confidence": 0.8,
+                "all_events": [],
+                "suspect_events": [],
+            },
+            "trend_status": {
+                "has_signal": False,
+                "signal_type": "",
+                "signal_detail": "",
+            },
+            "entry_family": "reversal",
+            "entry_signal_type": "Spring",
+            "entry_signal_detail": "synthetic spring",
+            "phase2_rr_gate_passed": False,
+            "phase2_score_gate_passed": False,
+        },
+    )
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: SimpleNamespace(phase="markup", confidence=0.8, description="上涨阶段"))
+    monkeypatch.setattr(pre_market, "analyze_volume_pattern", lambda *args, **kwargs: {"up_down_ratio": 1.4, "vol_trend": 1.1, "price_vol_corr": 0.2})
+    monkeypatch.setattr(
+        pre_market,
+        "vsa_scan",
+        lambda *args, **kwargs: [SimpleNamespace(strength=2, bias="bullish", bar_type="upthrust", description="VSA signal")],
+    )
+    monkeypatch.setattr(pre_market, "analyze_oi", lambda *args, **kwargs: SimpleNamespace(bias="bullish", label="新多", strength=10, description="OI signal"))
+    monkeypatch.setattr(pre_market, "oi_divergence", lambda *args, **kwargs: "OI divergence")
+    monkeypatch.setattr(pre_market, "detect_climax", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pre_market, "detect_spring_upthrust", lambda *args, **kwargs: [])
+    monkeypatch.setattr(pre_market, "detect_sos_sow", lambda *args, **kwargs: [])
+
+    result = pre_market.analyze_one("LH0", "生猪", "long", {"reason": "test", "ma_windows": [5], "sr_lookback": 120})
+
+    assert result is not None
+    assert any("⚠️ 反转确认已出现，但准入盈亏比(0.80)不足1.0，谨慎执行" in msg for msg in messages)
+    assert any("⚠️ 反转确认已出现，但评分(+9)未达标，谨慎执行" in msg for msg in messages)
+    assert not any("有入场信号但" in msg for msg in messages)
