@@ -201,7 +201,7 @@ def _phase1_score_details(
     reversal_down_drivers = _compact_drivers(
         _score_driver("价格高位", high_price),
         _score_driver("高位持续", high_persistence),
-        _score_driver("收紧/低库存", structural_up),
+        _score_driver("过剩/高库存", structural_down),
         _score_driver("利润高位", hog_reversal),
         _score_driver("历史代理反转向下", proxy_scores.get("reversal_down")),
     )
@@ -662,7 +662,7 @@ def _build_candidate(
         high_price * 0.18
         + high_persistence * 0.22
         + hog_reversal * 0.42
-        + structural_up * 0.12
+        + structural_down * 0.12
     )
     if high_price >= 50 and hog_reversal >= 45:
         reversal_down += 12.0
@@ -725,7 +725,13 @@ def _build_candidate(
                 ]
             )
             dominant_reasons.extend([item for item in hog_reasons if "偏高" in item[0] or "利润" in item[0]])
-            dominant_reasons.extend([item for item in inv_reasons + receipt_reasons if "低位" in item[0] or "下降" in item[0]])
+            dominant_reasons.extend(
+                [
+                    item
+                    for item in inv_reasons + receipt_reasons
+                    if "高位" in item[0] or "累" in item[0] or "增加" in item[0]
+                ]
+            )
     else:
         if trend_up >= trend_down:
             dominant_reasons.append(("历史代理:价格趋势上行", trend_up))
@@ -750,7 +756,7 @@ def _build_candidate(
     )
     reversal_evidence_domains = _reversal_evidence_domains(
         direction=reversal_direction,
-        structural_score=structural_down if reversal_direction == "long" else structural_up,
+        structural_score=structural_down,
         oi_structure=oi_structure,
         hog_reversal=hog_reversal,
         hog_profit=hog_profit,

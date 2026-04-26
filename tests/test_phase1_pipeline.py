@@ -705,6 +705,163 @@ def test_build_candidate_keeps_structural_distress_reversal_high_after_small_reb
     assert "反转候选" in cand["labels"] or "双标签候选" in cand["labels"]
 
 
+def test_build_candidate_uses_supply_pressure_as_short_reversal_driver(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    closes = [100.0] * 120
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_price_stats",
+        lambda frame: {
+            "price": 100.0,
+            "range_pct": 100.0,
+            "price_percentile_300d": 100.0,
+            "price_percentile_full": 100.0,
+            "low_persistence_days": 0,
+            "high_persistence_days": 25,
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_historical_proxy_scores",
+        lambda *, df, stats: (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 0.0,
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "build_fundamental_snapshot",
+        lambda **kwargs: {
+            "raw_details": {
+                "inventory": {
+                    "inv_now": 12580.0,
+                    "inv_change_4wk": 18.0,
+                    "inv_cumulating_weeks": 7,
+                    "inv_percentile": 92.0,
+                    "inv_trend": "累库",
+                },
+                "warehouse_receipt": {
+                    "receipt_total": 2000.0,
+                    "receipt_change": 160.0,
+                    "exchange": "GFEX",
+                },
+            },
+            "coverage_score": 0.75,
+            "coverage_status": "partial",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_oi_structure", lambda frame: None)
+
+    cand = phase1_pipeline._build_candidate(
+        info={"symbol": "PS0", "name": "多晶硅", "exchange": "gfex"},
+        df=df,
+    )
+
+    assert cand is not None
+    assert cand["reversal_direction"] == "short"
+    drivers = cand["phase1_score_details"]["reversal"]["drivers"]
+    assert any("过剩/高库存" in item for item in drivers)
+    assert not any("收紧/低库存" in item for item in drivers)
+    assert phase1_pipeline.DOMAIN_INVENTORY_SUPPLY in cand["reversal_evidence_domains"]
+
+
+def test_build_candidate_does_not_use_tight_supply_as_short_reversal_evidence(monkeypatch) -> None:
+    dates = pd.date_range("2025-01-01", periods=120, freq="D")
+    closes = [100.0] * 120
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_price_stats",
+        lambda frame: {
+            "price": 100.0,
+            "range_pct": 100.0,
+            "price_percentile_300d": 100.0,
+            "price_percentile_full": 100.0,
+            "low_persistence_days": 0,
+            "high_persistence_days": 25,
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_historical_proxy_scores",
+        lambda *, df, stats: (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 0.0,
+            },
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "build_fundamental_snapshot",
+        lambda **kwargs: {
+            "raw_details": {
+                "inventory": {
+                    "inv_now": 800.0,
+                    "inv_change_4wk": -18.0,
+                    "inv_cumulating_weeks": 1,
+                    "inv_percentile": 12.0,
+                    "inv_trend": "去库",
+                },
+                "warehouse_receipt": {
+                    "receipt_total": 2000.0,
+                    "receipt_change": -160.0,
+                    "exchange": "GFEX",
+                },
+            },
+            "coverage_score": 0.75,
+            "coverage_status": "partial",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+    monkeypatch.setattr(phase1_pipeline, "get_oi_structure", lambda frame: None)
+
+    cand = phase1_pipeline._build_candidate(
+        info={"symbol": "PS0", "name": "多晶硅", "exchange": "gfex"},
+        df=df,
+    )
+
+    assert cand is not None
+    assert cand["reversal_direction"] == "short"
+    drivers = cand["phase1_score_details"]["reversal"]["drivers"]
+    assert not any("收紧/低库存" in item for item in drivers)
+    assert phase1_pipeline.DOMAIN_INVENTORY_SUPPLY not in cand["reversal_evidence_domains"]
+
+
 def test_build_candidate_uses_snapshot_confirmed_fundamental_reversal(monkeypatch) -> None:
     dates = pd.date_range("2025-01-01", periods=120, freq="D")
     closes = [42000.0] * 120
