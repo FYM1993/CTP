@@ -111,9 +111,9 @@ def test_build_trend_universe_uses_price_trend_without_phase1(monkeypatch) -> No
     monkeypatch.setattr(
         trend_screen.pre_market,
         "score_signals",
-        lambda df, direction, cfg: {"trend": 58.0, "volume": 11.0, "wyckoff": -4.0}
+        lambda df, direction, cfg: {"均线排列": 30.0, "MACD": 20.0, "动量": 8.0, "持仓信号": 11.0}
         if float(df["close"].iloc[-1]) > 150
-        else {"trend": -56.0, "volume": -10.0, "wyckoff": 3.0},
+        else {"均线排列": -30.0, "MACD": -18.0, "动量": -8.0, "持仓信号": -10.0},
     )
     monkeypatch.setattr(
         trend_screen.pre_market,
@@ -134,3 +134,45 @@ def test_build_trend_universe_uses_price_trend_without_phase1(monkeypatch) -> No
     assert selected[0]["trend_direction"] == "long"
     assert selected[1]["trend_direction"] == "short"
     assert all(row["labels"] == ["趋势候选"] for row in selected)
+
+
+def test_build_trend_universe_ignores_contrarian_only_scores(monkeypatch) -> None:
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=120, freq="D"),
+            "open": [200 - i for i in range(120)],
+            "high": [201 - i for i in range(120)],
+            "low": [199 - i for i in range(120)],
+            "close": [200 - i for i in range(120)],
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        trend_screen.pre_market,
+        "score_signals",
+        lambda df, direction, cfg: {
+            "RSI": 10.0,
+            "布林带": 10.0,
+            "价格位置": 5.0,
+            "均线排列": 0.0,
+            "MACD": 0.0,
+            "动量": 0.0,
+            "量价关系": 0.0,
+            "VSA信号": 0.0,
+            "持仓信号": 0.0,
+            "Wyckoff阶段": 0.0,
+        },
+    )
+
+    selected = build_trend_universe(
+        all_data={"PS0": df},
+        symbols=[{"symbol": "PS0", "name": "多晶硅", "exchange": "gfex"}],
+        config={"pre_market": {"min_history_bars": 60, "direction_delta": 12.0}},
+        min_trend_score=20.0,
+    )
+
+    assert selected == []

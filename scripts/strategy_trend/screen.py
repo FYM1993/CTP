@@ -32,8 +32,9 @@ def _slice_visible_frame(df: pd.DataFrame, *, as_of_date: date | None = None) ->
 
 
 def _trend_reason_summary(scores: dict[str, float]) -> str:
+    trend_keys = set(pre_market.TREND_DIRECTION_SCORE_KEYS)
     ranked = sorted(
-        ((str(key), float(value)) for key, value in scores.items()),
+        ((str(key), float(value)) for key, value in scores.items() if str(key) in trend_keys),
         key=lambda item: abs(item[1]),
         reverse=True,
     )
@@ -63,14 +64,14 @@ def build_trend_universe(
             continue
 
         phase2_scores = pre_market.score_signals(df, "long", pre_market_cfg)
-        long_score = float(sum(value for value in phase2_scores.values() if value > 0))
-        short_score = float(sum(-value for value in phase2_scores.values() if value < 0))
-        resolved_direction = pre_market.resolve_phase2_direction(
-            long_score=long_score,
-            short_score=short_score,
+        trend_summary = pre_market.trend_direction_score_summary(
+            phase2_scores,
             delta=float(pre_market_cfg.get("direction_delta", 12.0)),
         )
-        trend_score = max(long_score, short_score)
+        long_score = float(trend_summary["long_score"])
+        short_score = float(trend_summary["short_score"])
+        resolved_direction = str(trend_summary["direction"])
+        trend_score = float(trend_summary["score"])
         if trend_score < float(min_trend_score):
             continue
         if resolved_direction == "watch":

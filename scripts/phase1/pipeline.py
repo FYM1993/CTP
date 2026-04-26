@@ -11,9 +11,45 @@ from data_cache import (
     get_inventory,
     get_oi_structure,
     get_seasonality,
+    get_spot_basis,
     get_warehouse_receipt,
 )
+from market.fundamental_snapshot import build_fundamental_snapshot
 from phase1.scoring import build_labels, build_state_labels, calc_attention_raw
+
+DOMAIN_TECHNICAL_TREND = "technical_trend"
+DOMAIN_POSITIONING_OI = "positioning_oi"
+DOMAIN_INVENTORY_SUPPLY = "inventory_supply"
+DOMAIN_WAREHOUSE_RECEIPT = "warehouse_receipt"
+DOMAIN_SEASONALITY_PROFIT = "seasonality_profit"
+
+
+def _snapshot_domain(snapshot: dict[str, Any] | None, domain: str) -> dict[str, Any] | None:
+    raw_details = (snapshot or {}).get("raw_details") or {}
+    payload = raw_details.get(domain)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    return dict(payload)
+
+
+def _snapshot_fields(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    snapshot = snapshot or {}
+    return {
+        "fundamental_snapshot": snapshot,
+        "fundamental_coverage_score": float(snapshot.get("coverage_score") or 0.0),
+        "fundamental_coverage_status": str(snapshot.get("coverage_status") or ""),
+        "fundamental_domains_present": list(snapshot.get("evidence_domains_present") or []),
+        "fundamental_domains_missing": list(snapshot.get("evidence_domains_missing") or []),
+        "fundamental_missing_domain_reasons": list(snapshot.get("missing_domain_reasons") or []),
+        "fundamental_extreme_state_direction": str(snapshot.get("extreme_state_direction") or ""),
+        "fundamental_extreme_state_confirmed": bool(snapshot.get("extreme_state_confirmed")),
+        "fundamental_extreme_state_reasons": list(snapshot.get("extreme_state_reasons") or []),
+        "fundamental_marginal_turn_direction": str(snapshot.get("marginal_turn_direction") or ""),
+        "fundamental_marginal_turn_confirmed": bool(snapshot.get("marginal_turn_confirmed")),
+        "fundamental_marginal_turn_reasons": list(snapshot.get("marginal_turn_reasons") or []),
+        "fundamental_reversal_confirmed": bool(snapshot.get("fundamental_reversal_confirmed")),
+        "fundamental_only_proxy_evidence": bool(snapshot.get("only_proxy_evidence")),
+    }
 
 
 def _clip_score(value: float) -> float:
@@ -78,6 +114,191 @@ def _entry_pool_reason(row: dict[str, Any]) -> str:
         f"{dominant_family}未达标（反转{reversal_score:.0f} / 趋势{trend_score:.0f}；"
         f"门槛{entry_threshold:.0f}）"
     )
+
+
+def _unique_domains(*domains: str) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for domain in domains:
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        ordered.append(domain)
+    return ordered
+
+
+def _score_driver(label: str, value: float | None, *, min_value: float = 1.0) -> str | None:
+    if value is None:
+        return None
+    numeric = float(value)
+    if abs(numeric) < min_value:
+        return None
+    return f"{label}{numeric:.0f}"
+
+
+def _metric_driver(label: str, value: Any, *, suffix: str = "") -> str | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        text = str(value or "").strip()
+        return f"{label}{text}" if text else None
+    if abs(numeric) < 1e-9:
+        return None
+    return f"{label}{numeric:+.1f}{suffix}"
+
+
+def _reason_drivers(
+    reasons: list[tuple[str, float]],
+    *,
+    include_keywords: tuple[str, ...],
+) -> list[str]:
+    drivers: list[str] = []
+    for reason, value in reasons:
+        if include_keywords and not any(keyword in reason for keyword in include_keywords):
+            continue
+        if value <= 0:
+            continue
+        drivers.append(f"{reason}{value:.0f}")
+    return drivers
+
+
+def _compact_drivers(*drivers: str | None) -> list[str]:
+    return [driver for driver in drivers if driver]
+
+
+def _phase1_score_details(
+    *,
+    reversal_direction: str,
+    trend_direction: str,
+    reversal_score: float,
+    trend_score: float,
+    reversal_up: float,
+    reversal_down: float,
+    trend_up: float,
+    trend_down: float,
+    low_price: float,
+    high_price: float,
+    low_persistence: float,
+    high_persistence: float,
+    structural_down: float,
+    structural_up: float,
+    hog_reversal: float,
+    proxy_scores: dict[str, float],
+    proxy_reasons: list[tuple[str, float]],
+    oi_structure: dict[str, Any] | None,
+    data_coverage: float,
+    shrink: float,
+) -> dict[str, Any]:
+    reversal_up_drivers = _compact_drivers(
+        _score_driver("价格低位", low_price),
+        _score_driver("低位持续", low_persistence),
+        _score_driver("过剩/高库存", structural_down),
+        _score_driver("利润压力", hog_reversal),
+        _score_driver("历史代理反转向上", proxy_scores.get("reversal_up")),
+    )
+    reversal_down_drivers = _compact_drivers(
+        _score_driver("价格高位", high_price),
+        _score_driver("高位持续", high_persistence),
+        _score_driver("收紧/低库存", structural_up),
+        _score_driver("利润高位", hog_reversal),
+        _score_driver("历史代理反转向下", proxy_scores.get("reversal_down")),
+    )
+
+    oi_vs_price = str((oi_structure or {}).get("oi_vs_price") or "")
+    oi_change = (oi_structure or {}).get("oi_20d_change")
+    oi_percentile = (oi_structure or {}).get("oi_percentile")
+    trend_up_drivers = _compact_drivers(
+        _score_driver("技术趋势上行", trend_up),
+        f"价格/OI={oi_vs_price}" if oi_vs_price else None,
+        _metric_driver("OI20日", oi_change, suffix="%"),
+        _metric_driver("OI分位", oi_percentile, suffix="%"),
+    )
+    trend_up_drivers.extend(
+        _reason_drivers(proxy_reasons, include_keywords=("上行", "多头"))
+    )
+
+    trend_down_drivers = _compact_drivers(
+        _score_driver("技术趋势下行", trend_down),
+        f"价格/OI={oi_vs_price}" if oi_vs_price else None,
+        _metric_driver("OI20日", oi_change, suffix="%"),
+        _metric_driver("OI分位", oi_percentile, suffix="%"),
+    )
+    trend_down_drivers.extend(
+        _reason_drivers(proxy_reasons, include_keywords=("下行", "空头"))
+    )
+
+    return {
+        "reversal": {
+            "direction": reversal_direction,
+            "score": round(reversal_score, 2),
+            "up_score": round(reversal_up, 2),
+            "down_score": round(reversal_down, 2),
+            "drivers": reversal_up_drivers if reversal_direction == "long" else reversal_down_drivers,
+        },
+        "trend": {
+            "direction": trend_direction,
+            "score": round(trend_score, 2),
+            "up_score": round(trend_up, 2),
+            "down_score": round(trend_down, 2),
+            "drivers": trend_up_drivers if trend_direction == "long" else trend_down_drivers,
+        },
+        "coverage": {
+            "data_coverage": round(data_coverage, 2),
+            "shrink": round(shrink, 2),
+        },
+    }
+
+
+def _trend_evidence_domains(
+    *,
+    direction: str,
+    trend_score: float,
+    oi_structure: dict[str, Any] | None,
+    inventory_score: float,
+    receipt_score: float,
+    seasonal_score: float,
+    hog: dict[str, Any] | None,
+) -> list[str]:
+    domains: list[str] = []
+    if trend_score > 0:
+        domains.append(DOMAIN_TECHNICAL_TREND)
+
+    oi_vs_price = str((oi_structure or {}).get("oi_vs_price") or "")
+    if (direction == "long" and oi_vs_price == "增仓上涨") or (direction == "short" and oi_vs_price == "增仓下跌"):
+        domains.append(DOMAIN_POSITIONING_OI)
+
+    if inventory_score > 0:
+        domains.append(DOMAIN_INVENTORY_SUPPLY)
+    if receipt_score > 0:
+        domains.append(DOMAIN_WAREHOUSE_RECEIPT)
+
+    hog_trend = float((hog or {}).get("price_trend", 0.0))
+    if seasonal_score > 0 or (direction == "long" and hog_trend > 0) or (direction == "short" and hog_trend < 0):
+        domains.append(DOMAIN_SEASONALITY_PROFIT)
+    return _unique_domains(*domains)
+
+
+def _reversal_evidence_domains(
+    *,
+    direction: str,
+    structural_score: float,
+    oi_structure: dict[str, Any] | None,
+    hog_reversal: float,
+    hog_profit: float | None,
+) -> list[str]:
+    domains: list[str] = []
+    if structural_score > 0:
+        domains.append(DOMAIN_INVENTORY_SUPPLY)
+
+    oi_vs_price = str((oi_structure or {}).get("oi_vs_price") or "")
+    if (direction == "long" and oi_vs_price == "减仓下跌") or (direction == "short" and oi_vs_price == "减仓上涨"):
+        domains.append(DOMAIN_POSITIONING_OI)
+
+    if hog_reversal > 0 or hog_profit is not None:
+        domains.append(DOMAIN_SEASONALITY_PROFIT)
+    return _unique_domains(*domains)
 
 
 def _price_stats(df: pd.DataFrame) -> dict[str, float]:
@@ -378,28 +599,44 @@ def _build_candidate(
         return None
 
     stats = _price_stats(df)
-    inv = _call_factor(get_inventory, info["symbol"], as_of_date=as_of_date)
-    receipt = _call_factor(get_warehouse_receipt, info["symbol"], as_of_date=as_of_date)
-    seasonal = _call_factor(get_seasonality, df, as_of_date=as_of_date)
+    fundamental_snapshot = build_fundamental_snapshot(
+        symbol=info["symbol"],
+        name=info["name"],
+        exchange=info["exchange"],
+        daily_df=df,
+        as_of_date=as_of_date,
+        inventory_fetcher=get_inventory,
+        warehouse_receipt_fetcher=get_warehouse_receipt,
+        spot_basis_fetcher=get_spot_basis,
+        seasonality_fetcher=get_seasonality,
+    )
+    inv = _snapshot_domain(fundamental_snapshot, "inventory")
+    receipt = _snapshot_domain(fundamental_snapshot, "warehouse_receipt")
+    seasonal = _snapshot_domain(fundamental_snapshot, "seasonality")
     hog = _call_factor(get_hog_fundamentals, as_of_date=as_of_date) if info["symbol"] == "LH0" else None
+    oi_structure = get_oi_structure(df)
 
     inv_up, inv_down, inv_reasons = _inventory_scores(inv)
     receipt_up, receipt_down, receipt_reasons = _receipt_scores(receipt)
     seasonal_up, seasonal_down, seasonal_reasons = _seasonal_scores(seasonal)
     hog_reversal, hog_trend, hog_profit, hog_reasons = _hog_scores(hog)
     use_proxy_scores = as_of_date is not None or not any((inv, receipt, seasonal, hog))
+    technical_proxy_scores, technical_proxy_reasons = _historical_proxy_scores(df=df, stats=stats)
     if use_proxy_scores:
-        proxy_scores, proxy_reasons = _historical_proxy_scores(df=df, stats=stats)
+        proxy_scores = technical_proxy_scores
+        proxy_reasons = technical_proxy_reasons
     else:
-        proxy_scores, proxy_reasons = (
-            {
-                "reversal_up": 0.0,
-                "reversal_down": 0.0,
-                "trend_up": 0.0,
-                "trend_down": 0.0,
-            },
-            [],
-        )
+        proxy_scores = {
+            "reversal_up": 0.0,
+            "reversal_down": 0.0,
+            "trend_up": technical_proxy_scores["trend_up"],
+            "trend_down": technical_proxy_scores["trend_down"],
+        }
+        proxy_reasons = [
+            item
+            for item in technical_proxy_reasons
+            if "价格/OI共振" in item[0] or "价格沿均线" in item[0]
+        ]
 
     low_price, high_price = _reversal_price_scores(stats=stats, hog=hog)
     low_persistence = _clip_score(stats["low_persistence_days"] / 25.0 * 100.0)
@@ -433,18 +670,8 @@ def _build_candidate(
         reversal_down += 6.0
     reversal_down = _clip_score(reversal_down)
 
-    trend_up = _clip_score(
-        inv_up * 0.52
-        + receipt_up * 0.23
-        + seasonal_up * 0.15
-        + (hog_trend if hog and float(hog.get("price_trend", 0.0)) > 0 else 0.0) * 0.10
-    )
-    trend_down = _clip_score(
-        inv_down * 0.52
-        + receipt_down * 0.23
-        + seasonal_down * 0.15
-        + (hog_trend if hog and float(hog.get("price_trend", 0.0)) < 0 else 0.0) * 0.10
-    )
+    trend_up = _clip_score(proxy_scores["trend_up"])
+    trend_down = _clip_score(proxy_scores["trend_down"])
 
     reversal_up = _clip_score(max(reversal_up, proxy_scores["reversal_up"]))
     reversal_down = _clip_score(max(reversal_down, proxy_scores["reversal_down"]))
@@ -501,9 +728,9 @@ def _build_candidate(
             dominant_reasons.extend([item for item in inv_reasons + receipt_reasons if "低位" in item[0] or "下降" in item[0]])
     else:
         if trend_up >= trend_down:
-            dominant_reasons.extend(inv_reasons + receipt_reasons + seasonal_reasons + hog_reasons)
+            dominant_reasons.append(("历史代理:价格趋势上行", trend_up))
         else:
-            dominant_reasons.extend(inv_reasons + receipt_reasons + seasonal_reasons + hog_reasons)
+            dominant_reasons.append(("历史代理:价格趋势下行", trend_down))
 
     dominant_reasons.extend(proxy_reasons)
     dominant_reasons = [item for item in dominant_reasons if item[1] > 0]
@@ -512,8 +739,46 @@ def _build_candidate(
 
     reversal_direction = "long" if reversal_up >= reversal_down else "short"
     trend_direction = "long" if trend_up >= trend_down else "short"
+    trend_evidence_domains = _trend_evidence_domains(
+        direction=trend_direction,
+        trend_score=max(trend_up, trend_down),
+        oi_structure=oi_structure,
+        inventory_score=inv_up if trend_direction == "long" else inv_down,
+        receipt_score=receipt_up if trend_direction == "long" else receipt_down,
+        seasonal_score=seasonal_up if trend_direction == "long" else seasonal_down,
+        hog=hog,
+    )
+    reversal_evidence_domains = _reversal_evidence_domains(
+        direction=reversal_direction,
+        structural_score=structural_down if reversal_direction == "long" else structural_up,
+        oi_structure=oi_structure,
+        hog_reversal=hog_reversal,
+        hog_profit=hog_profit,
+    )
+    score_details = _phase1_score_details(
+        reversal_direction=reversal_direction,
+        trend_direction=trend_direction,
+        reversal_score=reversal_score,
+        trend_score=trend_score,
+        reversal_up=reversal_up,
+        reversal_down=reversal_down,
+        trend_up=trend_up,
+        trend_down=trend_down,
+        low_price=low_price,
+        high_price=high_price,
+        low_persistence=low_persistence,
+        high_persistence=high_persistence,
+        structural_down=structural_down,
+        structural_up=structural_up,
+        hog_reversal=hog_reversal,
+        proxy_scores=proxy_scores,
+        proxy_reasons=proxy_reasons,
+        oi_structure=oi_structure,
+        data_coverage=data_coverage,
+        shrink=shrink,
+    )
 
-    return {
+    candidate = {
         "symbol": info["symbol"],
         "name": info["name"],
         "exchange": info["exchange"],
@@ -527,21 +792,30 @@ def _build_candidate(
         "receipt_change": None if not receipt else receipt.get("receipt_change"),
         "seasonal_signal": None if not seasonal else seasonal.get("seasonal_signal"),
         "hog_profit": hog_profit,
+        "hog_price_trend": None if not hog else hog.get("price_trend"),
+        "oi_vs_price": None if not oi_structure else oi_structure.get("oi_vs_price"),
+        "oi_20d_change": None if not oi_structure else oi_structure.get("oi_20d_change"),
+        "oi_percentile": None if not oi_structure else oi_structure.get("oi_percentile"),
         "reversal_score": reversal_score,
         "trend_score": trend_score,
         "reversal_direction": reversal_direction,
         "trend_direction": trend_direction,
+        "trend_evidence_domains": trend_evidence_domains,
+        "reversal_evidence_domains": reversal_evidence_domains,
         "attention_score": 0.0,
         "labels": labels,
         "state_labels": state_labels,
         "data_coverage": data_coverage,
         "reason_summary": reason_summary,
         "entry_pool_reason": "",
+        "phase1_score_details": score_details,
         "_reversal_up_score": reversal_up,
         "_reversal_down_score": reversal_down,
         "_trend_up_score": trend_up,
         "_trend_down_score": trend_down,
     }
+    candidate.update(_snapshot_fields(fundamental_snapshot))
+    return candidate
 
 
 def build_phase1_candidates(

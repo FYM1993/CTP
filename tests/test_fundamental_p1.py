@@ -320,6 +320,117 @@ def test_save_targets_renders_downgrade_and_extended_target_notes(monkeypatch, t
     assert "新鲜可执行" not in downgraded_section
 
 
+def test_save_targets_describes_strategy_pool_and_playbook_selection(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets([], [], phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "系统采用策略池：各策略独立命中，多个同方向命中代表共振增强" in md_text
+    assert "最终交易只能选择一个交易剧本执行" in md_text
+    assert "系统以趋势跟随为核心策略" not in md_text
+    assert "反转确认优先级高于顺势确认" not in md_text
+
+
+def test_save_targets_renders_strategy_hit_matrix_for_symbol(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    targets = [
+        {
+            "symbol": "CF0",
+            "name": "棉花",
+            "direction": "long",
+            "score": 41.0,
+            "price": 15000.0,
+            "entry": 15020.0,
+            "stop": 14680.0,
+            "tp1": 15600.0,
+            "tp2": 16000.0,
+            "rr": 1.70,
+            "admission_rr": 2.88,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 1,
+            "fund_screen_score": 78.0,
+            "attention_score": 82.0,
+            "signal_strength": 0.75,
+            "labels": ["趋势候选"],
+            "phase1_labels": ["趋势候选"],
+            "phase1_reason_summary": "趋势技术分达标",
+            "reason_summary": "趋势技术分达标",
+            "entry_pool_reason": "趋势机会分达标",
+            "actionable": True,
+            "entry_family": "trend",
+            "entry_signal_type": "TrendBreak",
+            "entry_signal_detail": "趋势突破确认",
+            "market_stage": "clear_trend",
+            "strategy_resonance": "same_direction",
+            "selected_playbook": "trend_continuation",
+            "confluence_quality": "independent",
+            "independent_evidence_count": 4,
+            "independent_evidence_summary": ["技术趋势", "持仓资金", "库存供需", "仓单压力"],
+            "unselected_playbook_reason": "存在明确趋势，基本面同向只作为共振增强，不单独切换到均值回归剧本",
+            "strategy_pool_hits": [
+                {
+                    "strategy_family": "trend_following",
+                    "direction": "long",
+                    "actionable": True,
+                    "score": 41.0,
+                    "evidence_domains": ["technical_trend", "positioning_oi"],
+                },
+                {
+                    "strategy_family": "reversal_fundamental",
+                    "direction": "long",
+                    "actionable": True,
+                    "score": 28.0,
+                    "evidence_domains": ["inventory_supply", "warehouse_receipt"],
+                },
+            ],
+            "trend_status": {
+                "has_signal": True,
+                "signal_type": "TrendBreak",
+                "signal_detail": "趋势突破确认",
+            },
+            "reversal_status": {
+                "has_signal": False,
+                "current_stage": "趋势延续",
+                "confidence": 0.0,
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(targets, [], phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "**策略池命中**: 同方向共振，执行剧本: 趋势延续" in md_text
+    assert "**市场阶段**: 明确趋势" in md_text
+    assert "**共振质量**: 独立共振（4个独立证据）" in md_text
+    assert "**独立证据**: 技术趋势 / 持仓资金 / 库存供需 / 仓单压力" in md_text
+    assert "**未选剧本原因**: 存在明确趋势，基本面同向只作为共振增强，不单独切换到均值回归剧本" in md_text
+    assert "- 趋势跟随: 做多，可执行，评分+41" in md_text
+    assert "- 基本面均值回归: 做多，可执行，评分+28" in md_text
+
+
 def test_save_targets_renders_trend_plan_from_entry_family(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
     monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
@@ -487,6 +598,153 @@ def test_save_targets_uses_trade_story_wording_for_watchlist(monkeypatch, tmp_pa
     assert "今日观望" not in md_text
     assert "待入场条件改善" not in md_text
     assert "无有效入场信号" not in md_text
+
+
+def test_save_targets_renders_confirmed_fundamental_snapshot(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    targets = [
+        {
+            "symbol": "PS0",
+            "name": "多晶硅",
+            "direction": "long",
+            "score": 29.0,
+            "price": 43125.0,
+            "entry": 43125.0,
+            "stop": 40988.0,
+            "tp1": 50175.0,
+            "tp2": 52842.0,
+            "rr": 3.30,
+            "rrf_score": 0.1234,
+            "rank_p1": 1,
+            "rank_p2": 1,
+            "fund_screen_score": 72.0,
+            "attention_score": 70.0,
+            "signal_strength": 0.82,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "高库存后开始去库，仓单回落",
+            "reason_summary": "高库存后开始去库，仓单回落",
+            "entry_pool_reason": "反转机会分达标",
+            "actionable": True,
+            "entry_family": "reversal",
+            "fundamental_coverage_score": 1.0,
+            "fundamental_coverage_status": "complete",
+            "fundamental_domains_present": ["inventory", "warehouse_receipt", "spot_basis"],
+            "fundamental_domains_missing": [],
+            "fundamental_missing_domain_reasons": [],
+            "fundamental_extreme_state_confirmed": True,
+            "fundamental_extreme_state_reasons": ["高库存"],
+            "fundamental_marginal_turn_confirmed": True,
+            "fundamental_marginal_turn_reasons": ["去库启动", "仓单回落"],
+            "fundamental_reversal_confirmed": True,
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "Spring",
+                "signal_date": "2026-04-15",
+                "signal_strength": 0.82,
+                "current_stage": "accumulation",
+                "confidence": 0.8,
+                "signal_detail": "反转确认",
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(targets, [], phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    section = md_text.split("### 多晶硅(主力)", 1)[1].split("**Wyckoff阶段**", 1)[0]
+    assert "**基本面反转**: 已确认" in section
+    assert "- 基本面覆盖: 完整 (100%)" in section
+    assert "- 已有产业证据: 库存 / 仓单 / 现货/基差" in section
+    assert "- 缺失产业证据: 无" in section
+    assert "- 极值状态: 高库存" in section
+    assert "- 边际转向: 去库启动 / 仓单回落" in section
+
+
+def test_save_targets_renders_missing_fundamental_snapshot_as_observation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    watchlist = [
+        {
+            "symbol": "RB0",
+            "name": "螺纹钢",
+            "direction": "long",
+            "score": 24.0,
+            "price": 3200.0,
+            "entry": 3200.0,
+            "stop": 3100.0,
+            "tp1": 3500.0,
+            "tp2": 3650.0,
+            "rr": 3.0,
+            "rrf_score": 0.1000,
+            "rank_p1": 1,
+            "rank_p2": 3,
+            "fund_screen_score": 64.0,
+            "attention_score": 66.0,
+            "signal_strength": 0.65,
+            "labels": ["反转候选"],
+            "phase1_labels": ["反转候选"],
+            "phase1_reason_summary": "库存处于高位，但产业链证据不足",
+            "reason_summary": "库存处于高位，但产业链证据不足",
+            "entry_pool_reason": "反转机会分达标",
+            "actionable": False,
+            "entry_family": "reversal",
+            "downgrade_reason": "基本面数据不足：缺少现货/基差数据/缺少仓单数据，仅保留观察",
+            "oi_vs_price": "减仓下跌",
+            "oi_20d_change": -8.0,
+            "fundamental_coverage_score": 0.33,
+            "fundamental_coverage_status": "partial",
+            "fundamental_domains_present": ["inventory"],
+            "fundamental_domains_missing": ["spot_basis", "warehouse_receipt"],
+            "fundamental_missing_domain_reasons": ["缺少现货/基差数据", "缺少仓单数据"],
+            "fundamental_extreme_state_confirmed": True,
+            "fundamental_extreme_state_reasons": ["高库存"],
+            "fundamental_marginal_turn_confirmed": False,
+            "fundamental_marginal_turn_reasons": [],
+            "fundamental_reversal_confirmed": False,
+            "reversal_status": {
+                "has_signal": True,
+                "signal_type": "SOS",
+                "signal_date": "2026-04-15",
+                "signal_strength": 0.65,
+                "current_stage": "反转确认",
+                "confidence": 0.7,
+                "signal_detail": "市场动作开始改善",
+            },
+        }
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets([], watchlist, phase1_summary=summary)
+
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    section = md_text.split("### 螺纹钢(主力)", 1)[1].split("**Wyckoff阶段**", 1)[0]
+    assert "**基本面反转**: 未确认，仅观察" in section
+    assert "- 基本面覆盖: 不完整 (33%)" in section
+    assert "- 已有产业证据: 库存" in section
+    assert "- 缺失产业证据: 现货/基差 / 仓单" in section
+    assert "- 不建议开仓: 缺少现货/基差数据 / 缺少仓单数据" in section
+    assert "持仓" not in section.split("**基本面数据**", 1)[1]
 
 
 def test_save_targets_cleans_nested_numpy_in_strategy_results(monkeypatch, tmp_path) -> None:

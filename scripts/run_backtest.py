@@ -34,6 +34,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-trades", action="store_true", help="Print detailed trade breakdown for self-debugging")
     parser.add_argument("--debug-phase2", action="store_true", help="Print per-day Phase 2 rejection/actionable details for self-debugging")
     parser.add_argument("--window-index", type=int, help="When used with --rolling debug output, only print the selected validation window")
+    parser.add_argument(
+        "--fundamental-mode",
+        choices=("strict", "proxy"),
+        help="Backtest reversal fundamentals as strict confirmed evidence or allow proxy replay",
+    )
     return parser
 
 
@@ -65,6 +70,7 @@ def _print_rolling_windows(result) -> None:
         "phase2_reject_score_gate_days",
         "phase2_reject_rr_gate_days",
         "phase2_reject_duplicate_signal_days",
+        "phase2_reject_missing_fundamental_days",
         "phase3_signal_eval_bars",
         "phase3_entry_signal_hits",
         "trades_opened",
@@ -72,6 +78,8 @@ def _print_rolling_windows(result) -> None:
         "trades_opened_trend",
         "trades_opened_strategy_reversal",
         "trades_opened_strategy_trend",
+        "backtest_fundamental_blocked_days",
+        "backtest_fundamental_proxy_days",
     )
     for window_result in result.windows:
         prefix = f"wf{window_result.window.index:02d}"
@@ -95,6 +103,12 @@ def _print_trade_debug(*, trades, prefix: str = "") -> None:
         print(f"{label}_entry_signal_type={trade.meta.get('entry_signal_type', '')}")
         print(f"{label}_entry_signal_detail={trade.meta.get('entry_signal_detail', '')}")
         print(f"{label}_phase2_score={trade.meta.get('phase2_score', '')}")
+        print(f"{label}_management_profile={trade.meta.get('management_profile', '')}")
+        print(f"{label}_management_tp1_exit_fraction={trade.meta.get('management_tp1_exit_fraction', '')}")
+        print(
+            f"{label}_management_move_stop_to_entry_after_tp1="
+            f"{trade.meta.get('management_move_stop_to_entry_after_tp1', '')}"
+        )
         print(f"{label}_entry_time={trade.entry_time}")
         print(f"{label}_entry_price={trade.entry_price}")
         print(f"{label}_exit_time={trade.exit_time}")
@@ -142,6 +156,32 @@ def _plan_factory_for_case(case: BacktestCase):
     return make_trade_plan_from_phase2
 
 
+def _resolved_fundamental_mode(config: dict, cli_mode: str | None) -> str:
+    if cli_mode in {"strict", "proxy"}:
+        return cli_mode
+    pre_market_cfg = config.get("pre_market") or {}
+    backtest_cfg = pre_market_cfg.get("backtest") or {}
+    if not isinstance(backtest_cfg, dict):
+        backtest_cfg = {}
+    configured = (
+        pre_market_cfg.get("backtest_fundamental_mode")
+        or pre_market_cfg.get("fundamental_data_mode")
+        or backtest_cfg.get("fundamental_mode")
+        or backtest_cfg.get("fundamental_data_mode")
+    )
+    if str(configured).strip().lower() == "proxy":
+        return "proxy"
+    return "strict"
+
+
+def _config_with_fundamental_mode(config: dict, mode: str) -> dict:
+    out = dict(config)
+    pre_market_cfg = dict(out.get("pre_market") or {})
+    pre_market_cfg["backtest_fundamental_mode"] = mode
+    out["pre_market"] = pre_market_cfg
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -154,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    config = load_config()
+    loaded_config = load_config()
+    config = _config_with_fundamental_mode(
+        loaded_config,
+        _resolved_fundamental_mode(loaded_config, args.fundamental_mode),
+    )
 
     daily_df, minute_df = load_case_frames_with_tqbacktest(case=case, config=config)
     plan_factory = _plan_factory_for_case(case)

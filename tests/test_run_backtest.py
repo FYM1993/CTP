@@ -112,6 +112,9 @@ def test_main_prints_single_case_trade_debug(monkeypatch, capsys):
             "entry_signal_type": "Pullback",
             "entry_signal_detail": "反弹受阻后转弱",
             "phase2_score": -31.0,
+            "management_profile": "strategy_trend",
+            "management_tp1_exit_fraction": 0.5,
+            "management_move_stop_to_entry_after_tp1": True,
         },
     )
 
@@ -145,6 +148,9 @@ def test_main_prints_single_case_trade_debug(monkeypatch, capsys):
     assert "debug_trade_1_trade_id=t-short" in captured
     assert "debug_trade_1_entry_family=trend" in captured
     assert "debug_trade_1_entry_signal_type=Pullback" in captured
+    assert "debug_trade_1_management_profile=strategy_trend" in captured
+    assert "debug_trade_1_management_tp1_exit_fraction=0.5" in captured
+    assert "debug_trade_1_management_move_stop_to_entry_after_tp1=True" in captured
     assert "debug_trade_1_exit_reason=end_of_data" in captured
 
 def test_main_runs_single_case_and_prints_summary(monkeypatch, capsys):
@@ -266,6 +272,80 @@ def test_main_overrides_case_date_range(monkeypatch):
     assert seen["case"].start_dt == date(2025, 1, 1)
     assert seen["case"].end_dt == date(2025, 3, 31)
     assert seen["case"].case_id == "lh0_long_2025-01-01_2025-03-31"
+
+
+def test_main_defaults_to_strict_backtest_fundamental_mode(monkeypatch):
+    case = BacktestCase(
+        case_id="lh0_reversal_long",
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        start_dt=date(2025, 1, 1),
+        end_dt=date(2025, 1, 31),
+        strategy_family="reversal_fundamental",
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(run_backtest, "get_case", lambda case_id: case)
+    monkeypatch.setattr(
+        run_backtest,
+        "load_config",
+        lambda: {"pre_market": {}, "intraday": {}, "tqsdk": {"account": "a", "password": "b"}},
+    )
+    monkeypatch.setattr(
+        run_backtest,
+        "load_case_frames_with_tqbacktest",
+        lambda *, case, config: ("daily-frame", "minute-frame"),
+    )
+
+    def fake_run_case_from_frames(**kwargs):
+        seen["pre_market_cfg"] = kwargs["pre_market_cfg"]
+        return BacktestResult(case_id="lh0_reversal_long", trades=[], summary={"num_trades": 0}, diagnostics={})
+
+    monkeypatch.setattr(run_backtest, "run_case_from_frames", fake_run_case_from_frames)
+    monkeypatch.setattr(run_backtest, "summarize_trades", lambda trades: {"num_trades": len(trades)})
+
+    exit_code = run_backtest.main(["--case", "lh0_reversal_long"])
+
+    assert exit_code == 0
+    assert seen["pre_market_cfg"]["backtest_fundamental_mode"] == "strict"
+
+
+def test_main_allows_proxy_backtest_fundamental_mode(monkeypatch):
+    case = BacktestCase(
+        case_id="lh0_reversal_long",
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        start_dt=date(2025, 1, 1),
+        end_dt=date(2025, 1, 31),
+        strategy_family="reversal_fundamental",
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(run_backtest, "get_case", lambda case_id: case)
+    monkeypatch.setattr(
+        run_backtest,
+        "load_config",
+        lambda: {"pre_market": {"backtest_fundamental_mode": "strict"}, "intraday": {}, "tqsdk": {"account": "a", "password": "b"}},
+    )
+    monkeypatch.setattr(
+        run_backtest,
+        "load_case_frames_with_tqbacktest",
+        lambda *, case, config: ("daily-frame", "minute-frame"),
+    )
+
+    def fake_run_case_from_frames(**kwargs):
+        seen["pre_market_cfg"] = kwargs["pre_market_cfg"]
+        return BacktestResult(case_id="lh0_reversal_long", trades=[], summary={"num_trades": 0}, diagnostics={})
+
+    monkeypatch.setattr(run_backtest, "run_case_from_frames", fake_run_case_from_frames)
+    monkeypatch.setattr(run_backtest, "summarize_trades", lambda trades: {"num_trades": len(trades)})
+
+    exit_code = run_backtest.main(["--case", "lh0_reversal_long", "--fundamental-mode", "proxy"])
+
+    assert exit_code == 0
+    assert seen["pre_market_cfg"]["backtest_fundamental_mode"] == "proxy"
 
 
 def test_main_rejects_invalid_date_range(monkeypatch):

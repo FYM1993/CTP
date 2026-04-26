@@ -9,7 +9,7 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from backtest.cases import BUILTIN_CASES, get_case  # noqa: E402
+from backtest.cases import BUILTIN_CASES, CASE_GROUPS, get_case, get_case_group  # noqa: E402
 
 
 def test_builtin_cases_include_baselines():
@@ -28,6 +28,46 @@ def test_builtin_cases_include_event_replay_cases() -> None:
     assert "ps0_mixed_long_jul2025" in BUILTIN_CASES
     assert "jm0_mixed_long_jul2025" in BUILTIN_CASES
     assert "ao0_mixed_long_jul2024" in BUILTIN_CASES
+
+
+def test_builtin_cases_include_expanded_cached_trend_cases() -> None:
+    expected = {
+        "jm0_trend_long_q1_2025",
+        "jm0_trend_short_q1_2025",
+        "au0_trend_long_mar_may_2025",
+        "ag0_trend_short_aug_oct_2025",
+        "bu0_trend_long_q1_2025",
+        "ss0_trend_short_jan_may_2025",
+        "ap0_trend_long_aug_oct_2025",
+        "sa0_trend_short_mar_apr_2025",
+    }
+
+    assert expected.issubset(BUILTIN_CASES)
+    assert all(BUILTIN_CASES[case_id].strategy_family == "trend_following" for case_id in expected)
+
+
+def test_expanded_trend_cached_group_covers_multiple_sectors() -> None:
+    case_ids = CASE_GROUPS["expanded_trend_cached"]
+    cases = get_case_group("expanded_trend_cached")
+    symbols = {case.symbol for case in cases}
+
+    assert len(case_ids) >= 24
+    assert len(cases) == len(case_ids)
+    assert len(symbols) >= 12
+    assert {"JM0", "AU0", "AG0", "BU0", "SS0", "AP0", "SA0"}.issubset(symbols)
+    assert all(case.strategy_family == "trend_following" for case in cases)
+
+
+def test_long_trend_core_group_uses_multi_year_windows() -> None:
+    cases = get_case_group("long_trend_core")
+    symbols = {case.symbol for case in cases}
+
+    assert len(cases) >= 18
+    assert len(symbols) >= 9
+    assert {"JM0", "AU0", "AG0", "BU0", "FU0", "SC0", "SS0", "AP0", "SA0"}.issubset(symbols)
+    assert all(case.strategy_family == "trend_following" for case in cases)
+    assert all(case.start_dt == date(2022, 1, 1) for case in cases)
+    assert all(case.end_dt == date(2025, 12, 31) for case in cases)
 
 
 def test_builtin_cases_have_contract_values():

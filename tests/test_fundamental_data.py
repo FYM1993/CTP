@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from datetime import date
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -9,7 +10,12 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from market import fundamental_edb_map as edb_map  # noqa: E402
-from market.fundamental_data import get_inventory_fundamental  # noqa: E402
+from market.fundamental_data import (  # noqa: E402
+    FundamentalDataPool,
+    get_inventory_fundamental,
+    get_spot_basis_fundamental,
+)
+from market.fundamental_universe import DOMAIN_SPOT_BASIS  # noqa: E402
 
 
 def test_inventory_falls_back_to_akshare_when_edb_unmapped_or_empty():
@@ -82,6 +88,58 @@ def test_inventory_prefers_edb_when_mapped_and_data_available():
     assert result.data == {"inv_now": 123.0, "source": "edb"}
     assert result.edb_id == 1
     assert calls == [("edb", 1)]
+
+
+def test_spot_basis_fundamental_enters_data_pool_without_source_coupling():
+    calls: list[tuple[str, date | None]] = []
+
+    def fake_spot_basis_fetcher(symbol: str, as_of_date=None):
+        calls.append((symbol, as_of_date))
+        return {
+            "commodity_code": "RB",
+            "spot_price": 3181.33,
+            "dominant_contract_price": 3170.0,
+            "basis": -11.33,
+            "basis_rate": -0.003561,
+            "data_date": "20250401",
+            "source": "akshare_futures_spot_price",
+        }
+
+    as_of = date(2025, 4, 1)
+    record = get_spot_basis_fundamental(
+        "RB0",
+        as_of_date=as_of,
+        spot_basis_fetcher=fake_spot_basis_fetcher,
+    )
+    pool = FundamentalDataPool.from_records("RB0", [record])
+
+    assert calls == [("RB0", as_of)]
+    assert pool.symbol == "RB0"
+    assert pool.group == "black_chain"
+    assert pool.present_domains == (DOMAIN_SPOT_BASIS,)
+    assert pool.values(DOMAIN_SPOT_BASIS) == {
+        "spot_price": 3181.33,
+        "dominant_contract_price": 3170.0,
+        "basis": -11.33,
+        "basis_rate": -0.003561,
+    }
+    assert pool.metadata(DOMAIN_SPOT_BASIS) == {
+        "commodity_code": "RB",
+        "data_date": "20250401",
+        "source": "akshare_futures_spot_price",
+    }
+
+
+def test_missing_spot_basis_stays_missing_in_data_pool():
+    record = get_spot_basis_fundamental(
+        "RB0",
+        spot_basis_fetcher=lambda symbol, as_of_date=None: None,
+    )
+    pool = FundamentalDataPool.from_records("RB0", [record])
+
+    assert pool.present_domains == ()
+    assert DOMAIN_SPOT_BASIS in pool.missing_required_domains
+    assert pool.values(DOMAIN_SPOT_BASIS) == {}
 
 
 def test_edb_registry_only_contains_confirmed_inventory_mappings():

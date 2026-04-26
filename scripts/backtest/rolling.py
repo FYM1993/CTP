@@ -46,6 +46,7 @@ WINDOW_DIAGNOSTIC_KEYS = (
     "phase2_reject_score_gate_days",
     "phase2_reject_rr_gate_days",
     "phase2_reject_duplicate_signal_days",
+    "phase2_reject_missing_fundamental_days",
     "phase3_signal_eval_bars",
     "phase3_entry_signal_hits",
     "trades_opened",
@@ -53,6 +54,8 @@ WINDOW_DIAGNOSTIC_KEYS = (
     "trades_opened_trend",
     "trades_opened_strategy_reversal",
     "trades_opened_strategy_trend",
+    "backtest_fundamental_blocked_days",
+    "backtest_fundamental_proxy_days",
 )
 
 

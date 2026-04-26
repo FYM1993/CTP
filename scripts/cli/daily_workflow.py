@@ -48,18 +48,21 @@ from shared.workflow_wording import (
 )
 
 from data_cache import (
-    get_all_symbols, get_daily, get_minute,
+    get_all_symbols, get_completed_daily as get_daily, get_minute,
     prefetch_all_with_stats, get_request_count,
     format_prefetch_summary,
     get_daily_with_live_bar,
 )
 from phase2.pre_market import (
+    TREND_DIRECTION_SCORE_KEYS,
     analyze_one,
     assess_active_reversal_hold_from_daily_df,
     assess_active_trend_hold_from_daily_df,
     build_trade_plan_from_daily_df,
+    reversal_direction_score_summary,
     resolve_phase2_direction,
     score_signals,
+    trend_direction_score_summary,
 )
 from phase3.intraday import print_dashboard
 from wyckoff import assess_reversal_status
@@ -128,7 +131,7 @@ def phase_0_prefetch() -> dict[str, pd.DataFrame]:
     log.info("▓  Phase 0: 数据预加载")
     log.info("▓" * 60)
 
-    data, stats = prefetch_all_with_stats(symbols)
+    data, stats = prefetch_all_with_stats(symbols, completed_only=True)
     log.info("  ✅ %s", format_prefetch_summary(len(data), stats))
 
     return data
@@ -273,6 +276,78 @@ def _log_phase1_diagnostics(diag: dict[str, object]) -> None:
             )
 
 
+def _phase1_direction_cn(value: object) -> str:
+    direction = str(value or "").strip().lower()
+    if direction == "long":
+        return "做多"
+    if direction == "short":
+        return "做空"
+    return "观察"
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _phase1_story_details(row: dict, family: str) -> dict:
+    details = row.get("phase1_score_details")
+    if isinstance(details, dict):
+        story = details.get(family)
+        if isinstance(story, dict):
+            return story
+    if family == "reversal":
+        return {
+            "direction": row.get("reversal_direction"),
+            "score": row.get("reversal_score"),
+            "drivers": [row.get("reason_summary") or row.get("fund_details") or "暂无拆解"],
+        }
+    return {
+        "direction": row.get("trend_direction"),
+        "score": row.get("trend_score"),
+        "drivers": [row.get("reason_summary") or row.get("fund_details") or "暂无拆解"],
+    }
+
+
+def _format_phase1_story_log(row: dict, family: str, *, prefix: str) -> str:
+    story = _phase1_story_details(row, family)
+    details = row.get("phase1_score_details") if isinstance(row.get("phase1_score_details"), dict) else {}
+    coverage = details.get("coverage") if isinstance(details, dict) else {}
+    if not isinstance(coverage, dict):
+        coverage = {}
+
+    label = "反转故事线" if family == "reversal" else "趋势故事线"
+    up_label = "低位反转" if family == "reversal" else "上行趋势"
+    down_label = "高位反转" if family == "reversal" else "下行趋势"
+    direction = _phase1_direction_cn(story.get("direction"))
+    score = _as_float(story.get("score"), _as_float(row.get(f"{family}_score")))
+    up_score = story.get("up_score")
+    down_score = story.get("down_score")
+
+    pieces = [f"{prefix} {label}: {direction} {score:.0f}分"]
+    if up_score is not None and down_score is not None:
+        pieces.append(
+            f"内部={up_label}{_as_float(up_score):.0f}/{down_label}{_as_float(down_score):.0f}"
+        )
+    if coverage.get("data_coverage") is not None:
+        pieces.append(f"覆盖{_as_float(coverage.get('data_coverage')) * 100:.0f}%")
+    if coverage.get("shrink") is not None:
+        pieces.append(f"折减{_as_float(coverage.get('shrink')):.2f}")
+
+    raw_drivers = story.get("drivers") or []
+    if isinstance(raw_drivers, str):
+        drivers = [raw_drivers]
+    else:
+        drivers = [str(item) for item in raw_drivers if str(item or "").strip()]
+    driver_text = "；".join(drivers[:6]) if drivers else "暂无拆解"
+    pieces.append(f"指标: {driver_text}")
+    return "  ".join(pieces)
+
+
 def phase_1_screen(
     all_data: dict[str, pd.DataFrame],
     threshold: float = 10,
@@ -308,10 +383,14 @@ def phase_1_screen(
                 f"趋势={c.get('trend_score', 0):.0f}  "
                 f"关注={c.get('attention_score', 0):.0f}  "
                 f"标签={label_text}")
+        if c.get("entry_threshold") is not None:
+            line += f"  门槛={_as_float(c.get('entry_threshold')):.0f}"
         fd = c.get("fund_details", "")
         if fd:
             line += f"  [{fd}]"
         log.info(line)
+        log.info(_format_phase1_story_log(c, "reversal", prefix="      ├─"))
+        log.info(_format_phase1_story_log(c, "trend", prefix="      └─"))
 
     if candidates:
         log.info("  👀 关注候选:")
@@ -330,6 +409,110 @@ def build_trend_universe(
         symbols=get_all_symbols(),
         config=config,
     )
+
+
+def _phase1_trend_labeled_candidates(candidates: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for row in candidates:
+        labels = set(row.get("labels") or [])
+        if "趋势候选" in labels or "双标签候选" in labels:
+            rows.append(row)
+    rows.sort(key=lambda item: float(item.get("trend_score") or 0.0), reverse=True)
+    return rows
+
+
+def _phase2_trend_component_text(scores: dict) -> str:
+    components = sorted(
+        (
+            (str(key), _as_float(scores.get(key)))
+            for key in TREND_DIRECTION_SCORE_KEYS
+            if abs(_as_float(scores.get(key))) >= 3.0
+        ),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )
+    return " / ".join(f"{key}{value:+.0f}" for key, value in components[:4]) or "趋势指标无明显贡献"
+
+
+def _log_trend_bridge_diagnostics(
+    *,
+    phase1_candidates: list[dict],
+    trend_candidates: list[dict],
+    all_data: dict[str, pd.DataFrame],
+    config: dict,
+) -> None:
+    phase1_trend_rows = _phase1_trend_labeled_candidates(phase1_candidates)
+    if not phase1_trend_rows:
+        return
+
+    trend_symbols = {str(row.get("symbol") or "") for row in trend_candidates}
+    pre_cfg = config.get("pre_market") or {}
+    min_history = max(int(pre_cfg.get("min_history_bars", 60)), 1)
+    min_trend_score = 60.0
+
+    log.info(
+        "  🔎 趋势线衔接: Phase 1趋势标签%s 个, 盘前趋势技术池%s 个（趋势技术入池线%.0f分）",
+        len(phase1_trend_rows),
+        len(trend_candidates),
+        min_trend_score,
+    )
+
+    for row in phase1_trend_rows[:10]:
+        symbol = str(row.get("symbol") or "")
+        name = str(row.get("name") or symbol)
+        p1_trend = _as_float(row.get("trend_score"))
+        frame = all_data.get(symbol)
+
+        if frame is None or getattr(frame, "empty", False):
+            log.info(
+                "     %s (%s)  Phase1趋势%.0f -> 盘前趋势无数据  未入池: 日线缺失",
+                name,
+                symbol,
+                p1_trend,
+            )
+            continue
+        if len(frame) < min_history:
+            log.info(
+                "     %s (%s)  Phase1趋势%.0f -> 盘前趋势无数据  未入池: 历史长度%s < %s",
+                name,
+                symbol,
+                p1_trend,
+                len(frame),
+                min_history,
+            )
+            continue
+
+        scores = score_signals(frame.reset_index(drop=True), "long", pre_cfg)
+        summary = trend_direction_score_summary(
+            scores,
+            delta=float(pre_cfg.get("direction_delta", 12.0)),
+        )
+        p2_trend = _as_float(summary.get("score"))
+        long_score = _as_float(summary.get("long_score"))
+        short_score = _as_float(summary.get("short_score"))
+        direction = str(summary.get("direction") or "")
+
+        if symbol in trend_symbols:
+            status = "已进入趋势线"
+        elif p2_trend < min_trend_score:
+            status = f"未入池: 盘前趋势分{p2_trend:.0f} < {min_trend_score:.0f}"
+        elif direction == "watch":
+            status = "未入池: 多空分差不足，方向只够观察"
+        else:
+            status = "未入池: 未被趋势技术池返回"
+
+        log.info(
+            "     %s (%s)  Phase1趋势%.0f -> 盘前趋势%.0f（%s；多%.0f/空%.0f）  %s  指标: %s",
+            name,
+            symbol,
+            p1_trend,
+            p2_trend,
+            _phase1_direction_cn(direction),
+            long_score,
+            short_score,
+            status,
+            _phase2_trend_component_text(scores),
+        )
 
 
 # ============================================================
@@ -430,6 +613,397 @@ def _fundamental_conflict_reason(
     return "；".join(reasons)
 
 
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+EVIDENCE_DOMAIN_CN = {
+    "technical_trend": "技术趋势",
+    "positioning_oi": "持仓资金",
+    "inventory_supply": "库存供需",
+    "warehouse_receipt": "仓单压力",
+    "seasonality_profit": "季节利润",
+}
+
+FUNDAMENTAL_DOMAIN_CN = {
+    "inventory": "库存",
+    "warehouse_receipt": "仓单",
+    "spot_basis": "现货/基差",
+    "margin_cost": "成本/利润",
+    "supply": "供给",
+    "demand": "需求",
+    "seasonality": "季节性",
+}
+
+MARKET_STAGE_CN = {
+    "clear_trend": "明确趋势",
+    "fundamental_turn": "基本面拐点",
+    "technical_rebound_only": "技术反弹",
+    "conflict": "方向冲突",
+    "observation": "观察",
+}
+
+CONFLUENCE_QUALITY_CN = {
+    "conflict": "方向冲突",
+    "single_domain": "单域支撑",
+    "supported": "多域支撑",
+    "overlapping": "同类重叠",
+    "independent": "独立共振",
+}
+
+
+def _normalize_evidence_domains(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        return []
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        domains.append(name)
+    return domains
+
+
+def _candidate_evidence_domains(*, cand: dict, strategy_family: str, direction: str) -> list[str]:
+    domains = _normalize_evidence_domains(
+        cand.get("trend_evidence_domains" if strategy_family == STRATEGY_TREND else "reversal_evidence_domains")
+    )
+    if domains:
+        return domains
+
+    oi_vs_price = str(cand.get("oi_vs_price") or "")
+    seasonal_signal = _float_or_none(cand.get("seasonal_signal"))
+    hog_profit = _float_or_none(cand.get("hog_profit"))
+    inv_change = _float_or_none(cand.get("inv_change_4wk"))
+    inv_percentile = _float_or_none(cand.get("inv_percentile"))
+    receipt_change = _float_or_none(cand.get("receipt_change"))
+    fallback: list[str] = []
+
+    if strategy_family == STRATEGY_TREND:
+        fallback.append("technical_trend")
+        if (direction == "long" and oi_vs_price == "增仓上涨") or (direction == "short" and oi_vs_price == "增仓下跌"):
+            fallback.append("positioning_oi")
+        if direction == "long" and (
+            (inv_change is not None and inv_change < 0) or (inv_percentile is not None and inv_percentile <= 30)
+        ):
+            fallback.append("inventory_supply")
+        if direction == "short" and (
+            (inv_change is not None and inv_change > 0) or (inv_percentile is not None and inv_percentile >= 70)
+        ):
+            fallback.append("inventory_supply")
+        if (direction == "long" and receipt_change is not None and receipt_change < 0) or (
+            direction == "short" and receipt_change is not None and receipt_change > 0
+        ):
+            fallback.append("warehouse_receipt")
+        if (direction == "long" and seasonal_signal is not None and seasonal_signal > 0) or (
+            direction == "short" and seasonal_signal is not None and seasonal_signal < 0
+        ):
+            fallback.append("seasonality_profit")
+        return _normalize_evidence_domains(fallback)
+
+    if (direction == "long" and receipt_change is not None and receipt_change < 0) or (
+        direction == "short" and receipt_change is not None and receipt_change > 0
+    ):
+        fallback.append("warehouse_receipt")
+    if (direction == "long" and inv_change is not None and inv_change <= 0) or (
+        direction == "short" and inv_change is not None and inv_change >= 0
+    ) or (
+        direction == "long" and inv_percentile is not None and inv_percentile >= 80
+    ) or (
+        direction == "short" and inv_percentile is not None and inv_percentile <= 20
+    ):
+        fallback.append("inventory_supply")
+    if (direction == "long" and oi_vs_price == "减仓下跌") or (direction == "short" and oi_vs_price == "减仓上涨"):
+        fallback.append("positioning_oi")
+    if hog_profit is not None:
+        fallback.append("seasonality_profit")
+    return _normalize_evidence_domains(fallback)
+
+
+def _candidate_strategy_direction(cand: dict, *, strategy_family: str) -> str:
+    if strategy_family == STRATEGY_REVERSAL:
+        return _normalize_plan_direction(cand.get("reversal_direction"))
+    if strategy_family == STRATEGY_TREND:
+        return _normalize_plan_direction(cand.get("trend_direction"))
+    return ""
+
+
+def _candidate_primary_strategy_family(cand: dict) -> str:
+    family = str(cand.get("strategy_family") or "")
+    if family in {STRATEGY_REVERSAL, STRATEGY_TREND}:
+        return family
+    labels = set(cand.get("labels") or [])
+    if "趋势候选" in labels and "反转候选" not in labels and "双标签候选" not in labels:
+        return STRATEGY_TREND
+    reversal_score = float(cand.get("reversal_score") or 0.0)
+    trend_score = float(cand.get("trend_score") or 0.0)
+    if trend_score > reversal_score:
+        return STRATEGY_TREND
+    return STRATEGY_REVERSAL
+
+
+def _pre_market_cfg_for_symbol(config: dict, symbol: str) -> dict:
+    pre_cfg = dict(config.get("pre_market") or {})
+    position = (config.get("positions") or {}).get(symbol)
+    if not isinstance(position, dict):
+        return pre_cfg
+
+    contract_values = {
+        key: position[key]
+        for key in ("multiplier", "margin_rate", "pricetick", "commission")
+        if position.get(key) is not None
+    }
+    if not contract_values:
+        return pre_cfg
+
+    raw_specs = pre_cfg.get("contract_specs") or {}
+    specs = {str(key): dict(value) for key, value in raw_specs.items() if isinstance(value, dict)}
+    symbol_spec = dict(specs.get(symbol) or {})
+    for key, value in contract_values.items():
+        symbol_spec.setdefault(key, value)
+    specs[symbol] = symbol_spec
+    pre_cfg["contract_specs"] = specs
+    return pre_cfg
+
+
+def _strategy_direction_from_scores(
+    *,
+    scores: dict,
+    strategy_family: str,
+    pre_cfg: dict,
+) -> tuple[str, str, dict[str, float | str]]:
+    delta = float(pre_cfg.get("direction_delta", 12.0))
+    if strategy_family == STRATEGY_TREND:
+        summary = trend_direction_score_summary(scores, delta=delta)
+    else:
+        summary = reversal_direction_score_summary(scores, delta=delta)
+    long_score = float(summary.get("long_score") or 0.0)
+    short_score = float(summary.get("short_score") or 0.0)
+    resolved_direction = resolve_phase2_direction(
+        long_score=long_score,
+        short_score=short_score,
+        delta=delta,
+    )
+    analysis_direction = resolved_direction
+    if analysis_direction == "watch":
+        analysis_direction = "long" if long_score >= short_score else "short"
+    return resolved_direction, analysis_direction, summary
+
+
+def _opposite_direction(direction: str) -> str:
+    if direction == "long":
+        return "short"
+    if direction == "short":
+        return "long"
+    return ""
+
+
+def _resolve_strategy_phase2_direction(
+    *,
+    cand: dict,
+    scores: dict,
+    strategy_family: str,
+    pre_cfg: dict,
+) -> tuple[str, str, dict[str, float | str]]:
+    score_direction, score_analysis_direction, summary = _strategy_direction_from_scores(
+        scores=scores,
+        strategy_family=strategy_family,
+        pre_cfg=pre_cfg,
+    )
+    candidate_direction = _candidate_strategy_direction(cand, strategy_family=strategy_family)
+    if candidate_direction in {"long", "short"}:
+        summary["candidate_direction"] = candidate_direction
+        summary["score_direction"] = score_direction
+        if score_direction in {"long", "short"} and score_direction == _opposite_direction(candidate_direction):
+            summary["candidate_direction_conflict"] = True
+            summary["direction"] = "watch"
+            return "watch", candidate_direction, summary
+        return score_direction, candidate_direction, summary
+    summary["score_direction"] = score_direction
+    return score_direction, score_analysis_direction, summary
+
+
+def _phase2_direction_gate_reason(direction_summary: dict[str, float | str]) -> str:
+    if not bool(direction_summary.get("candidate_direction_conflict")):
+        return ""
+    candidate_direction = str(direction_summary.get("candidate_direction") or "")
+    score_direction = str(direction_summary.get("score_direction") or direction_summary.get("direction") or "")
+    if candidate_direction not in {"long", "short"} or score_direction not in {"long", "short"}:
+        return ""
+    return (
+        f"日线深度方向分数已明显转为{_direction_cn(score_direction)}，"
+        f"上游候选{_direction_cn(candidate_direction)}仅保留观察"
+    )
+
+
+def _apply_phase2_direction_gate(row: dict, direction_summary: dict[str, float | str]) -> dict:
+    row["phase2_direction_long_score"] = float(direction_summary.get("long_score") or 0.0)
+    row["phase2_direction_short_score"] = float(direction_summary.get("short_score") or 0.0)
+    row["phase2_score_direction"] = str(direction_summary.get("score_direction") or direction_summary.get("direction") or "")
+    candidate_direction = str(direction_summary.get("candidate_direction") or "")
+    if candidate_direction:
+        row["phase2_candidate_direction"] = candidate_direction
+    reason = _phase2_direction_gate_reason(direction_summary)
+    if reason:
+        row["actionable"] = False
+        row["phase2_direction_conflict"] = True
+        row["downgrade_reason"] = _append_downgrade_reason(
+            str(row.get("downgrade_reason") or ""),
+            reason,
+        )
+    return row
+
+
+def _fundamental_extreme_state(*, cand: dict, direction: str) -> tuple[bool, list[str]]:
+    inv_change = _float_or_none(cand.get("inv_change_4wk"))
+    inv_percentile = _float_or_none(cand.get("inv_percentile"))
+    receipt_change = _float_or_none(cand.get("receipt_change"))
+    hog_profit = _float_or_none(cand.get("hog_profit"))
+    reasons: list[str] = []
+
+    if direction == "long":
+        if inv_percentile is not None and inv_percentile >= 80:
+            reasons.append("高库存")
+        if inv_change is not None and inv_change > 0:
+            reasons.append("累库")
+        if receipt_change is not None and receipt_change > 0:
+            reasons.append("仓单增加")
+        if hog_profit is not None and hog_profit <= -30:
+            reasons.append("利润深亏")
+    else:
+        if inv_percentile is not None and inv_percentile <= 20:
+            reasons.append("低库存")
+        if inv_change is not None and inv_change < 0:
+            reasons.append("去库")
+        if receipt_change is not None and receipt_change < 0:
+            reasons.append("仓单减少")
+        if hog_profit is not None and hog_profit >= 30:
+            reasons.append("利润高位")
+
+    return bool(reasons), reasons
+
+
+def _fundamental_marginal_turn(*, cand: dict, direction: str) -> tuple[bool, list[str]]:
+    inv_change = _float_or_none(cand.get("inv_change_4wk"))
+    receipt_change = _float_or_none(cand.get("receipt_change"))
+    hog_profit = _float_or_none(cand.get("hog_profit"))
+    hog_profit_change = _float_or_none(cand.get("hog_profit_change"))
+    hog_price_trend = _float_or_none(cand.get("hog_price_trend"))
+    reasons: list[str] = []
+
+    if direction == "long":
+        if inv_change is not None and inv_change <= 0:
+            reasons.append("去库启动")
+        if receipt_change is not None and receipt_change < 0:
+            reasons.append("仓单回落")
+        if hog_profit is not None and hog_profit <= -30 and (
+            (hog_profit_change is not None and hog_profit_change > 0)
+            or (hog_price_trend is not None and hog_price_trend > 0)
+        ):
+            reasons.append("利润压力缓和")
+    else:
+        if inv_change is not None and inv_change >= 0:
+            reasons.append("库存回升")
+        if receipt_change is not None and receipt_change > 0:
+            reasons.append("仓单回升")
+        if hog_profit is not None and hog_profit >= 30 and (
+            (hog_profit_change is not None and hog_profit_change < 0)
+            or (hog_price_trend is not None and hog_price_trend < 0)
+        ):
+            reasons.append("利润高位回落")
+
+    return bool(reasons), reasons
+
+
+def _candidate_has_snapshot_fundamental_gate(cand: dict) -> bool:
+    return any(
+        key in cand
+        for key in (
+            "fundamental_reversal_confirmed",
+            "fundamental_extreme_state_confirmed",
+            "fundamental_marginal_turn_confirmed",
+            "fundamental_coverage_score",
+            "fundamental_domains_missing",
+        )
+    )
+
+
+def _fundamental_reversal_gate(*, cand: dict, result: dict) -> dict[str, object]:
+    direction = _normalize_plan_direction(result.get("direction"))
+    if direction not in {"long", "short"}:
+        return {
+            "extreme_state_confirmed": False,
+            "marginal_turn_confirmed": False,
+            "reversal_confirmed": False,
+            "downgrade_reason": "方向未明确，暂不判断基本面拐点",
+        }
+
+    coverage_score = cand.get("fundamental_coverage_score")
+    coverage_status = cand.get("fundamental_coverage_status")
+    domains_present = list(cand.get("fundamental_domains_present") or [])
+    domains_missing = list(cand.get("fundamental_domains_missing") or [])
+    missing_reasons = list(cand.get("fundamental_missing_domain_reasons") or [])
+
+    if _candidate_has_snapshot_fundamental_gate(cand):
+        extreme_confirmed = bool(cand.get("fundamental_extreme_state_confirmed"))
+        extreme_reasons = list(cand.get("fundamental_extreme_state_reasons") or [])
+        turn_confirmed = bool(cand.get("fundamental_marginal_turn_confirmed"))
+        turn_reasons = list(cand.get("fundamental_marginal_turn_reasons") or [])
+        reversal_confirmed = bool(cand.get("fundamental_reversal_confirmed"))
+    else:
+        extreme_confirmed, extreme_reasons = _fundamental_extreme_state(cand=cand, direction=direction)
+        turn_confirmed, turn_reasons = _fundamental_marginal_turn(cand=cand, direction=direction)
+        reversal_confirmed = extreme_confirmed and turn_confirmed
+
+    if reversal_confirmed:
+        reason = ""
+    elif missing_reasons:
+        reason = (
+            "基本面数据不足："
+            f"{'/'.join(missing_reasons)}，仅保留观察"
+        )
+    elif extreme_confirmed and not turn_confirmed:
+        reason = (
+            "基本面极端仍在但边际未转向："
+            f"{'/'.join(extreme_reasons) or '结构压力未缓解'}，归为逆基本面反弹观察"
+        )
+    elif turn_confirmed and not extreme_confirmed:
+        reason = (
+            "基本面尚未进入极端失衡："
+            f"{'/'.join(turn_reasons) or '仅有边际改善'}，暂不作为均值回归剧本"
+        )
+    else:
+        reason = "未见明确基本面拐点：当前更像技术反弹，暂归为观察"
+
+    return {
+        "extreme_state_confirmed": extreme_confirmed,
+        "extreme_state_reasons": extreme_reasons,
+        "marginal_turn_confirmed": turn_confirmed,
+        "marginal_turn_reasons": turn_reasons,
+        "reversal_confirmed": reversal_confirmed,
+        "coverage_score": coverage_score,
+        "coverage_status": coverage_status,
+        "domains_present": domains_present,
+        "domains_missing": domains_missing,
+        "missing_domain_reasons": missing_reasons,
+        "downgrade_reason": reason,
+    }
+
+
 def _merge_strategy_result(
     *,
     cand: dict,
@@ -457,11 +1031,22 @@ def _merge_strategy_result(
     merged["fund_receipt_change"] = cand.get("receipt_change")
     merged["fund_seasonal"] = cand.get("seasonal_signal")
     merged["fund_hog_profit"] = cand.get("hog_profit")
+    merged["fund_hog_price_trend"] = cand.get("hog_price_trend")
+    merged["fund_hog_profit_change"] = cand.get("hog_profit_change")
+    merged["oi_vs_price"] = cand.get("oi_vs_price")
+    merged["oi_20d_change"] = cand.get("oi_20d_change")
+    merged["oi_percentile"] = cand.get("oi_percentile")
     merged["fund_screen_score"] = cand.get("strategy_score", cand.get("attention_score", cand.get("score", 0)))
     merged["fund_details"] = cand.get("fund_details", "")
     merged["signal_strength"] = merged.get("reversal_status", {}).get("signal_strength", 0.0)
     merged["phase2_decision"] = resolved_direction
     merged["entry_pool_reason"] = cand.get("entry_pool_reason", "")
+    merged["strategy_role"] = "strategy_pool_member"
+    merged["evidence_domains"] = _candidate_evidence_domains(
+        cand=cand,
+        strategy_family=strategy_family,
+        direction=_normalize_plan_direction(merged.get("direction")),
+    )
     conflict_reason = _fundamental_conflict_reason(
         cand=cand,
         result=merged,
@@ -475,6 +1060,30 @@ def _merge_strategy_result(
             str(merged.get("downgrade_reason") or ""),
             conflict_reason,
         )
+    if strategy_family == STRATEGY_REVERSAL:
+        gate = _fundamental_reversal_gate(cand=cand, result=merged)
+        merged["fundamental_extreme_state_confirmed"] = bool(gate["extreme_state_confirmed"])
+        merged["fundamental_extreme_state_reasons"] = list(gate.get("extreme_state_reasons") or [])
+        merged["fundamental_marginal_turn_confirmed"] = bool(gate["marginal_turn_confirmed"])
+        merged["fundamental_marginal_turn_reasons"] = list(gate.get("marginal_turn_reasons") or [])
+        merged["fundamental_reversal_confirmed"] = bool(gate["reversal_confirmed"])
+        if gate.get("coverage_score") is not None:
+            merged["fundamental_coverage_score"] = float(gate.get("coverage_score") or 0.0)
+        if gate.get("coverage_status") is not None:
+            merged["fundamental_coverage_status"] = str(gate.get("coverage_status") or "")
+        merged["fundamental_domains_present"] = list(gate.get("domains_present") or cand.get("fundamental_domains_present") or [])
+        merged["fundamental_domains_missing"] = list(gate.get("domains_missing") or cand.get("fundamental_domains_missing") or [])
+        merged["fundamental_missing_domain_reasons"] = list(
+            gate.get("missing_domain_reasons") or cand.get("fundamental_missing_domain_reasons") or []
+        )
+        reversal_reason = str(gate.get("downgrade_reason") or "")
+        if not merged["fundamental_reversal_confirmed"] and reversal_reason:
+            merged["actionable"] = False
+            merged["strategy_role"] = "counter_fundamental_rebound_watch"
+            merged["downgrade_reason"] = _append_downgrade_reason(
+                str(merged.get("downgrade_reason") or ""),
+                reversal_reason,
+            )
     return merged
 
 
@@ -503,26 +1112,22 @@ def _run_strategy_phase2(
     sort_field: str,
     plan_builder,
 ) -> tuple[list[dict], list[dict]]:
-    pre_cfg = config.get("pre_market", {})
     actionable: list[dict] = []
     watchlist: list[dict] = []
 
     for cand in candidates:
+        pre_cfg = _pre_market_cfg_for_symbol(config, str(cand["symbol"]))
         phase2_df = get_daily(cand["symbol"])
         if phase2_df is None or getattr(phase2_df, "empty", False):
             continue
 
         phase2_scores = score_signals(phase2_df, "long", pre_cfg)
-        long_score = float(sum(v for v in phase2_scores.values() if v > 0))
-        short_score = float(sum(-v for v in phase2_scores.values() if v < 0))
-        resolved_direction = resolve_phase2_direction(
-            long_score=long_score,
-            short_score=short_score,
-            delta=float(pre_cfg.get("direction_delta", 12.0)),
+        resolved_direction, analysis_direction, direction_summary = _resolve_strategy_phase2_direction(
+            cand=cand,
+            scores=phase2_scores,
+            strategy_family=strategy_family,
+            pre_cfg=pre_cfg,
         )
-        analysis_direction = resolved_direction
-        if analysis_direction == "watch":
-            analysis_direction = "long" if long_score >= short_score else "short"
 
         screen_label = "基本面筛选" if strategy_family == STRATEGY_REVERSAL else "趋势筛选"
         screen_score = float(cand.get("strategy_score", cand.get("attention_score", cand.get("score", 0))))
@@ -555,6 +1160,7 @@ def _run_strategy_phase2(
             strategy_family=strategy_family,
             config=config,
         )
+        merged_result = _apply_phase2_direction_gate(merged_result, direction_summary)
         if merged_result["actionable"]:
             actionable.append(merged_result)
         else:
@@ -565,6 +1171,10 @@ def _run_strategy_phase2(
     actionable.sort(key=lambda item: item.get("rrf_score", 0), reverse=True)
     watchlist.sort(key=lambda item: item.get("rrf_score", 0), reverse=True)
     return actionable[:max_picks], watchlist
+
+
+def _is_actionable(row: dict) -> bool:
+    return bool(row.get("actionable", False))
 
 
 def run_reversal_strategy_phase2(candidates: list[dict], config: dict, max_picks: int) -> tuple[list[dict], list[dict]]:
@@ -591,6 +1201,268 @@ def run_trend_strategy_phase2(candidates: list[dict], config: dict, max_picks: i
     )
 
 
+def _strategy_hit(row: dict) -> dict:
+    return {
+        "strategy_family": str(row.get("strategy_family") or ""),
+        "direction": str(row.get("direction") or ""),
+        "actionable": _is_actionable(row),
+        "score": float(row.get("score") or 0.0),
+        "rrf_score": float(row.get("rrf_score") or 0.0),
+        "entry_family": str(row.get("entry_family") or ""),
+        "entry_signal_type": str(row.get("entry_signal_type") or ""),
+        "evidence_domains": _normalize_evidence_domains(row.get("evidence_domains")),
+    }
+
+
+def _row_priority(row: dict) -> tuple[int, float, float]:
+    return (
+        1 if _is_actionable(row) else 0,
+        float(row.get("rrf_score") or 0.0),
+        abs(float(row.get("score") or 0.0)),
+    )
+
+
+def _row_market_stage_priority(row: dict, market_stage: str) -> tuple[int, int, float, float]:
+    family = str(row.get("strategy_family") or "")
+    entry_family = str(row.get("entry_family") or "")
+    family_priority = 0
+    if market_stage == "clear_trend" and (family == STRATEGY_TREND or entry_family == "trend"):
+        family_priority = 1
+    elif market_stage in {"fundamental_turn", "technical_rebound_only"} and (
+        family == STRATEGY_REVERSAL or entry_family == "reversal"
+    ):
+        family_priority = 1
+    actionable, rrf_score, raw_score = _row_priority(row)
+    return (family_priority, actionable, rrf_score, raw_score)
+
+
+def _market_stage(rows: list[dict], hits: list[dict], directions: set[str]) -> str:
+    if len(directions) > 1:
+        return "conflict"
+
+    trend_rows = [
+        row
+        for row in rows
+        if str(row.get("strategy_family") or "") == STRATEGY_TREND or str(row.get("entry_family") or "") == "trend"
+    ]
+    if any(_is_actionable(row) for row in trend_rows):
+        return "clear_trend"
+
+    reversal_rows = [
+        row
+        for row in rows
+        if str(row.get("strategy_family") or "") == STRATEGY_REVERSAL or str(row.get("entry_family") or "") == "reversal"
+    ]
+    if any(
+        bool(row.get("fundamental_reversal_confirmed"))
+        or ("fundamental_reversal_confirmed" not in row and _is_actionable(row))
+        for row in reversal_rows
+    ):
+        return "fundamental_turn"
+    if reversal_rows:
+        return "technical_rebound_only"
+    return "observation"
+
+
+def _representative_row(rows: list[dict], market_stage: str) -> dict:
+    if market_stage == "clear_trend":
+        candidates = [
+            row
+            for row in rows
+            if str(row.get("strategy_family") or "") == STRATEGY_TREND or str(row.get("entry_family") or "") == "trend"
+        ]
+        if candidates:
+            return max(candidates, key=_row_priority)
+    if market_stage == "fundamental_turn":
+        candidates = [row for row in rows if bool(row.get("fundamental_reversal_confirmed"))]
+        if candidates:
+            return max(candidates, key=_row_priority)
+    if market_stage == "technical_rebound_only":
+        candidates = [
+            row
+            for row in rows
+            if str(row.get("strategy_family") or "") == STRATEGY_REVERSAL or str(row.get("entry_family") or "") == "reversal"
+        ]
+        if candidates:
+            return max(candidates, key=_row_priority)
+    return max(rows, key=_row_priority)
+
+
+def _selected_playbook(row: dict, market_stage: str) -> str:
+    if market_stage == "clear_trend":
+        signal_type = str(row.get("entry_signal_type") or "")
+        if signal_type == "Pullback":
+            return "trend_pullback"
+        return "trend_continuation"
+    if market_stage == "fundamental_turn":
+        return "fundamental_mean_reversion"
+    if market_stage == "technical_rebound_only":
+        return "technical_rebound_watch"
+    if market_stage == "conflict":
+        return "conflict_watch"
+    return "observation"
+
+
+def _confluence_quality(*, hits: list[dict], directions: set[str], independent_evidence_count: int) -> str:
+    if len(directions) > 1:
+        return "conflict"
+    if len(hits) <= 1:
+        return "supported" if independent_evidence_count >= 2 else "single_domain"
+    if independent_evidence_count <= 1:
+        return "overlapping"
+    return "independent"
+
+
+def _independent_evidence_summary(hits: list[dict]) -> tuple[list[str], int]:
+    domains: list[str] = []
+    seen: set[str] = set()
+    for hit in hits:
+        for domain in _normalize_evidence_domains(hit.get("evidence_domains")):
+            if domain in seen:
+                continue
+            seen.add(domain)
+            domains.append(domain)
+    summary = [EVIDENCE_DOMAIN_CN.get(domain, domain) for domain in domains]
+    return summary, len(domains)
+
+
+def _unselected_playbook_reason(*, market_stage: str, hits: list[dict]) -> str:
+    has_trend = any(hit["strategy_family"] == STRATEGY_TREND or hit["entry_family"] == "trend" for hit in hits)
+    has_reversal = any(hit["strategy_family"] == STRATEGY_REVERSAL or hit["entry_family"] == "reversal" for hit in hits)
+    confirmed_directions = {
+        hit["direction"]
+        for hit in hits
+        if hit.get("actionable") and hit.get("direction") in {"long", "short"}
+    }
+    if len(confirmed_directions) == 1 and market_stage in {"clear_trend", "fundamental_turn"}:
+        confirmed_direction = next(iter(confirmed_directions))
+        has_opposite_watch = any(
+            not hit.get("actionable")
+            and hit.get("direction") in {"long", "short"}
+            and hit.get("direction") != confirmed_direction
+            for hit in hits
+        )
+        if has_opposite_watch:
+            return "存在未确认的反向观察项，仅作为风险提示，不否决已确认交易剧本"
+
+    if market_stage == "clear_trend" and has_reversal:
+        return "存在明确趋势，基本面同向只作为共振增强，不单独切换到均值回归剧本"
+    if market_stage == "fundamental_turn" and has_trend:
+        return "当前无明确趋势，且基本面已出现边际转向，优先按均值回归剧本执行"
+    if market_stage == "technical_rebound_only":
+        return "未见基本面拐点，当前只按技术反弹观察"
+    if market_stage == "conflict":
+        return "趋势与基本面方向冲突，暂不选择交易剧本"
+    return ""
+
+
+def _market_stage_rank(value: str) -> int:
+    return {
+        "clear_trend": 3,
+        "fundamental_turn": 2,
+        "technical_rebound_only": 1,
+        "observation": 0,
+        "conflict": -1,
+    }.get(value, 0)
+
+
+def _direction_set(rows: list[dict]) -> set[str]:
+    return {
+        str(row.get("direction") or "")
+        for row in rows
+        if str(row.get("direction") or "") in {"long", "short"}
+    }
+
+
+def _merge_strategy_pool_rows(rows: list[dict]) -> dict:
+    confirmed_rows = [row for row in rows if _is_actionable(row)]
+    direction_rows = confirmed_rows if confirmed_rows else rows
+    directions = _direction_set(direction_rows)
+    market_stage = _market_stage(rows, [], directions)
+    ordered_rows = sorted(rows, key=lambda row: _row_market_stage_priority(row, market_stage), reverse=True)
+    hits = [_strategy_hit(row) for row in ordered_rows]
+    confirmed_hits = [hit for hit in hits if bool(hit.get("actionable"))]
+    confluence_hits = confirmed_hits if confirmed_hits else hits
+    market_stage = _market_stage(rows, hits, directions)
+    representative = _representative_row(rows, market_stage)
+    merged = dict(representative)
+    merged["strategy_pool_hits"] = hits
+    merged["strategy_hit_count"] = len(hits)
+    merged["confirmed_strategy_pool_hits"] = confirmed_hits
+    merged["confirmed_strategy_hit_count"] = len(confirmed_hits)
+    merged["market_stage"] = market_stage
+    merged["independent_evidence_summary"], merged["independent_evidence_count"] = _independent_evidence_summary(
+        confluence_hits
+    )
+    merged["confluence_quality"] = _confluence_quality(
+        hits=confluence_hits,
+        directions=directions,
+        independent_evidence_count=int(merged["independent_evidence_count"]),
+    )
+    merged["unselected_playbook_reason"] = _unselected_playbook_reason(market_stage=market_stage, hits=hits)
+
+    if len(directions) > 1:
+        merged["actionable"] = False
+        merged["strategy_resonance"] = "conflict"
+        merged["market_stage"] = "conflict"
+        merged["selected_playbook"] = "conflict_watch"
+        merged["downgrade_reason"] = _append_downgrade_reason(
+            str(merged.get("downgrade_reason") or ""),
+            "策略池方向冲突，需等待趋势和基本面重新同向",
+        )
+        return merged
+
+    resonance_hits = confirmed_hits if confirmed_hits else hits
+    if len(resonance_hits) > 1:
+        merged["strategy_resonance"] = "same_direction"
+    else:
+        merged["strategy_resonance"] = "single_strategy"
+    merged["selected_playbook"] = _selected_playbook(merged, market_stage)
+    if market_stage == "technical_rebound_only":
+        merged["actionable"] = False
+    return merged
+
+
+def _merge_strategy_pool(
+    *,
+    trend_actionable: list[dict],
+    trend_watchlist: list[dict],
+    reversal_actionable: list[dict],
+    reversal_watchlist: list[dict],
+    max_picks: int,
+) -> tuple[list[dict], list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for row in trend_actionable + trend_watchlist + reversal_actionable + reversal_watchlist:
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            continue
+        grouped.setdefault(symbol, []).append(row)
+
+    merged_rows = [_merge_strategy_pool_rows(rows) for rows in grouped.values()]
+    actionable = [row for row in merged_rows if _is_actionable(row)]
+    watchlist = [row for row in merged_rows if not _is_actionable(row)]
+
+    actionable.sort(
+        key=lambda row: (
+            _market_stage_rank(str(row.get("market_stage") or "")),
+            int(row.get("independent_evidence_count") or 0),
+            1 if row.get("confluence_quality") == "independent" else 0,
+            float(row.get("rrf_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    watchlist.sort(
+        key=lambda row: (
+            1 if row.get("strategy_resonance") == "conflict" else 0,
+            _market_stage_rank(str(row.get("market_stage") or "")),
+            int(row.get("independent_evidence_count") or 0),
+            float(row.get("rrf_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    return actionable[:max_picks], watchlist
+
+
 def run_dual_strategy_phase2(
     reversal_candidates: list[dict],
     trend_candidates: list[dict],
@@ -600,15 +1472,12 @@ def run_dual_strategy_phase2(
     reversal_actionable, reversal_watchlist = run_reversal_strategy_phase2(reversal_candidates, config, max_picks)
     trend_actionable, trend_watchlist = run_trend_strategy_phase2(trend_candidates, config, max_picks)
 
-    actionable = sorted(
-        reversal_actionable + trend_actionable,
-        key=lambda item: item.get("rrf_score", 0),
-        reverse=True,
-    )[:max_picks]
-    watchlist = sorted(
-        reversal_watchlist + trend_watchlist,
-        key=lambda item: item.get("rrf_score", 0),
-        reverse=True,
+    actionable, watchlist = _merge_strategy_pool(
+        trend_actionable=trend_actionable,
+        trend_watchlist=trend_watchlist,
+        reversal_actionable=reversal_actionable,
+        reversal_watchlist=reversal_watchlist,
+        max_picks=max_picks,
     )
     grouped = {
         STRATEGY_REVERSAL: {
@@ -637,12 +1506,12 @@ def phase_2_premarket(
     log.info("▓  Phase 2: 盘前深度分析")
     log.info("▓" * 60)
 
-    pre_cfg = config.get("pre_market", {})
     actionable = []
     watchlist = []
 
     for cand in candidates:
         try:
+            pre_cfg = _pre_market_cfg_for_symbol(config, str(cand["symbol"]))
             fund_parts = []
             if "range_pct" in cand:
                 fund_parts.append(f"区间位{cand['range_pct']:.0f}%")
@@ -657,16 +1526,13 @@ def phase_2_premarket(
             fund_reason = ", ".join(fund_parts) if fund_parts else ""
             phase2_df = get_daily(cand["symbol"])
             phase2_scores = score_signals(phase2_df, "long", pre_cfg)
-            long_score = float(sum(v for v in phase2_scores.values() if v > 0))
-            short_score = float(sum(-v for v in phase2_scores.values() if v < 0))
-            resolved_direction = resolve_phase2_direction(
-                long_score=long_score,
-                short_score=short_score,
-                delta=float(pre_cfg.get("direction_delta", 12.0)),
+            strategy_family = _candidate_primary_strategy_family(cand)
+            resolved_direction, analysis_direction, direction_summary = _resolve_strategy_phase2_direction(
+                cand=cand,
+                scores=phase2_scores,
+                strategy_family=strategy_family,
+                pre_cfg=pre_cfg,
             )
-            analysis_direction = resolved_direction
-            if analysis_direction == "watch":
-                analysis_direction = "long" if long_score >= short_score else "short"
 
             merged_cfg = {
                 **pre_cfg,
@@ -704,6 +1570,7 @@ def phase_2_premarket(
                 result["signal_strength"] = result.get("reversal_status", {}).get("signal_strength", 0.0)
                 result["phase2_decision"] = resolved_direction
                 result["entry_pool_reason"] = cand.get("entry_pool_reason", "")
+                result = _apply_phase2_direction_gate(result, direction_summary)
 
                 if result["actionable"]:
                     actionable.append(result)
@@ -925,7 +1792,14 @@ def phase_3_intraday(
                             execution_line = _format_intraday_execution_line(t, df)
                             if execution_line:
                                 log.info(execution_line)
-                        print_dashboard(t["symbol"], t["name"], t["direction"], df, intraday_cfg)
+                        print_dashboard(
+                            t["symbol"],
+                            t["name"],
+                            t["direction"],
+                            df,
+                            intraday_cfg,
+                            entry_family=str(entry_signal["entry_family"] or ""),
+                        )
                     except Exception as e:
                         log.info("\n  %s: ❌ %s", t["name"], e)
 
@@ -1014,22 +1888,27 @@ def phase_3_intraday(
                                 _print_and_log(f"       {live_info}")
 
                             else:
-                                stage = rev.get("current_stage", "")
-                                events = rev.get("all_events", [])
-                                today_str = now.strftime("%Y-%m-%d")
-                                today_events = [e for e in events if e.get("date") == today_str]
+                                entry_family = str(_resolve_entry_signal(current_watch)["entry_family"])
+                                if entry_family == "reversal":
+                                    stage = rev.get("current_stage", "")
+                                    events = rev.get("all_events", [])
+                                    today_str = now.strftime("%Y-%m-%d")
+                                    today_events = [e for e in events if e.get("date") == today_str]
 
-                                if today_events:
-                                    te = today_events[-1]
-                                    te_cn = SIG_CN.get(te["signal"], te["signal"])
-                                    log.info(
-                                        "  👀 %s: 当日出现 %s（预备信号）| %s",
-                                        w["name"],
-                                        te_cn,
-                                        live_info,
-                                    )
+                                    if today_events:
+                                        te = today_events[-1]
+                                        te_cn = SIG_CN.get(te["signal"], te["signal"])
+                                        log.info(
+                                            "  👀 %s: 当日出现 %s（预备信号）| %s",
+                                            w["name"],
+                                            te_cn,
+                                            live_info,
+                                        )
+                                    else:
+                                        waiting_text = stage or _default_waiting_hint(current_watch)
+                                        log.info("  ⏳ %s: %s | %s", w["name"], waiting_text, live_info)
                                 else:
-                                    waiting_text = stage or _default_waiting_hint(current_watch)
+                                    waiting_text = _default_waiting_hint(current_watch)
                                     log.info("  ⏳ %s: %s | %s", w["name"], waiting_text, live_info)
 
                         except Exception as e:
@@ -1242,10 +2121,15 @@ def _format_watchlist_story_status(row: dict) -> str:
             return f"已出现{family_cn}确认（{signal_label}），待执行条件改善"
         return f"已出现{family_cn}确认，待执行条件改善"
 
+    if entry_signal["entry_family"] == "trend":
+        return _default_waiting_hint(row)
+
     reversal = row.get("reversal_status")
     if not isinstance(reversal, dict):
         reversal = {}
-    return str(reversal.get("next_expected") or _default_waiting_hint(row))
+    if entry_signal["entry_family"] == "reversal":
+        return str(reversal.get("next_expected") or _default_waiting_hint(row))
+    return _default_waiting_hint(row)
 
 
 def _resolve_strategy_plan_mode(row: dict) -> str:
@@ -1584,10 +2468,15 @@ def _intraday_watch_confirmation_text(row: dict) -> str:
 
 
 def _merge_intraday_watch_plan(base_row: dict, live_plan: dict | None) -> dict:
-    merged = _normalize_phase2_plan_row(base_row)
+    base = _normalize_phase2_plan_row(base_row)
     if not isinstance(live_plan, dict):
-        return merged
-    merged.update(live_plan)
+        return base
+    live = _normalize_phase2_plan_row(live_plan)
+    merged = dict(base)
+    merged.update(live)
+    for key in ("strategy_family", "entry_family"):
+        if not str(merged.get(key) or "").strip():
+            merged[key] = base.get(key, "")
     return _normalize_phase2_plan_row(merged)
 
 
@@ -1677,6 +2566,63 @@ def save_targets(
         if fd and not any(fd in p for p in fp):
             fp.append(fd)
         return ", ".join(fp) if fp else "-"
+
+    def _fundamental_domain_list(domains) -> str:
+        labels = [
+            FUNDAMENTAL_DOMAIN_CN.get(str(domain), str(domain))
+            for domain in (domains or [])
+        ]
+        return " / ".join(labels) if labels else "无"
+
+    def _has_fundamental_snapshot_fields(t: dict) -> bool:
+        return any(
+            key in t
+            for key in (
+                "fundamental_reversal_confirmed",
+                "fundamental_coverage_score",
+                "fundamental_domains_present",
+                "fundamental_domains_missing",
+                "fundamental_missing_domain_reasons",
+            )
+        )
+
+    def _append_fundamental_snapshot_lines(t: dict) -> bool:
+        if not _has_fundamental_snapshot_fields(t):
+            return False
+
+        confirmed = bool(t.get("fundamental_reversal_confirmed"))
+        coverage = _float_or_none(t.get("fundamental_coverage_score"))
+        status = str(t.get("fundamental_coverage_status") or "")
+        status_cn = {
+            "complete": "完整",
+            "partial": "不完整",
+            "missing": "缺失",
+        }.get(status, "不完整" if coverage is not None and coverage < 1.0 else "完整")
+
+        lines.append(f"**基本面反转**: {'已确认' if confirmed else '未确认，仅观察'}")
+        if coverage is not None:
+            lines.append(f"- 基本面覆盖: {status_cn} ({coverage * 100:.0f}%)")
+        else:
+            lines.append(f"- 基本面覆盖: {status_cn}")
+        lines.append(f"- 已有产业证据: {_md_cell(_fundamental_domain_list(t.get('fundamental_domains_present')))}")
+        lines.append(f"- 缺失产业证据: {_md_cell(_fundamental_domain_list(t.get('fundamental_domains_missing')))}")
+
+        extreme_reasons = list(t.get("fundamental_extreme_state_reasons") or [])
+        turn_reasons = list(t.get("fundamental_marginal_turn_reasons") or [])
+        if extreme_reasons:
+            lines.append(f"- 极值状态: {_md_cell(' / '.join(str(item) for item in extreme_reasons))}")
+        elif not bool(t.get("fundamental_extreme_state_confirmed")):
+            lines.append("- 极值状态: 未确认")
+        if turn_reasons:
+            lines.append(f"- 边际转向: {_md_cell(' / '.join(str(item) for item in turn_reasons))}")
+        elif not bool(t.get("fundamental_marginal_turn_confirmed")):
+            lines.append("- 边际转向: 未确认")
+
+        missing_reasons = list(t.get("fundamental_missing_domain_reasons") or [])
+        if missing_reasons and not confirmed:
+            lines.append(f"- 不建议开仓: {_md_cell(' / '.join(str(item) for item in missing_reasons))}")
+        lines.append("")
+        return True
 
     if targets:
         lines.append("")
@@ -1786,7 +2732,8 @@ def save_targets(
     lines.append("")
     lines.append("### 交易故事确认说明")
     lines.append("")
-    lines.append("系统支持两种交易故事确认模式，反转确认优先级高于顺势确认：")
+    lines.append("系统采用策略池：各策略独立命中，多个同方向命中代表共振增强；反方向命中代表策略冲突。")
+    lines.append("同方向共振只提高关注等级；最终交易只能选择一个交易剧本执行，不能混用不同剧本的入场、止损和止盈。")
     lines.append("")
     lines.append("#### 模式一：Wyckoff 反转确认（抓顶抄底）")
     lines.append("")
@@ -1842,6 +2789,43 @@ def save_targets(
         if phase1_labels:
             lines.append(f"**机会标签（Phase 1）**: {_md_cell('/'.join(phase1_labels))}")
             lines.append("")
+        strategy_hits = t.get("strategy_pool_hits") or []
+        if strategy_hits:
+            resonance_cn = {
+                "same_direction": "同方向共振",
+                "conflict": "方向冲突",
+                "single_strategy": "单策略命中",
+            }.get(str(t.get("strategy_resonance") or ""), "策略池命中")
+            playbook_cn = {
+                "trend_continuation": "趋势延续",
+                "trend_pullback": "趋势回撤",
+                "fundamental_mean_reversion": "基本面均值回归",
+                "technical_rebound_watch": "技术反弹观察",
+                "conflict_watch": "冲突观察",
+                "observation": "观察",
+            }.get(str(t.get("selected_playbook") or ""), "观察")
+            market_stage_cn = MARKET_STAGE_CN.get(str(t.get("market_stage") or ""), "观察")
+            confluence_cn = CONFLUENCE_QUALITY_CN.get(str(t.get("confluence_quality") or ""), "单域支撑")
+            evidence_summary = t.get("independent_evidence_summary") or []
+            evidence_count = int(t.get("independent_evidence_count") or 0)
+            unselected_reason = str(t.get("unselected_playbook_reason") or "")
+            lines.append(f"**策略池命中**: {resonance_cn}，执行剧本: {playbook_cn}")
+            lines.append(f"**市场阶段**: {market_stage_cn}")
+            lines.append(f"**共振质量**: {confluence_cn}（{evidence_count}个独立证据）")
+            if evidence_summary:
+                lines.append(f"**独立证据**: {_md_cell(' / '.join(str(item) for item in evidence_summary))}")
+            if unselected_reason:
+                lines.append(f"**未选剧本原因**: {_md_cell(unselected_reason)}")
+            for hit in strategy_hits:
+                family_cn = {
+                    STRATEGY_TREND: "趋势跟随",
+                    STRATEGY_REVERSAL: "基本面均值回归",
+                }.get(str(hit.get("strategy_family") or ""), "其他策略")
+                hit_dir = _direction_cn(str(hit.get("direction") or ""))
+                hit_state = "可执行" if bool(hit.get("actionable")) else "观察"
+                hit_score = float(hit.get("score") or 0.0)
+                lines.append(f"- {family_cn}: {hit_dir}，{hit_state}，评分{hit_score:+.0f}")
+            lines.append("")
 
         # --- 交易故事确认状态 ---
         rev = t.get("reversal_status", {})
@@ -1884,7 +2868,7 @@ def save_targets(
                     lines.append(f"- 止损依据: 趋势反弹失效位 + 0.5×ATR")
             else:
                 signal_date = rev.get("signal_date", "")
-                actionable_now = bool(t.get("actionable", True))
+                actionable_now = _is_actionable(t)
                 if signal_date:
                     if actionable_now:
                         lines.append(f"- 入场依据: 当前价（确认于{signal_date}触发，新鲜可执行）")
@@ -1941,7 +2925,7 @@ def save_targets(
             lines.append(f"- Phase 1 关注分: {t.get('attention_score', fs):+.0f}")
         ss = t.get("signal_strength", 0)
         lines.append(f"- 信号强度: {ss:.2f}")
-        if not t.get("actionable", True):
+        if not _is_actionable(t):
             entry_signal_now = _resolve_entry_signal(t)
             reasons = []
             downgrade_reason = str(t.get("downgrade_reason") or "")
@@ -1967,6 +2951,8 @@ def save_targets(
         lines.append("**基本面数据**")
         lines.append("")
         has_any = False
+        if _append_fundamental_snapshot_lines(t):
+            has_any = True
         if t.get("fund_range_pct") is not None:
             lines.append(f"- 价格区间位: {t['fund_range_pct']:.0f}%（年度高低点间的位置）")
             has_any = True
@@ -2140,6 +3126,7 @@ def main():
                 "attention_score": abs(score),
                 "reversal_score": 0.0,
                 "trend_score": abs(score),
+                "trend_direction": pos["direction"],
                 "labels": ["趋势候选"],
                 "state_labels": [],
                 "data_coverage": 1.0,
@@ -2155,6 +3142,12 @@ def main():
     else:
         reversal_candidates = phase_1_screen(all_data, threshold=args.threshold)
         trend_candidates = build_trend_universe(all_data, config)
+        _log_trend_bridge_diagnostics(
+            phase1_candidates=reversal_candidates,
+            trend_candidates=trend_candidates,
+            all_data=all_data,
+            config=config,
+        )
 
     if not reversal_candidates and not trend_candidates:
         log.info("\n  😴 今日无可跟踪品种")

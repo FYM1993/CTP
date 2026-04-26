@@ -155,6 +155,52 @@ def _is_trading_session_active(now: datetime | None = None) -> bool:
     return is_day_session or is_night_session
 
 
+def _truthy_bar_marker(value: object) -> bool | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "final", "complete", "completed", "closed"}:
+        return True
+    if text in {"0", "false", "no", "n", "live", "open", "incomplete", "unfinished"}:
+        return False
+    return None
+
+
+def _latest_bar_complete_marker(df: pd.DataFrame) -> bool | None:
+    marker_columns = (
+        "bar_complete",
+        "is_complete",
+        "is_completed",
+        "is_final",
+        "final",
+        "completed",
+    )
+    for column in marker_columns:
+        if column not in df.columns:
+            continue
+        marker = _truthy_bar_marker(df[column].iloc[-1])
+        if marker is not None:
+            return marker
+    return None
+
+
+def _is_daily_bar_complete(latest_date: date, now: datetime) -> bool:
+    if latest_date < now.date():
+        return True
+    if latest_date > now.date():
+        return False
+    if now.weekday() > 4:
+        return False
+    if _is_trading_session_active(now):
+        return False
+    close_time = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
+    return _minutes_since_midnight(now) >= close_time
+
+
 def _throttle():
     global _request_count, _last_request_time
     now = time.time()
@@ -183,6 +229,32 @@ def _latest_bar_is_today(df: pd.DataFrame) -> bool:
         return False
     latest = pd.Timestamp(df["date"].iloc[-1]).strftime("%Y%m%d")
     return latest == datetime.now().strftime("%Y%m%d")
+
+
+def completed_daily_frame(df: pd.DataFrame | None, *, now: datetime | None = None) -> pd.DataFrame:
+    """Return daily bars safe for daily-strategy planning.
+
+    During an active trading session the last daily bar can be an unfinished
+    live bar. Daily strategy planning should not consume that bar; Phase 3
+    live re-evaluation uses explicit live-bar helpers instead.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if len(df) == 0 or "date" not in df.columns:
+        return df.copy()
+    if now is None:
+        now = datetime.now()
+
+    out = df.copy()
+    dates = pd.to_datetime(out["date"], errors="coerce")
+    if dates.isna().all():
+        return out
+    latest_date = dates.iloc[-1].date()
+    complete_marker = _latest_bar_complete_marker(out)
+    bar_complete = complete_marker if complete_marker is not None else _is_daily_bar_complete(latest_date, now)
+    if not bar_complete:
+        return out.iloc[:-1].copy().reset_index(drop=True)
+    return out.reset_index(drop=True)
 
 
 def _choose_cache_suffix(df: pd.DataFrame) -> str:
@@ -326,6 +398,17 @@ def get_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
             pass
         return df.tail(days)
     return None
+
+
+def get_completed_daily(symbol: str, days: int = 400) -> pd.DataFrame | None:
+    """Get daily bars for daily-strategy planning, excluding in-session live bars."""
+    df = get_daily(symbol, days=days)
+    if df is None:
+        return None
+    completed = completed_daily_frame(df)
+    if completed.empty:
+        return completed
+    return completed.tail(days).reset_index(drop=True)
 
 
 def _fetch_daily_from_api(symbol: str, days: int, retries: int = 3) -> pd.DataFrame | None:
@@ -518,8 +601,196 @@ GFEX_RECEIPT_MAP = {
     "LC0": "LC", "SI0": "SI", "PS0": "PS",
 }
 
+DCE_RECEIPT_MAP = {
+    "V0": "聚氯乙烯",
+    "P0": "棕榈油",
+    "B0": "豆二",
+    "M0": "豆粕",
+    "I0": "铁矿石",
+    "JD0": "鸡蛋",
+    "L0": "聚乙烯",
+    "PP0": "聚丙烯",
+    "Y0": "豆油",
+    "C0": "玉米",
+    "A0": "豆一",
+    "J0": "焦炭",
+    "JM0": "焦煤",
+    "CS0": "玉米淀粉",
+    "EG0": "乙二醇",
+    "EB0": "苯乙烯",
+    "PG0": "液化石油气",
+    "LH0": "生猪",
+    "FB0": "纤维板",
+}
+
+CZCE_RECEIPT_MAP = {
+    "TA0": "PTA",
+    "OI0": "OI",
+    "RM0": "RM",
+    "SR0": "SR",
+    "CF0": "CF",
+    "MA0": "MA",
+    "FG0": "FG",
+    "SF0": "SF",
+    "SM0": "SM",
+    "AP0": "AP",
+    "CJ0": "CJ",
+    "UR0": "UR",
+    "SA0": "SA",
+    "PK0": "PK",
+    "CY0": "CY",
+    "SH0": "SH",
+    "PX0": "PX",
+}
+
 _shfe_receipt_cache: dict | None = None
 _gfex_receipt_cache: dict | None = None
+_dce_receipt_cache: dict | None = None
+_czce_receipt_cache: dict | None = None
+
+
+def _spot_basis_commodity_code(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if text.endswith("0"):
+        return text[:-1]
+    while text and text[-1].isdigit():
+        text = text[:-1]
+    return text
+
+
+def _spot_basis_value(row: pd.Series, *names: str) -> float | None:
+    for name in names:
+        if name not in row:
+            continue
+        value = pd.to_numeric(pd.Series([row[name]]), errors="coerce").iloc[0]
+        if pd.isna(value):
+            continue
+        return float(value)
+    return None
+
+
+def _spot_basis_text(row: pd.Series, *names: str) -> str:
+    for name in names:
+        if name not in row:
+            continue
+        value = row[name]
+        if value is None or pd.isna(value):
+            continue
+        return str(value)
+    return ""
+
+
+def _receipt_frame_for_key(receipts: dict, key: str) -> pd.DataFrame | None:
+    df = receipts.get(key)
+    if df is not None:
+        return df
+    key_upper = str(key).strip().upper()
+    for raw_key, candidate in receipts.items():
+        if str(raw_key).strip().upper() == key_upper:
+            return candidate
+    return None
+
+
+def _receipt_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    columns = {str(col).strip(): col for col in frame.columns}
+    for name in names:
+        if name in columns:
+            return columns[name]
+    return None
+
+
+def _receipt_quantity_columns(frame: pd.DataFrame) -> list:
+    exact = _receipt_column(frame, ("今日仓单量", "仓单量", "仓单数量", "当日仓单量", "WRTWGHTS"))
+    if exact is not None:
+        return [exact]
+    return [
+        col
+        for col in frame.columns
+        if "仓单数量" in str(col)
+    ]
+
+
+def _receipt_totals_from_frame(df: pd.DataFrame | None) -> tuple[float, float] | None:
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return None
+    frame = df.copy()
+    total_cols = _receipt_quantity_columns(frame)
+    change_col = _receipt_column(frame, ("增减", "仓单增减", "当日增减", "WRTCHANGE"))
+    if not total_cols or change_col is None:
+        return None
+
+    text_frame = frame.astype(str)
+    total_mask = text_frame.apply(
+        lambda col: col.str.contains("总计", na=False)
+    ).any(axis=1)
+    subtotal_mask = text_frame.apply(
+        lambda col: col.str.contains("小计|合计", na=False)
+    ).any(axis=1)
+    if bool(total_mask.any()):
+        target = frame.loc[total_mask].copy()
+    elif bool(subtotal_mask.any()):
+        target = frame.loc[subtotal_mask].copy()
+    else:
+        target = frame
+
+    total = 0.0
+    for total_col in total_cols:
+        total += pd.to_numeric(target[total_col], errors="coerce").sum()
+    change = pd.to_numeric(target[change_col], errors="coerce").sum()
+    if pd.isna(total) or pd.isna(change):
+        return None
+    return float(total), float(change)
+
+
+def get_spot_basis(symbol: str, as_of_date: date | datetime | pd.Timestamp | None = None) -> dict | None:
+    """
+    获取通用现货/基差数据。
+
+    返回:
+      commodity_code: 商品代码，如 RB0 -> RB
+      spot_price: 现货价格
+      dominant_contract_price: 主力合约价格
+      basis: 主力基差
+      basis_rate: 主力基差率
+      data_date: 数据日期
+      source: 数据来源标识
+    """
+    commodity_code = _spot_basis_commodity_code(symbol)
+    if not commodity_code:
+        return None
+    anchor_date = _anchor_date(as_of_date)
+    date_str = anchor_date.strftime("%Y%m%d")
+    try:
+        df = aks.futures_spot_price(date=date_str, vars_list=[commodity_code])
+        if df is None or isinstance(df, bool) or getattr(df, "empty", False):
+            return None
+        frame = df.copy()
+        code_column = next((col for col in ("var", "symbol", "商品代码") if col in frame.columns), None)
+        if code_column is None:
+            return None
+        code_series = frame[code_column].astype(str).str.upper()
+        matched = frame.loc[code_series == commodity_code.upper()]
+        if matched.empty:
+            return None
+        row = matched.iloc[-1]
+        spot_price = _spot_basis_value(row, "sp", "spot_price", "现货价格")
+        dominant_price = _spot_basis_value(row, "dom_price", "dominant_contract_price", "主力合约价格")
+        basis = _spot_basis_value(row, "dom_basis", "basis", "主力基差")
+        basis_rate = _spot_basis_value(row, "dom_basis_rate", "basis_rate", "主力基差率")
+        if spot_price is None or dominant_price is None or basis is None or basis_rate is None:
+            return None
+        data_date = _spot_basis_text(row, "date", "日期") or date_str
+        return {
+            "commodity_code": commodity_code,
+            "spot_price": spot_price,
+            "dominant_contract_price": dominant_price,
+            "basis": basis,
+            "basis_rate": basis_rate,
+            "data_date": data_date,
+            "source": "akshare_futures_spot_price",
+        }
+    except Exception:
+        return None
 
 
 def get_warehouse_receipt(symbol: str, as_of_date: date | datetime | pd.Timestamp | None = None) -> dict | None:
@@ -531,12 +802,17 @@ def get_warehouse_receipt(symbol: str, as_of_date: date | datetime | pd.Timestam
       receipt_change: 仓单增减
       exchange: 交易所来源
     """
-    global _shfe_receipt_cache, _gfex_receipt_cache
+    global _shfe_receipt_cache, _gfex_receipt_cache, _dce_receipt_cache, _czce_receipt_cache
+    symbol = str(symbol or "").strip().upper()
     anchor_date = _anchor_date(as_of_date)
     if _shfe_receipt_cache is None or not isinstance(_shfe_receipt_cache, dict):
         _shfe_receipt_cache = {}
     if _gfex_receipt_cache is None or not isinstance(_gfex_receipt_cache, dict):
         _gfex_receipt_cache = {}
+    if _dce_receipt_cache is None or not isinstance(_dce_receipt_cache, dict):
+        _dce_receipt_cache = {}
+    if _czce_receipt_cache is None or not isinstance(_czce_receipt_cache, dict):
+        _czce_receipt_cache = {}
 
     # SHFE
     shfe_name = SHFE_RECEIPT_MAP.get(symbol)
@@ -581,6 +857,48 @@ def get_warehouse_receipt(symbol: str, as_of_date: date | datetime | pd.Timestam
                         "exchange": "GFEX"}
             except Exception:
                 continue
+
+    # DCE
+    dce_key = DCE_RECEIPT_MAP.get(symbol)
+    if dce_key:
+        for _offset in range(10):
+            date_str = (anchor_date - timedelta(days=_offset)).strftime("%Y%m%d")
+            if date_str not in _dce_receipt_cache:
+                try:
+                    _dce_receipt_cache[date_str] = aks.futures_dce_warehouse_receipt(date=date_str) or {}
+                except Exception:
+                    _dce_receipt_cache[date_str] = {}
+            df = _receipt_frame_for_key(_dce_receipt_cache.get(date_str) or {}, dce_key)
+            totals = _receipt_totals_from_frame(df)
+            if totals is None:
+                continue
+            total, change = totals
+            return {
+                "receipt_total": total,
+                "receipt_change": change,
+                "exchange": "DCE",
+            }
+
+    # CZCE
+    czce_key = CZCE_RECEIPT_MAP.get(symbol)
+    if czce_key:
+        for _offset in range(10):
+            date_str = (anchor_date - timedelta(days=_offset)).strftime("%Y%m%d")
+            if date_str not in _czce_receipt_cache:
+                try:
+                    _czce_receipt_cache[date_str] = aks.futures_czce_warehouse_receipt(date=date_str) or {}
+                except Exception:
+                    _czce_receipt_cache[date_str] = {}
+            df = _receipt_frame_for_key(_czce_receipt_cache.get(date_str) or {}, czce_key)
+            totals = _receipt_totals_from_frame(df)
+            if totals is None:
+                continue
+            total, change = totals
+            return {
+                "receipt_total": total,
+                "receipt_change": change,
+                "exchange": "CZCE",
+            }
 
     return None
 
@@ -936,7 +1254,11 @@ def get_all_symbols() -> list[dict]:
     return [s for s in BUILTIN_SYMBOLS if s["symbol"] not in EXCLUDE]
 
 
-def prefetch_all_with_stats(symbols: list[dict] | None = None) -> tuple[dict[str, pd.DataFrame], PrefetchStats]:
+def prefetch_all_with_stats(
+    symbols: list[dict] | None = None,
+    *,
+    completed_only: bool = False,
+) -> tuple[dict[str, pd.DataFrame], PrefetchStats]:
     """
     批量预加载所有品种日线数据。
 
@@ -978,7 +1300,7 @@ def prefetch_all_with_stats(symbols: list[dict] | None = None) -> tuple[dict[str
                         cached_df = None
 
             if cached_df is not None:
-                data[sym] = cached_df
+                data[sym] = completed_daily_frame(cached_df) if completed_only else cached_df
                 stats.cache_hits += 1
                 _update_prefetch_freshness(stats, cached_df)
                 continue
@@ -1021,7 +1343,7 @@ def prefetch_all_with_stats(symbols: list[dict] | None = None) -> tuple[dict[str
                     df.to_parquet(save_path, index=False)
                 except Exception:
                     pass
-                data[sym] = df
+                data[sym] = completed_daily_frame(df) if completed_only else df
             else:
                 stats.missing += 1
     finally:

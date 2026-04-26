@@ -115,7 +115,8 @@ def format_holding_status_text(result: dict) -> str:
     reason = str(result.get("reason") or "")
 
     if action == "继续持有" and management_action == "上移止损":
-        return f"保护止损已抬高到{stop_text}，第一止盈继续看{tp1_text}"
+        prefix = reason.split("，保护止损", 1)[0].strip() or "原有交易故事仍成立"
+        return f"{prefix}，保护止损已抬高到{stop_text}，第一止盈继续看{tp1_text}"
     if action == "继续持有":
         return f"原有交易故事仍成立，继续按原计划持有，第一止盈继续看{tp1_text}"
     if action == "减仓观察":

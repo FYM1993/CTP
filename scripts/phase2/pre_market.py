@@ -13,6 +13,7 @@
     PYTHONPATH=scripts python -m phase2.pre_market
 """
 
+import math
 from pathlib import Path
 from datetime import datetime
 
@@ -22,7 +23,7 @@ import pandas as pd
 from shared.ctp_log import get_log_path, get_logger
 from shared.config_loader import load_yaml_config
 from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
-from data_cache import get_daily
+from data_cache import get_completed_daily as get_daily
 from phase2.direction import choose_phase2_direction as _choose_phase2_direction
 
 log = get_logger("pre_market")
@@ -336,6 +337,46 @@ def score_signals(df: pd.DataFrame, direction: str, cfg: dict) -> dict:
     return scores
 
 
+TREND_DIRECTION_SCORE_KEYS = (
+    "均线排列",
+    "MACD",
+    "动量",
+    "量价关系",
+    "VSA信号",
+    "持仓信号",
+)
+
+REVERSAL_DIRECTION_SCORE_KEYS = (
+    "RSI",
+    "布林带",
+    "价格位置",
+    "Wyckoff阶段",
+    "VSA信号",
+    "持仓信号",
+)
+
+
+def direction_score_summary(scores: dict, *, keys: tuple[str, ...], delta: float = 12.0) -> dict[str, float | str]:
+    keyed_scores = [float(scores.get(key, 0.0) or 0.0) for key in keys]
+    long_score = float(sum(value for value in keyed_scores if value > 0))
+    short_score = float(sum(-value for value in keyed_scores if value < 0))
+    direction = resolve_phase2_direction(long_score=long_score, short_score=short_score, delta=delta)
+    return {
+        "long_score": long_score,
+        "short_score": short_score,
+        "score": max(long_score, short_score),
+        "direction": direction,
+    }
+
+
+def trend_direction_score_summary(scores: dict, *, delta: float = 12.0) -> dict[str, float | str]:
+    return direction_score_summary(scores, keys=TREND_DIRECTION_SCORE_KEYS, delta=delta)
+
+
+def reversal_direction_score_summary(scores: dict, *, delta: float = 12.0) -> dict[str, float | str]:
+    return direction_score_summary(scores, keys=REVERSAL_DIRECTION_SCORE_KEYS, delta=delta)
+
+
 def resolve_phase2_direction(*, long_score: float, short_score: float, delta: float = 12.0) -> str:
     """Thin seam for future phase 2 direction selection."""
     return _choose_phase2_direction(long_score=long_score, short_score=short_score, delta=delta)
@@ -387,19 +428,104 @@ def _stop_risk_pct(direction: str, *, entry: float, stop: float) -> float:
     return max(float(risk), 0.0) / entry
 
 
-def _risk_gate_details(direction: str, *, entry: float, stop: float, cfg: dict) -> dict[str, float | bool | str]:
+def _contract_spec_for_symbol(symbol: str, cfg: dict) -> dict:
+    specs = cfg.get("contract_specs") or {}
+    spec = specs.get(symbol) if isinstance(specs, dict) else None
+    return spec if isinstance(spec, dict) else {}
+
+
+def _risk_budget_from_config(cfg: dict) -> float:
+    explicit_budget = cfg.get("risk_per_trade_cny")
+    if explicit_budget is not None:
+        try:
+            return max(float(explicit_budget), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        equity = float(cfg.get("account_equity") or 0.0)
+        risk_pct = float(cfg.get("risk_per_trade_pct") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(equity * risk_pct, 0.0)
+
+
+def _positive_int_floor(value: float) -> int:
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return max(int(math.floor(value)), 0)
+
+
+def _risk_gate_details(
+    direction: str,
+    *,
+    symbol: str,
+    entry: float,
+    stop: float,
+    cfg: dict,
+) -> dict[str, float | int | bool | str]:
     risk_pct = _stop_risk_pct(direction, entry=entry, stop=stop)
     max_loss_pct = float(cfg.get("max_loss_pct") or 0.0)
     passed = True
-    reason = ""
+    reasons: list[str] = []
     if max_loss_pct > 0 and risk_pct > max_loss_pct:
         passed = False
-        reason = f"止损距离{risk_pct:.1%}超过单笔风险上限{max_loss_pct:.1%}"
+        reasons.append(f"止损距离{risk_pct:.1%}超过单笔风险上限{max_loss_pct:.1%}")
+
+    spec = _contract_spec_for_symbol(symbol, cfg)
+    multiplier = float(spec.get("multiplier") or cfg.get("contract_multiplier") or 1.0)
+    margin_rate = float(spec.get("margin_rate") or cfg.get("margin_rate") or 0.0)
+    stop_distance = max(abs(float(entry) - float(stop)), 0.0)
+    risk_per_lot = stop_distance * max(multiplier, 0.0)
+    risk_budget = _risk_budget_from_config(cfg)
+
+    max_lots_by_risk = 0
+    if risk_budget > 0 and risk_per_lot > 0:
+        max_lots_by_risk = _positive_int_floor(risk_budget / risk_per_lot)
+        if max_lots_by_risk < 1:
+            passed = False
+            reasons.append(f"每手亏损{risk_per_lot:.0f}超过单笔风险预算{risk_budget:.0f}")
+
+    margin_per_lot = float(entry) * max(multiplier, 0.0) * max(margin_rate, 0.0)
+    account_equity = float(cfg.get("account_equity") or 0.0)
+    max_lots_by_margin = 0
+    max_margin_pct = float(cfg.get("max_margin_pct") or 0.0)
+    if account_equity > 0 and max_margin_pct > 0 and margin_per_lot > 0:
+        max_margin = account_equity * max_margin_pct
+        max_lots_by_margin = _positive_int_floor(max_margin / margin_per_lot)
+        if max_lots_by_margin < 1:
+            passed = False
+            reasons.append(f"单笔保证金需求{margin_per_lot:.0f}超过保证金上限{max_margin:.0f}")
+
+    max_lots_by_portfolio = 0
+    portfolio_max_margin_pct = float(cfg.get("portfolio_max_margin_pct") or 0.0)
+    portfolio_margin_used = float(cfg.get("portfolio_margin_used_cny") or 0.0)
+    if account_equity > 0 and portfolio_max_margin_pct > 0 and margin_per_lot > 0:
+        remaining_margin = account_equity * portfolio_max_margin_pct - portfolio_margin_used
+        max_lots_by_portfolio = _positive_int_floor(remaining_margin / margin_per_lot)
+        if max_lots_by_portfolio < 1:
+            passed = False
+            reasons.append("组合保证金剩余额度不足")
+
+    lot_caps = [
+        value
+        for value in (max_lots_by_risk, max_lots_by_margin, max_lots_by_portfolio)
+        if value > 0
+    ]
+    suggested_lots = min(lot_caps) if lot_caps else 0
     return {
         "risk_pct": float(risk_pct),
         "max_loss_pct": float(max_loss_pct),
+        "contract_multiplier": float(multiplier),
+        "margin_rate": float(margin_rate),
+        "risk_per_lot": float(risk_per_lot),
+        "risk_budget": float(risk_budget),
+        "margin_per_lot": float(margin_per_lot),
+        "max_lots_by_risk": int(max_lots_by_risk),
+        "max_lots_by_margin": int(max_lots_by_margin),
+        "max_lots_by_portfolio": int(max_lots_by_portfolio),
+        "suggested_lots": int(suggested_lots),
         "phase2_risk_gate_passed": bool(passed),
-        "risk_gate_reason": reason,
+        "risk_gate_reason": "；".join(reasons),
     }
 
 
@@ -502,6 +628,7 @@ def _trend_hold_gate(direction: str, total: float, trend_status: dict) -> bool:
 
 def _build_reversal_candidate_plan(
     *,
+    symbol: str,
     direction: str,
     last: float,
     atr: float,
@@ -558,7 +685,7 @@ def _build_reversal_candidate_plan(
 
     rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
     admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
-    risk_gate = _risk_gate_details(direction, entry=entry, stop=stop, cfg=cfg)
+    risk_gate = _risk_gate_details(direction, symbol=symbol, entry=entry, stop=stop, cfg=cfg)
 
     extended_target = rr < 1.0 and admission_rr >= 1.0
     weak_reversal = float(gate_details["signal_strength"]) <= 0.65
@@ -588,6 +715,15 @@ def _build_reversal_candidate_plan(
         "phase2_risk_gate_passed": risk_ok,
         "risk_pct": float(risk_gate["risk_pct"]),
         "max_loss_pct": float(risk_gate["max_loss_pct"]),
+        "contract_multiplier": float(risk_gate["contract_multiplier"]),
+        "margin_rate": float(risk_gate["margin_rate"]),
+        "risk_per_lot": float(risk_gate["risk_per_lot"]),
+        "risk_budget": float(risk_gate["risk_budget"]),
+        "margin_per_lot": float(risk_gate["margin_per_lot"]),
+        "max_lots_by_risk": int(risk_gate["max_lots_by_risk"]),
+        "max_lots_by_margin": int(risk_gate["max_lots_by_margin"]),
+        "max_lots_by_portfolio": int(risk_gate["max_lots_by_portfolio"]),
+        "suggested_lots": int(risk_gate["suggested_lots"]),
         "entry_plan_type": entry_plan_type,
         "management_note": management_note,
         "downgrade_reason": downgrade_reason,
@@ -637,6 +773,15 @@ def _assess_trend_continuation(
         "MACD": float(scores.get("MACD", 0.0)),
         "动量": float(scores.get("动量", 0.0)),
     }
+    trend_summary = trend_direction_score_summary(
+        scores,
+        delta=float(cfg.get("direction_delta", 12.0)),
+    )
+    directional_score = (
+        float(trend_summary["long_score"])
+        if direction == "long"
+        else -float(trend_summary["short_score"])
+    )
 
     if direction == "long":
         slope_ok = bool(aligned_slopes) and all(s > 0 for s in aligned_slopes)
@@ -650,10 +795,10 @@ def _assess_trend_continuation(
         trend_bias = "bearish"
 
     trend_indicator_ok = all(_directional_value_ok(direction, value) for value in trend_quality_values.values())
-    score_ok = _score_gate(direction, total)
+    score_ok = _score_gate(direction, directional_score)
     has_signal = bool(score_ok and slope_ok and phase_ok and trend_indicator_ok)
     signal_detail = (
-        f"{wk_phase} 阶段，评分{total:+.0f}，"
+        f"{wk_phase} 阶段，趋势评分{directional_score:+.0f}，"
         f"均线斜率与{trend_bias}方向一致，当前按{signal_type}处理"
     ) if has_signal else ""
 
@@ -662,6 +807,10 @@ def _assess_trend_continuation(
         "signal_type": signal_type if has_signal else "",
         "signal_detail": signal_detail,
         "score_ok": score_ok,
+        "directional_score": directional_score,
+        "trend_score": float(trend_summary["score"]),
+        "long_score": float(trend_summary["long_score"]),
+        "short_score": float(trend_summary["short_score"]),
         "trend_indicator_ok": trend_indicator_ok,
         "trend_quality_values": trend_quality_values,
         "phase_ok": phase_ok,
@@ -674,6 +823,7 @@ def _assess_trend_continuation(
 
 def _build_trend_candidate_plan(
     *,
+    symbol: str,
     direction: str,
     last: float,
     atr: float,
@@ -739,11 +889,11 @@ def _build_trend_candidate_plan(
 
     rr = _reward_risk(direction, entry=entry, target=tp1, stop=stop)
     admission_rr = _reward_risk(direction, entry=entry, target=tp2, stop=stop)
-    risk_gate = _risk_gate_details(direction, entry=entry, stop=stop, cfg=cfg)
+    risk_gate = _risk_gate_details(direction, symbol=symbol, entry=entry, stop=stop, cfg=cfg)
 
     extended_target = rr < 1.0 and admission_rr >= 1.0
     rr_ok = admission_rr >= 1.0
-    score_ok = _score_gate(direction, total)
+    score_ok = bool(trend_status.get("score_ok"))
     risk_ok = bool(risk_gate["phase2_risk_gate_passed"])
     downgrade_reason = _append_downgrade_reason("", str(risk_gate["risk_gate_reason"]))
     entry_plan_type = "extended_target" if extended_target else "standard"
@@ -755,6 +905,7 @@ def _build_trend_candidate_plan(
         "tp2": float(tp2),
         "rr": float(rr),
         "admission_rr": float(admission_rr),
+        "score": float(trend_status.get("directional_score") or total),
         "actionable": bool(score_ok and rr_ok and risk_ok),
         "phase2_score_gate_passed": bool(score_ok),
         "phase2_rr_gate_passed": bool(rr_ok),
@@ -763,6 +914,15 @@ def _build_trend_candidate_plan(
         "phase2_risk_gate_passed": risk_ok,
         "risk_pct": float(risk_gate["risk_pct"]),
         "max_loss_pct": float(risk_gate["max_loss_pct"]),
+        "contract_multiplier": float(risk_gate["contract_multiplier"]),
+        "margin_rate": float(risk_gate["margin_rate"]),
+        "risk_per_lot": float(risk_gate["risk_per_lot"]),
+        "risk_budget": float(risk_gate["risk_budget"]),
+        "margin_per_lot": float(risk_gate["margin_per_lot"]),
+        "max_lots_by_risk": int(risk_gate["max_lots_by_risk"]),
+        "max_lots_by_margin": int(risk_gate["max_lots_by_margin"]),
+        "max_lots_by_portfolio": int(risk_gate["max_lots_by_portfolio"]),
+        "suggested_lots": int(risk_gate["suggested_lots"]),
         "entry_plan_type": entry_plan_type,
         "management_note": management_note,
         "downgrade_reason": downgrade_reason,
@@ -803,7 +963,7 @@ def assess_active_trend_hold_from_daily_df(
         wk_phase=phase_info.phase,
         cfg=cfg,
     )
-    hold_valid = _trend_hold_gate(direction, total, trend_status)
+    hold_valid = _trend_hold_gate(direction, float(trend_status.get("directional_score") or total), trend_status)
     return {
         "hold_valid": hold_valid,
         "score": total,
@@ -842,6 +1002,7 @@ def assess_active_reversal_hold_from_daily_df(
         trend_status.get("phase_ok")
         and trend_status.get("slope_ok")
         and trend_status.get("trend_indicator_ok")
+            and _score_gate(direction, float(trend_status.get("directional_score") or ctx["total"]))
     )
     story_transition = "trend_followthrough" if not reversal.get("has_signal") and trend_followthrough else ""
     return {
@@ -930,6 +1091,7 @@ def _build_plan_payload(
     trend_status: dict,
 ) -> dict:
     if candidate:
+        plan_score = float(candidate.get("score", ctx["total"]))
         entry = float(candidate["entry"])
         stop = float(candidate["stop"])
         tp1 = float(candidate["tp1"])
@@ -944,6 +1106,15 @@ def _build_plan_payload(
         phase2_risk_gate_passed = bool(candidate.get("phase2_risk_gate_passed", True))
         risk_pct = float(candidate.get("risk_pct", 0.0))
         max_loss_pct = float(candidate.get("max_loss_pct", 0.0))
+        contract_multiplier = float(candidate.get("contract_multiplier", 1.0))
+        margin_rate = float(candidate.get("margin_rate", 0.0))
+        risk_per_lot = float(candidate.get("risk_per_lot", 0.0))
+        risk_budget = float(candidate.get("risk_budget", 0.0))
+        margin_per_lot = float(candidate.get("margin_per_lot", 0.0))
+        max_lots_by_risk = int(candidate.get("max_lots_by_risk", 0))
+        max_lots_by_margin = int(candidate.get("max_lots_by_margin", 0))
+        max_lots_by_portfolio = int(candidate.get("max_lots_by_portfolio", 0))
+        suggested_lots = int(candidate.get("suggested_lots", 0))
         entry_plan_type = str(candidate.get("entry_plan_type") or "standard")
         management_note = str(candidate.get("management_note") or "")
         downgrade_reason = str(candidate.get("downgrade_reason") or "")
@@ -954,6 +1125,7 @@ def _build_plan_payload(
         entry_signal_detail = str(candidate.get("entry_signal_detail") or "")
         strategy_value = strategy_family
     else:
+        plan_score = float(ctx["total"])
         entry = float(ctx["last"])
         stop = 0.0
         tp1 = 0.0
@@ -968,6 +1140,15 @@ def _build_plan_payload(
         phase2_risk_gate_passed = False
         risk_pct = 0.0
         max_loss_pct = 0.0
+        contract_multiplier = 1.0
+        margin_rate = 0.0
+        risk_per_lot = 0.0
+        risk_budget = 0.0
+        margin_per_lot = 0.0
+        max_lots_by_risk = 0
+        max_lots_by_margin = 0
+        max_lots_by_portfolio = 0
+        suggested_lots = 0
         entry_plan_type = ""
         management_note = ""
         downgrade_reason = ""
@@ -983,7 +1164,7 @@ def _build_plan_payload(
         "name": name,
         "direction": direction,
         "strategy_family": strategy_value,
-        "score": float(ctx["total"]),
+        "score": plan_score,
         "actionable": actionable,
         "price": float(ctx["last"]),
         "entry": entry,
@@ -999,6 +1180,15 @@ def _build_plan_payload(
         "phase2_risk_gate_passed": phase2_risk_gate_passed,
         "risk_pct": risk_pct,
         "max_loss_pct": max_loss_pct,
+        "contract_multiplier": contract_multiplier,
+        "margin_rate": margin_rate,
+        "risk_per_lot": risk_per_lot,
+        "risk_budget": risk_budget,
+        "margin_per_lot": margin_per_lot,
+        "max_lots_by_risk": max_lots_by_risk,
+        "max_lots_by_margin": max_lots_by_margin,
+        "max_lots_by_portfolio": max_lots_by_portfolio,
+        "suggested_lots": suggested_lots,
         "entry_plan_type": entry_plan_type,
         "management_note": management_note,
         "downgrade_reason": downgrade_reason,
@@ -1049,6 +1239,7 @@ def build_reversal_trade_plan_from_daily_df(
         cfg=cfg,
     )
     reversal_candidate = _build_reversal_candidate_plan(
+        symbol=symbol,
         direction=direction,
         last=float(ctx["last"]),
         atr=float(ctx["atr"]),
@@ -1114,6 +1305,7 @@ def build_trend_trade_plan_from_daily_df(
         cfg=cfg,
     )
     trend_candidate = _build_trend_candidate_plan(
+        symbol=symbol,
         direction=direction,
         last=float(ctx["last"]),
         atr=float(ctx["atr"]),

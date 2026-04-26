@@ -296,8 +296,24 @@ def test_format_holding_log_block_describes_raise_stop_as_hold_management() -> N
     )
 
     assert "持仓建议: 继续持有（保护止损上移）" in text
-    assert "当前状态: 保护止损已抬高到11135.82，第一止盈继续看12265.24" in text
+    assert "当前状态: 原有顺势逻辑仍成立，保护止损已抬高到11135.82，第一止盈继续看12265.24" in text
     assert "建议原因: 原有顺势逻辑仍成立，保护止损可从11128上移至11136" in text
+
+
+def test_format_holding_status_text_keeps_story_before_raise_stop() -> None:
+    from holdings_advice.presenter import format_holding_status_text
+
+    result = {
+        "action": "继续持有",
+        "management_action": "上移止损",
+        "reason": "原有顺势逻辑仍成立，保护止损可从11128上移至11141",
+        "current_plan": {"stop": 11141.0, "tp1": 12265.0},
+    }
+
+    text = format_holding_status_text(result)
+
+    assert text.startswith("原有顺势逻辑仍成立")
+    assert "保护止损已抬高到11141" in text
 
 
 def test_format_holding_terminal_alert_describes_raise_stop_as_hold_management() -> None:

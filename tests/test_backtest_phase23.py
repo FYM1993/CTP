@@ -26,7 +26,7 @@ from backtest.phase23 import (  # noqa: E402
     resolve_case_tq_symbol,
     run_case_from_frames,
 )
-from shared.strategy import STRATEGY_REVERSAL  # noqa: E402
+from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND  # noqa: E402
 
 
 def _make_case(direction: str, strategy_family: str = "") -> BacktestCase:
@@ -79,6 +79,27 @@ def _long_plan(*, trade_id: str = "trade-long", plan_date: str = "2025-01-06") -
             "entry_family": "reversal",
             "entry_signal_type": "spring",
             "entry_signal_detail": "反转确认",
+        },
+    )
+
+
+def _trend_long_plan(*, trade_id: str = "trade-trend-long", plan_date: str = "2025-01-06") -> TradePlan:
+    return TradePlan(
+        trade_id=trade_id,
+        symbol="LH0",
+        direction="long",
+        plan_date=plan_date,
+        entry_ref=102.0,
+        stop=98.0,
+        tp1=106.0,
+        tp2=109.0,
+        phase2_score=30.0,
+        signal_type="TrendBreak",
+        meta={
+            "strategy_family": STRATEGY_TREND,
+            "entry_family": "trend",
+            "entry_signal_type": "TrendBreak",
+            "entry_signal_detail": "顺势突破确认",
         },
     )
 
@@ -304,11 +325,14 @@ def test_run_case_from_frames_opens_long_and_exits_on_tp2_intrabar_touch(monkeyp
     assert trade.direction == "long"
     assert trade.entry_time == "2025-01-06 09:31:00"
     assert trade.entry_price == 100.0
-    assert trade.exit_time == "2025-01-06 09:34:00"
-    assert trade.exit_price == 109.0
+    assert trade.exit_time == "2025-01-06 09:33:00"
+    assert trade.exit_price == 107.0
     assert trade.exit_reason == "tp2"
     assert trade.tp1_hit is True
-    assert trade.pnl_ratio == 0.09
+    assert trade.meta["execution_stop"] == 96.0
+    assert trade.meta["execution_tp1"] == 104.0
+    assert trade.meta["execution_tp2"] == 107.0
+    assert trade.pnl_ratio == pytest.approx(0.0601)
 
 
 def test_run_case_from_frames_opens_short_and_exits_on_tp2_intrabar_touch(monkeypatch):
@@ -356,17 +380,20 @@ def test_run_case_from_frames_opens_short_and_exits_on_tp2_intrabar_touch(monkey
     assert trade.entry_time == "2025-01-06 09:31:00"
     assert trade.entry_price == 200.0
     assert trade.exit_time == "2025-01-06 09:34:00"
-    assert trade.exit_price == 189.0
+    assert trade.exit_price == 190.0
     assert trade.exit_reason == "tp2"
     assert trade.tp1_hit is True
-    assert trade.pnl_ratio == 0.055
+    assert trade.meta["execution_stop"] == 206.0
+    assert trade.meta["execution_tp1"] == 193.0
+    assert trade.meta["execution_tp2"] == 190.0
+    assert trade.pnl_ratio == pytest.approx(0.04505)
 
 
 def test_run_case_from_frames_exits_long_on_stop_intrabar_touch(monkeypatch):
     minute_df = _build_minute_df(
         [
             ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
-            ("2025-01-06 09:32:00", 100.0, 101.0, 97.5, 99.5),
+            ("2025-01-06 09:32:00", 100.0, 101.0, 95.5, 99.5),
         ]
     )
 
@@ -380,15 +407,194 @@ def test_run_case_from_frames_exits_long_on_stop_intrabar_touch(monkeypatch):
         daily_df=_daily_df_for_backtest().iloc[:3].copy(),
         minute_df=minute_df,
         plan_factory=lambda **_kwargs: _long_plan(),
-        pre_market_cfg={},
+        pre_market_cfg={"backtest_fundamental_mode": "proxy"},
         signal_cfg={},
     )
 
     trade = result.trades[0]
     assert trade.exit_time == "2025-01-06 09:32:00"
-    assert trade.exit_price == 98.0
+    assert trade.exit_price == 96.0
     assert trade.exit_reason == "stop"
-    assert trade.pnl_ratio == -0.02
+    assert trade.pnl_ratio == -0.04
+
+
+def test_run_case_from_frames_moves_stop_to_entry_after_first_target(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+            ("2025-01-06 09:33:00", 105.0, 105.5, 99.8, 100.2),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={"tp1_exit_fraction": 0.5, "move_stop_to_entry_after_tp1": True},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.tp1_hit is True
+    assert trade.exit_time == "2025-01-06 09:33:00"
+    assert trade.exit_price == 100.0
+    assert trade.exit_reason == "stop"
+    assert trade.pnl_ratio == pytest.approx(0.02)
+    assert trade.meta["tp1_exit_fraction"] == 0.5
+    assert trade.meta["protective_stop"] == 100.0
+
+
+def test_run_case_from_frames_uses_trend_hold_management_after_first_target(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+            ("2025-01-06 09:33:00", 105.0, 105.5, 99.8, 100.2),
+            ("2025-01-06 09:34:00", 100.2, 109.5, 100.1, 109.0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "加多", "entry_family": "trend"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_TREND),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _trend_long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.tp1_hit is True
+    assert trade.exit_reason == "tp2"
+    assert trade.exit_price == 107.0
+    assert trade.pnl_ratio == pytest.approx(0.0601)
+    assert trade.meta["management_profile"] == "strategy_trend"
+    assert trade.meta["management_tp1_exit_fraction"] == pytest.approx(0.33)
+    assert trade.meta["management_move_stop_to_entry_after_tp1"] is False
+    assert trade.meta["management_post_tp1_stop_policy"] == "risk_buffer"
+    assert trade.meta["management_post_tp1_stop_r_buffer"] == pytest.approx(0.25)
+    assert trade.meta["protective_stop"] == 99.0
+
+
+def test_run_case_from_frames_uses_reversal_default_management_after_first_target(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+            ("2025-01-06 09:33:00", 105.0, 105.5, 99.8, 100.2),
+            ("2025-01-06 09:34:00", 100.2, 109.5, 100.1, 109.0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多", "entry_family": "reversal"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={"backtest_fundamental_mode": "proxy"},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.tp1_hit is True
+    assert trade.exit_reason == "tp2"
+    assert trade.exit_price == 107.0
+    assert trade.pnl_ratio == pytest.approx(0.0601)
+    assert trade.meta["management_profile"] == "strategy_reversal"
+    assert trade.meta["management_tp1_exit_fraction"] == pytest.approx(0.33)
+    assert trade.meta["management_move_stop_to_entry_after_tp1"] is False
+    assert trade.meta["tp1_exit_fraction"] == pytest.approx(0.33)
+    assert trade.meta["protective_stop"] == 96.0
+
+
+def test_run_case_from_frames_allows_explicit_reversal_management_override(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 99.8, 100.2),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多", "entry_family": "reversal"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={
+            "backtest_fundamental_mode": "proxy",
+            "trade_management": {
+                "strategy_profiles": {
+                    "reversal_fundamental": {
+                        "tp1_exit_fraction": 0.4,
+                        "move_stop_to_entry_after_tp1": True,
+                    }
+                }
+            }
+        },
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.tp1_hit is True
+    assert trade.exit_reason == "stop"
+    assert trade.exit_price == 100.0
+    assert trade.pnl_ratio == pytest.approx(0.016)
+    assert trade.meta["management_profile"] == "strategy_reversal"
+    assert trade.meta["management_tp1_exit_fraction"] == 0.4
+    assert trade.meta["management_move_stop_to_entry_after_tp1"] is True
+
+
+def test_run_case_from_frames_applies_protective_stop_on_same_bar_after_first_target(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 99.8, 100.2),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={"tp1_exit_fraction": 0.5, "move_stop_to_entry_after_tp1": True},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.tp1_hit is True
+    assert trade.exit_time == "2025-01-06 09:32:00"
+    assert trade.exit_price == 100.0
+    assert trade.exit_reason == "stop"
+    assert trade.pnl_ratio == pytest.approx(0.02)
+    assert trade.meta["protective_stop"] == 100.0
 
 
 def test_run_case_from_frames_exits_short_on_stop_intrabar_touch(monkeypatch):
@@ -415,16 +621,279 @@ def test_run_case_from_frames_exits_short_on_stop_intrabar_touch(monkeypatch):
 
     trade = result.trades[0]
     assert trade.exit_time == "2025-01-06 09:32:00"
-    assert trade.exit_price == 205.0
+    assert trade.exit_price == 206.0
     assert trade.exit_reason == "stop"
-    assert trade.pnl_ratio == -0.025
+    assert trade.pnl_ratio == -0.03
+
+
+def test_run_case_from_frames_uses_trend_add_signal_as_entry_confirmation(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 103.0, 99.0, 102.0),
+            ("2025-01-06 09:33:00", 102.0, 110.0, 101.0, 109.5),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "加多"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long"),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert len(result.trades) == 1
+    assert result.trades[0].entry_time == "2025-01-06 09:31:00"
+    assert result.trades[0].exit_reason == "tp2"
+
+
+def test_run_case_from_frames_rebases_execution_levels_to_actual_trigger_price(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 105.0, 105.5, 104.5, 105.0),
+            ("2025-01-06 09:32:00", 105.0, 112.5, 106.0, 112.0),
+        ]
+    )
+    plan = TradePlan(
+        trade_id="rebased-long",
+        symbol="LH0",
+        direction="long",
+        plan_date="2025-01-06",
+        entry_ref=102.0,
+        stop=98.0,
+        tp1=106.0,
+        tp2=109.0,
+        phase2_score=30.0,
+        signal_type="TrendBreak",
+        meta={
+            "entry_family": "trend",
+            "entry_signal_type": "TrendBreak",
+            "contract_multiplier": 10.0,
+            "margin_rate": 0.12,
+        },
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "加多", "entry_family": "trend"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_TREND),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: plan,
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    trade = result.trades[0]
+    assert trade.entry_price == 105.0
+    assert trade.exit_price == 112.0
+    assert trade.exit_reason == "tp2"
+    assert trade.meta["planned_entry_ref"] == 102.0
+    assert trade.meta["planned_stop"] == 98.0
+    assert trade.meta["execution_stop"] == 101.0
+    assert trade.meta["execution_tp1"] == 109.0
+    assert trade.meta["execution_tp2"] == 112.0
+    assert trade.meta["execution_rr"] == pytest.approx(1.0)
+    assert trade.meta["execution_admission_rr"] == pytest.approx(1.75)
+    assert trade.meta["execution_risk_per_lot"] == pytest.approx(40.0)
+    assert trade.meta["execution_margin_per_lot"] == pytest.approx(126.0)
+    assert trade.pnl_ratio == pytest.approx(0.057238095238095234)
+
+
+def test_run_case_from_frames_does_not_open_trend_plan_on_reversal_minute_signal(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 103.0, 99.0, 102.0),
+            ("2025-01-06 09:33:00", 102.0, 110.0, 101.0, 109.5),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [
+            {
+                "type": "开多",
+                "entry_family": "reversal",
+                "entry_signal_type": "MeanReversion",
+                "reason": "触及布林下轨后超卖回升",
+            }
+        ],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_TREND),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _trend_long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 0}
+    assert result.trades == []
+
+
+def test_run_case_from_frames_does_not_open_reversal_plan_on_trend_minute_signal(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 103.0, 99.0, 102.0),
+            ("2025-01-06 09:33:00", 102.0, 110.0, 101.0, 109.5),
+        ]
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [
+            {
+                "type": "加多",
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
+                "reason": "放量突破布林中轨",
+            }
+        ],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: _long_plan(),
+        pre_market_cfg={},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 0}
+    assert result.trades == []
+
+
+def test_run_case_from_frames_strict_mode_blocks_reversal_without_historical_fundamentals(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+        ]
+    )
+    plan = _long_plan()
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多", "entry_family": "reversal"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: plan,
+        pre_market_cfg={"min_history_bars": 1, "backtest_fundamental_mode": "strict"},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 0}
+    assert result.trades == []
+    assert result.diagnostics["phase2_actionable_days"] == 0
+    assert result.diagnostics["phase2_non_actionable_days"] == 1
+    assert result.diagnostics["phase2_reject_missing_fundamental_days"] == 1
+    assert result.diagnostics["backtest_fundamental_blocked_days"] == 1
+    assert result.diagnostics["backtest_fundamental_proxy_days"] == 0
+
+
+def test_run_case_from_frames_proxy_mode_allows_reversal_without_historical_fundamentals(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+        ]
+    )
+    plan = _long_plan()
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多", "entry_family": "reversal"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: plan,
+        pre_market_cfg={"min_history_bars": 1, "backtest_fundamental_mode": "proxy"},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    assert result.diagnostics["phase2_actionable_days"] == 1
+    assert result.diagnostics["backtest_fundamental_blocked_days"] == 0
+    assert result.diagnostics["backtest_fundamental_proxy_days"] == 1
+    trade = result.trades[0]
+    assert trade.meta["backtest_fundamental_mode"] == "proxy"
+    assert trade.meta["backtest_fundamental_status"] == "proxy_missing"
+
+
+def test_run_case_from_frames_strict_mode_allows_confirmed_reversal_fundamentals(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 106.5, 100.5, 105.0),
+        ]
+    )
+    plan = TradePlan(
+        trade_id="confirmed-fundamental-reversal",
+        symbol="LH0",
+        direction="long",
+        plan_date="2025-01-06",
+        entry_ref=102.0,
+        stop=98.0,
+        tp1=106.0,
+        tp2=109.0,
+        phase2_score=30.0,
+        signal_type="Spring",
+        meta={
+            "strategy_family": STRATEGY_REVERSAL,
+            "entry_family": "reversal",
+            "entry_signal_type": "Spring",
+            "fundamental_reversal_confirmed": True,
+            "fundamental_only_proxy_evidence": False,
+        },
+    )
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "开多", "entry_family": "reversal"}],
+    )
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_REVERSAL),
+        daily_df=_daily_df_for_backtest().iloc[:3].copy(),
+        minute_df=minute_df,
+        plan_factory=lambda **_kwargs: plan,
+        pre_market_cfg={"min_history_bars": 1, "backtest_fundamental_mode": "strict"},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    assert result.diagnostics["phase2_actionable_days"] == 1
+    assert result.diagnostics["backtest_fundamental_blocked_days"] == 0
+    assert result.trades[0].meta["backtest_fundamental_status"] == "confirmed"
 
 
 def test_run_case_from_frames_prefers_stop_when_stop_and_tp2_touch_same_bar(monkeypatch):
     minute_df = _build_minute_df(
         [
             ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
-            ("2025-01-06 09:32:00", 100.0, 110.0, 97.0, 107.0),
+            ("2025-01-06 09:32:00", 100.0, 110.0, 95.5, 107.0),
         ]
     )
 
@@ -444,7 +913,7 @@ def test_run_case_from_frames_prefers_stop_when_stop_and_tp2_touch_same_bar(monk
 
     trade = result.trades[0]
     assert trade.exit_time == "2025-01-06 09:32:00"
-    assert trade.exit_price == 98.0
+    assert trade.exit_price == 96.0
     assert trade.exit_reason == "stop"
 
 
@@ -626,7 +1095,7 @@ def test_run_case_from_frames_keeps_custom_reversal_trade_when_hold_is_still_val
         daily_df=daily_df,
         minute_df=minute_df,
         plan_factory=plan_factory,
-        pre_market_cfg={"min_history_bars": 1},
+        pre_market_cfg={"min_history_bars": 1, "backtest_fundamental_mode": "proxy"},
         signal_cfg={},
     )
 
@@ -795,6 +1264,58 @@ def test_run_case_from_frames_keeps_custom_trend_trade_when_hold_is_still_valid(
     assert trade.meta["entry_family"] == "trend"
 
 
+def test_run_case_from_frames_keeps_trend_trade_when_daily_review_only_weakens(monkeypatch):
+    minute_df = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 100.0, 102.0, 99.5, 101.0),
+            ("2025-01-07 09:31:00", 101.0, 102.0, 100.5, 101.5),
+            ("2025-01-07 09:32:00", 101.5, 102.5, 101.0, 102.0),
+        ]
+    )
+    plan = _trend_long_plan()
+
+    monkeypatch.setattr(
+        "backtest.phase23._safe_generate_signals",
+        lambda df, direction, cfg: [{"type": "加多", "entry_family": "trend"}],
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.pre_market.assess_active_trend_hold_from_daily_df",
+        lambda **_kwargs: {
+            "hold_valid": False,
+            "score": 8.0,
+            "story_family": "trend",
+            "trend_status": {
+                "directional_score": 8.0,
+                "phase_ok": True,
+                "slope_ok": False,
+                "trend_indicator_ok": False,
+            },
+        },
+    )
+
+    def plan_factory(*, daily_df, **_kwargs):
+        latest_visible = daily_df["trade_date"].max() if not daily_df.empty else None
+        if latest_visible == date(2025, 1, 5):
+            return plan
+        return None
+
+    result = run_case_from_frames(
+        case=_make_case("long", strategy_family=STRATEGY_TREND),
+        daily_df=_daily_df_for_backtest(),
+        minute_df=minute_df,
+        plan_factory=plan_factory,
+        pre_market_cfg={"min_history_bars": 1},
+        signal_cfg={},
+    )
+
+    assert result.summary == {"num_trades": 1}
+    trade = result.trades[0]
+    assert trade.exit_reason == "end_of_data"
+    assert trade.exit_time == "2025-01-07 09:32:00"
+    assert trade.meta["management_profile"] == "strategy_trend"
+
+
 def test_run_case_from_frames_plan_factory_sees_only_prior_daily_bars(monkeypatch):
     seen_daily_dates: list[tuple[date, list[date]]] = []
     expected_trade_dates = [date(2025, 1, 6), date(2025, 1, 7)]
@@ -911,6 +1432,7 @@ def test_run_case_from_frames_reports_actionable_plan_without_entry(monkeypatch)
         "phase2_reject_score_gate_days": 0,
         "phase2_reject_rr_gate_days": 0,
         "phase2_reject_duplicate_signal_days": 0,
+        "phase2_reject_missing_fundamental_days": 0,
         "phase3_signal_eval_bars": 2,
         "phase3_entry_signal_hits": 0,
         "trades_opened": 0,
@@ -918,6 +1440,8 @@ def test_run_case_from_frames_reports_actionable_plan_without_entry(monkeypatch)
         "trades_opened_trend": 0,
         "trades_opened_strategy_reversal": 0,
         "trades_opened_strategy_trend": 0,
+        "backtest_fundamental_blocked_days": 0,
+        "backtest_fundamental_proxy_days": 0,
     }
 
 
@@ -979,6 +1503,7 @@ def test_run_case_from_frames_reports_short_history_then_entry(monkeypatch):
         "phase2_reject_score_gate_days": 0,
         "phase2_reject_rr_gate_days": 0,
         "phase2_reject_duplicate_signal_days": 0,
+        "phase2_reject_missing_fundamental_days": 0,
         "phase3_signal_eval_bars": 1,
         "phase3_entry_signal_hits": 1,
         "trades_opened": 1,
@@ -986,6 +1511,8 @@ def test_run_case_from_frames_reports_short_history_then_entry(monkeypatch):
         "trades_opened_trend": 0,
         "trades_opened_strategy_reversal": 0,
         "trades_opened_strategy_trend": 0,
+        "backtest_fundamental_blocked_days": 0,
+        "backtest_fundamental_proxy_days": 0,
     }
 
 
@@ -1283,6 +1810,10 @@ def test_run_case_from_frames_collects_phase2_debug_days_when_requested(monkeypa
             "trend_phase_ok": True,
             "trend_slope_ok": True,
             "trend_indicator_ok": True,
+            "backtest_fundamental_mode": "",
+            "backtest_fundamental_status": "",
+            "backtest_fundamental_confirmed": False,
+            "backtest_fundamental_proxy_used": False,
         }
     ]
 
@@ -1419,6 +1950,10 @@ def test_run_case_from_frames_strategy_specific_debug_keeps_reversal_watch_snaps
             "trend_phase_ok": False,
             "trend_slope_ok": False,
             "trend_indicator_ok": False,
+            "backtest_fundamental_mode": "",
+            "backtest_fundamental_status": "",
+            "backtest_fundamental_confirmed": False,
+            "backtest_fundamental_proxy_used": False,
         }
     ]
 
@@ -1751,6 +2286,38 @@ def test_load_case_frames_with_tqbacktest_returns_cached_frames_without_tqsdk(mo
     monkeypatch.setattr(
         "backtest.phase23.resolve_case_tq_symbol",
         lambda *args, **kwargs: pytest.fail("cache hit should not resolve tq symbol"),
+    )
+
+    daily_df, minute_df = load_case_frames_with_tqbacktest(case=case, config={})
+
+    pd.testing.assert_frame_equal(daily_df, cached_daily)
+    pd.testing.assert_frame_equal(minute_df, cached_minute)
+
+
+def test_load_case_frames_with_tqbacktest_reads_legacy_v2_cache_without_tqsdk(monkeypatch, tmp_path):
+    case = _make_case("long")
+    warmup_bars = _daily_warmup_bars({})
+    cached_daily = _daily_df_for_backtest().copy()
+    cached_minute = _build_minute_df(
+        [
+            ("2025-01-06 09:31:00", 100.0, 101.0, 99.0, 100.0),
+            ("2025-01-06 09:32:00", 101.0, 102.0, 100.0, 101.0),
+        ]
+    )
+
+    monkeypatch.setattr("backtest.phase23.BACKTEST_CACHE_DIR", tmp_path)
+    legacy_key = f"lh0_20250101_20250131_w{warmup_bars}_v2"
+    legacy_daily_path = tmp_path / f"{legacy_key}_daily.parquet"
+    legacy_minute_path = tmp_path / f"{legacy_key}_minute.parquet"
+    cached_daily.to_parquet(legacy_daily_path, index=False)
+    cached_minute.to_parquet(legacy_minute_path, index=False)
+    monkeypatch.setattr(
+        "backtest.phase23._create_backtest_api",
+        lambda **_kwargs: pytest.fail("legacy cache hit should not open tqbacktest"),
+    )
+    monkeypatch.setattr(
+        "backtest.phase23.resolve_case_tq_symbol",
+        lambda *args, **kwargs: pytest.fail("legacy cache hit should not resolve tq symbol"),
     )
 
     daily_df, minute_df = load_case_frames_with_tqbacktest(case=case, config={})

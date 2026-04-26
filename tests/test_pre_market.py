@@ -47,6 +47,27 @@ def test_score_signals_keeps_finite_score_when_long_ma_window_exceeds_history() 
     assert np.isfinite(sum(float(value) for value in scores.values()))
 
 
+def test_trend_direction_summary_excludes_contrarian_reversal_scores() -> None:
+    scores = {
+        "RSI": 10.0,
+        "布林带": 10.0,
+        "价格位置": 5.0,
+        "均线排列": 0.0,
+        "MACD": 0.0,
+        "动量": 0.0,
+        "量价关系": 0.0,
+        "VSA信号": 0.0,
+        "持仓信号": 0.0,
+        "Wyckoff阶段": 0.0,
+    }
+
+    summary = pre_market.trend_direction_score_summary(scores, delta=12.0)
+
+    assert summary["long_score"] == 0.0
+    assert summary["short_score"] == 0.0
+    assert summary["direction"] == "watch"
+
+
 def test_build_trade_plan_from_daily_df_returns_long_plan(monkeypatch) -> None:
     df = _build_daily_frame()
 
@@ -421,6 +442,101 @@ def test_build_reversal_trade_plan_from_daily_df_downgrades_when_stop_width_exce
     assert plan["phase2_risk_gate_passed"] is False
     assert plan["risk_pct"] > 0.02
     assert "止损距离" in plan["downgrade_reason"]
+
+
+def test_build_reversal_trade_plan_rejects_when_contract_risk_allows_zero_lots(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": True,
+            "signal_type": "Spring",
+            "signal_date": "2025-05-10",
+            "signal_days_ago": 0,
+            "signal_bar": {"low": 100.0, "high": 116.0},
+            "signal_detail": "fresh spring with oversized yuan risk",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
+            "confidence": 0.8,
+            "signal_strength": 0.75,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([92.0], [118.0, 124.0]))
+    monkeypatch.setattr(pre_market, "score_signals", lambda *args, **kwargs: {"dummy": 25.0})
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+
+    plan = pre_market.build_reversal_trade_plan_from_daily_df(
+        symbol="PS0",
+        name="多晶硅",
+        direction="long",
+        df=df,
+        cfg={
+            "ma_windows": [5, 10, 20],
+            "account_equity": 100_000.0,
+            "risk_per_trade_pct": 0.001,
+            "contract_specs": {"PS0": {"multiplier": 20, "margin_rate": 0.12}},
+        },
+        allow_watch_plan=True,
+    )
+
+    assert plan is not None
+    assert plan["phase2_risk_gate_passed"] is False
+    assert plan["suggested_lots"] == 0
+    assert plan["risk_per_lot"] > plan["risk_budget"]
+    assert "每手亏损" in plan["downgrade_reason"]
+
+
+def test_build_reversal_trade_plan_reports_contract_lot_sizing_when_budget_allows_trade(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": True,
+            "signal_type": "Spring",
+            "signal_date": "2025-05-10",
+            "signal_days_ago": 0,
+            "signal_bar": {"low": 110.0, "high": 116.0},
+            "signal_detail": "fresh spring with sized risk",
+            "current_stage": "反转确认",
+            "next_expected": "确认新鲜(今日)，可考虑入场",
+            "confidence": 0.8,
+            "signal_strength": 0.75,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([92.0], [118.0, 124.0]))
+    monkeypatch.setattr(pre_market, "score_signals", lambda *args, **kwargs: {"dummy": 25.0})
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+
+    plan = pre_market.build_reversal_trade_plan_from_daily_df(
+        symbol="PS0",
+        name="多晶硅",
+        direction="long",
+        df=df,
+        cfg={
+            "ma_windows": [5, 10, 20],
+            "account_equity": 100_000.0,
+            "risk_per_trade_pct": 0.02,
+            "max_margin_pct": 0.2,
+            "contract_specs": {"PS0": {"multiplier": 10, "margin_rate": 0.12}},
+        },
+        allow_watch_plan=True,
+    )
+
+    assert plan is not None
+    assert plan["phase2_risk_gate_passed"] is True
+    assert plan["risk_budget"] == pytest.approx(2000.0)
+    assert plan["risk_per_lot"] > 0
+    assert plan["suggested_lots"] >= 1
 
 
 def test_build_trade_plan_from_daily_df_returns_short_plan(monkeypatch) -> None:
@@ -1014,6 +1130,56 @@ def test_assess_active_trend_hold_from_daily_df_rejects_when_all_continuation_ev
     assert hold["hold_valid"] is False
     assert hold["score"] == 5.0
     assert hold["trend_status"]["phase_ok"] is True
+
+
+def test_assess_active_reversal_hold_requires_score_for_trend_followthrough(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(pre_market, "assess_reversal_status", lambda *args, **kwargs: {"has_signal": False})
+    monkeypatch.setattr(
+        pre_market,
+        "_build_plan_context",
+        lambda **kwargs: {
+            "close": df["close"],
+            "last": float(df["close"].iloc[-1]),
+            "scores": {"均线排列": 8.0, "MACD": 7.0, "动量": 6.0, "持仓信号": -40.0},
+            "total": -19.0,
+            "atr": 2.0,
+            "wk_phase": "markup",
+            "supports": [],
+            "resistances": [],
+            "fib_targets": {},
+            "fib_low": 90.0,
+            "fib_high": 110.0,
+            "fib_range": 20.0,
+            "classical_total": 21.0,
+            "wyckoff_total": 0.0,
+            "oi_total": -40.0,
+            "reason": "趋势结构不足",
+        },
+    )
+    monkeypatch.setattr(
+        pre_market,
+        "_assess_trend_continuation",
+        lambda **kwargs: {
+            "has_signal": False,
+            "phase_ok": True,
+            "slope_ok": True,
+            "trend_indicator_ok": True,
+        },
+    )
+
+    result = pre_market.assess_active_reversal_hold_from_daily_df(
+        symbol="LH0",
+        name="生猪",
+        direction="long",
+        df=df,
+        cfg={},
+    )
+
+    assert result is not None
+    assert result["hold_valid"] is False
+    assert result["story_transition"] == ""
 
 
 def test_analyze_one_reports_actionable_trend_entry(monkeypatch) -> None:

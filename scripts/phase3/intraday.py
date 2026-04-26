@@ -51,6 +51,8 @@ log = get_logger("intraday")
 from wyckoff import vsa_scan, classify_vsa_bar, relative_volume, close_position
 from phase3.live import TqPhase3Monitor, tqsdk_configured
 
+ENTRY_FAMILIES = {"trend", "reversal"}
+
 
 def load_config() -> dict:
     return load_yaml_config(__file__)
@@ -110,6 +112,43 @@ def calc_kdj(df: pd.DataFrame, n=9, m1=3, m2=3):
 
 # ========== 信号生成 ==========
 
+def signal_entry_family(signal: dict) -> str:
+    family = str(signal.get("entry_family") or "").strip()
+    if family in ENTRY_FAMILIES or family == "protection":
+        return family
+    return ""
+
+
+def _entry_confirmation_types(direction: str) -> set[str]:
+    if direction == "long":
+        return {"开多", "加多"}
+    return {"开空", "加空"}
+
+
+def is_entry_confirmation_signal(signal: dict, direction: str, entry_family: str = "") -> bool:
+    if signal.get("type") not in _entry_confirmation_types(direction):
+        return False
+
+    plan_family = str(entry_family or "").strip()
+    signal_family = signal_entry_family(signal)
+    if plan_family in ENTRY_FAMILIES and signal_family in ENTRY_FAMILIES:
+        return plan_family == signal_family
+    return True
+
+
+def filter_signals_for_entry_story(signals: list[dict], entry_family: str = "") -> list[dict]:
+    plan_family = str(entry_family or "").strip()
+    if plan_family not in ENTRY_FAMILIES:
+        return signals
+
+    filtered: list[dict] = []
+    for signal in signals:
+        signal_family = signal_entry_family(signal)
+        if signal_family in {"", plan_family, "protection"}:
+            filtered.append(signal)
+    return filtered
+
+
 def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
     """根据技术指标生成日内交易信号"""
     signals = []
@@ -159,6 +198,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last <= lo * 1.005 and r < 35 and r > r_prev:
             signals.append({
                 "type": "开多",
+                "entry_family": "reversal",
+                "entry_signal_type": "MeanReversion",
                 "strength": "强" if r < rsi_os else "中",
                 "reason": f"触及布林下轨({lo:.0f}), RSI={r:.1f}↑ 超卖回升",
                 "entry": last,
@@ -170,6 +211,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if hist_now > 0 and hist_prev <= 0:
             signals.append({
                 "type": "开多",
+                "entry_family": "trend",
+                "entry_signal_type": "TrendMomentum",
                 "strength": "中",
                 "reason": f"MACD金叉, DIF={dif_now:.1f}上穿DEA",
                 "entry": last,
@@ -181,6 +224,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if j_now > d_now and j_prev <= d_prev and j_now < 30:
             signals.append({
                 "type": "开多",
+                "entry_family": "reversal",
+                "entry_signal_type": "MomentumReversal",
                 "strength": "中",
                 "reason": f"KDJ金叉(J={j_now:.0f}), 低位金叉",
                 "entry": last,
@@ -192,6 +237,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last > m and close_prev <= mid_prev and vol_now > vol_avg * vol_filter:
             signals.append({
                 "type": "加多",
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
                 "strength": "强",
                 "reason": f"放量突破布林中轨({m:.0f}), 量比={vol_now/vol_avg:.1f}",
                 "entry": last,
@@ -203,6 +250,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last >= u * 0.995:
             signals.append({
                 "type": "平多",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectProfit",
                 "strength": "中",
                 "reason": f"触及布林上轨({u:.0f}), 考虑止盈",
             })
@@ -210,6 +259,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if r > rsi_ob:
             signals.append({
                 "type": "平多",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectRisk",
                 "strength": "弱",
                 "reason": f"RSI={r:.1f} 超买, 注意回落风险",
             })
@@ -219,6 +270,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last >= u * 0.995 and r > 65 and r < r_prev:
             signals.append({
                 "type": "开空",
+                "entry_family": "reversal",
+                "entry_signal_type": "MeanReversion",
                 "strength": "强" if r > rsi_ob else "中",
                 "reason": f"触及布林上轨({u:.0f}), RSI={r:.1f}↓ 超买回落",
                 "entry": last,
@@ -230,6 +283,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if hist_now < 0 and hist_prev >= 0:
             signals.append({
                 "type": "开空",
+                "entry_family": "trend",
+                "entry_signal_type": "TrendMomentum",
                 "strength": "中",
                 "reason": f"MACD死叉, DIF={dif_now:.1f}下穿DEA",
                 "entry": last,
@@ -241,6 +296,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if j_now < d_now and j_prev >= d_prev and j_now > 70:
             signals.append({
                 "type": "开空",
+                "entry_family": "reversal",
+                "entry_signal_type": "MomentumReversal",
                 "strength": "中",
                 "reason": f"KDJ死叉(J={j_now:.0f}), 高位死叉",
                 "entry": last,
@@ -252,6 +309,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last < m and close_prev >= mid_prev and vol_now > vol_avg * vol_filter:
             signals.append({
                 "type": "加空",
+                "entry_family": "trend",
+                "entry_signal_type": "TrendBreak",
                 "strength": "强",
                 "reason": f"放量跌破布林中轨({m:.0f}), 量比={vol_now/vol_avg:.1f}",
                 "entry": last,
@@ -263,6 +322,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if last <= lo * 1.005:
             signals.append({
                 "type": "平空",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectProfit",
                 "strength": "中",
                 "reason": f"触及布林下轨({lo:.0f}), 考虑止盈",
             })
@@ -270,6 +331,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if r < rsi_os:
             signals.append({
                 "type": "平空",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectRisk",
                 "strength": "弱",
                 "reason": f"RSI={r:.1f} 超卖, 注意反弹风险",
             })
@@ -283,6 +346,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         if direction == "long" and last_vsa.bias == "bullish":
             signals.append({
                 "type": "开多",
+                "entry_family": "reversal",
+                "entry_signal_type": "VSAReversal",
                 "strength": "强" if last_vsa.strength >= 3 else "中",
                 "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
                 "entry": last,
@@ -292,12 +357,16 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         elif direction == "long" and last_vsa.bias == "bearish" and last_vsa.strength >= 2:
             signals.append({
                 "type": "平多",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectRisk",
                 "strength": "中",
                 "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
             })
         elif direction == "short" and last_vsa.bias == "bearish":
             signals.append({
                 "type": "开空",
+                "entry_family": "reversal",
+                "entry_signal_type": "VSAReversal",
                 "strength": "强" if last_vsa.strength >= 3 else "中",
                 "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
                 "entry": last,
@@ -307,6 +376,8 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
         elif direction == "short" and last_vsa.bias == "bullish" and last_vsa.strength >= 2:
             signals.append({
                 "type": "平空",
+                "entry_family": "protection",
+                "entry_signal_type": "ProtectRisk",
                 "strength": "中",
                 "reason": f"VSA [{last_vsa.bar_type}] {last_vsa.description}",
             })
@@ -314,7 +385,7 @@ def generate_signals(df: pd.DataFrame, direction: str, cfg: dict) -> list[dict]:
     return signals
 
 
-def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cfg: dict):
+def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cfg: dict, entry_family: str = ""):
     """打印单品种分钟级执行辅助观察面板。"""
     close = df["close"]
     last = close.iloc[-1]
@@ -355,6 +426,7 @@ def print_dashboard(symbol: str, name: str, direction: str, df: pd.DataFrame, cf
 
     # 生成信号
     signals = generate_signals(df, direction, cfg)
+    signals = filter_signals_for_entry_story(signals, entry_family)
 
     if signals:
         log.info(f"│")

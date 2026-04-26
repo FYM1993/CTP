@@ -193,6 +193,7 @@ def test_run_walk_forward_from_frames_aggregates_validation_windows() -> None:
         "total_phase2_reject_score_gate_days": 0,
         "total_phase2_reject_rr_gate_days": 0,
         "total_phase2_reject_duplicate_signal_days": 0,
+        "total_phase2_reject_missing_fundamental_days": 0,
         "total_phase3_signal_eval_bars": 0,
         "total_phase3_entry_signal_hits": 0,
         "total_trades_opened": 0,
@@ -200,6 +201,8 @@ def test_run_walk_forward_from_frames_aggregates_validation_windows() -> None:
         "total_trades_opened_trend": 0,
         "total_trades_opened_strategy_reversal": 0,
         "total_trades_opened_strategy_trend": 0,
+        "total_backtest_fundamental_blocked_days": 0,
+        "total_backtest_fundamental_proxy_days": 0,
     }
     assert [window.window.index for window in result.windows] == [1, 2]
     assert result.windows[0] == RollingWindowResult(
@@ -269,6 +272,7 @@ def test_run_walk_forward_from_frames_marks_no_history_when_no_windows() -> None
             "total_phase2_reject_score_gate_days": 0,
             "total_phase2_reject_rr_gate_days": 0,
             "total_phase2_reject_duplicate_signal_days": 0,
+            "total_phase2_reject_missing_fundamental_days": 0,
             "total_phase3_signal_eval_bars": 0,
             "total_phase3_entry_signal_hits": 0,
             "total_trades_opened": 0,
@@ -276,6 +280,8 @@ def test_run_walk_forward_from_frames_marks_no_history_when_no_windows() -> None
             "total_trades_opened_trend": 0,
             "total_trades_opened_strategy_reversal": 0,
             "total_trades_opened_strategy_trend": 0,
+            "total_backtest_fundamental_blocked_days": 0,
+            "total_backtest_fundamental_proxy_days": 0,
         },
     )
 
@@ -349,6 +355,7 @@ def test_run_walk_forward_from_frames_aggregates_window_diagnostics() -> None:
         "total_phase2_reject_score_gate_days": 1,
         "total_phase2_reject_rr_gate_days": 1,
         "total_phase2_reject_duplicate_signal_days": 0,
+        "total_phase2_reject_missing_fundamental_days": 0,
         "total_phase3_signal_eval_bars": 10,
         "total_phase3_entry_signal_hits": 1,
         "total_trades_opened": 1,
@@ -356,4 +363,44 @@ def test_run_walk_forward_from_frames_aggregates_window_diagnostics() -> None:
         "total_trades_opened_trend": 1,
         "total_trades_opened_strategy_reversal": 0,
         "total_trades_opened_strategy_trend": 0,
+        "total_backtest_fundamental_blocked_days": 0,
+        "total_backtest_fundamental_proxy_days": 0,
     }
+
+
+def test_run_walk_forward_from_frames_aggregates_fundamental_backtest_diagnostics() -> None:
+    def fake_run_window(*, case, daily_df, minute_df, **kwargs):
+        if case.start_dt == date(2025, 1, 4):
+            diagnostics = {
+                "backtest_fundamental_blocked_days": 2,
+                "backtest_fundamental_proxy_days": 0,
+                "phase2_reject_missing_fundamental_days": 2,
+            }
+        else:
+            diagnostics = {
+                "backtest_fundamental_blocked_days": 1,
+                "backtest_fundamental_proxy_days": 3,
+                "phase2_reject_missing_fundamental_days": 1,
+            }
+        return BacktestResult(
+            case_id=case.case_id,
+            trades=[],
+            summary={"num_trades": 0},
+            diagnostics=diagnostics,
+        )
+
+    result = run_walk_forward_from_frames(
+        case=_case(),
+        daily_df=_daily_frame(),
+        minute_df=_minute_frame(),
+        pre_market_cfg={"min_history_bars": 3},
+        signal_cfg={},
+        train_days=10,
+        validation_days=5,
+        step_days=5,
+        run_window=fake_run_window,
+    )
+
+    assert result.aggregate_diagnostics["total_backtest_fundamental_blocked_days"] == 3
+    assert result.aggregate_diagnostics["total_backtest_fundamental_proxy_days"] == 3
+    assert result.aggregate_diagnostics["total_phase2_reject_missing_fundamental_days"] == 3

@@ -853,6 +853,98 @@ def test_get_inventory_live_uses_eastmoney_source(monkeypatch):
     assert out["inv_trend"] == "累库"
 
 
+def test_get_spot_basis_maps_internal_symbol_to_commodity_code(monkeypatch):
+    seen: list[tuple[str, list[str]]] = []
+
+    def fake_spot_price(date="20240430", vars_list=None):
+        seen.append((date, list(vars_list or [])))
+        return pd.DataFrame(
+            {
+                "var": ["RB"],
+                "sp": [3520.0],
+                "dom_price": [3480.0],
+                "dom_basis": [40.0],
+                "dom_basis_rate": [1.15],
+                "date": ["20250401"],
+            }
+        )
+
+    monkeypatch.setattr(data_cache.aks, "futures_spot_price", fake_spot_price)
+
+    out = data_cache.get_spot_basis("RB0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert seen == [("20250401", ["RB"])]
+    assert out == {
+        "commodity_code": "RB",
+        "spot_price": 3520.0,
+        "dominant_contract_price": 3480.0,
+        "basis": 40.0,
+        "basis_rate": 1.15,
+        "data_date": "20250401",
+        "source": "akshare_futures_spot_price",
+    }
+
+
+def test_get_spot_basis_accepts_akshare_normalized_schema(monkeypatch):
+    def fake_spot_price(date="20240430", vars_list=None):
+        return pd.DataFrame(
+            {
+                "date": ["20250401"],
+                "symbol": ["RB"],
+                "spot_price": [3181.33],
+                "dominant_contract_price": [3170.0],
+                "dom_basis": [-11.33],
+                "dom_basis_rate": [-0.003561],
+            }
+        )
+
+    monkeypatch.setattr(data_cache.aks, "futures_spot_price", fake_spot_price)
+
+    out = data_cache.get_spot_basis("RB0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out == {
+        "commodity_code": "RB",
+        "spot_price": 3181.33,
+        "dominant_contract_price": 3170.0,
+        "basis": -11.33,
+        "basis_rate": -0.003561,
+        "data_date": "20250401",
+        "source": "akshare_futures_spot_price",
+    }
+
+
+def test_get_spot_basis_returns_none_when_symbol_row_missing(monkeypatch):
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_spot_price",
+        lambda date="20240430", vars_list=None: pd.DataFrame(
+            {
+                "var": ["HC"],
+                "sp": [3600.0],
+                "dom_price": [3550.0],
+                "dom_basis": [50.0],
+                "dom_basis_rate": [1.4],
+                "date": ["20250401"],
+            }
+        ),
+    )
+
+    out = data_cache.get_spot_basis("RB0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out is None
+
+
+def test_get_spot_basis_returns_none_when_source_fails(monkeypatch):
+    def fail_spot_price(date="20240430", vars_list=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(data_cache.aks, "futures_spot_price", fail_spot_price)
+
+    out = data_cache.get_spot_basis("RB0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out is None
+
+
 def test_get_warehouse_receipt_uses_as_of_date_snapshot(monkeypatch):
     monkeypatch.setattr(data_cache, "_shfe_receipt_cache", {})
     monkeypatch.setattr(data_cache, "_gfex_receipt_cache", {})
@@ -875,6 +967,94 @@ def test_get_warehouse_receipt_uses_as_of_date_snapshot(monkeypatch):
 
     assert out == {"receipt_total": 50.0, "receipt_change": 1.0, "exchange": "SHFE"}
     assert seen == ["20250401"]
+
+
+def test_get_warehouse_receipt_supports_dce_symbols(monkeypatch):
+    monkeypatch.setattr(data_cache, "_shfe_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_gfex_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_dce_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_czce_receipt_cache", {})
+    seen: list[str] = []
+
+    def fake_dce(date="20200702"):
+        seen.append(date)
+        return {
+            "豆粕": pd.DataFrame(
+                {
+                    "今日仓单量": [100.0, 30.0],
+                    "增减": [5.0, -2.0],
+                }
+            )
+        }
+
+    monkeypatch.setattr(data_cache.aks, "futures_dce_warehouse_receipt", fake_dce)
+
+    out = data_cache.get_warehouse_receipt("M0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out == {"receipt_total": 130.0, "receipt_change": 3.0, "exchange": "DCE"}
+    assert seen == ["20250401"]
+
+
+def test_get_warehouse_receipt_supports_czce_symbols(monkeypatch):
+    monkeypatch.setattr(data_cache, "_shfe_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_gfex_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_dce_receipt_cache", {})
+    monkeypatch.setattr(data_cache, "_czce_receipt_cache", {})
+    seen: list[str] = []
+
+    def fake_czce(date="20200702"):
+        seen.append(date)
+        return {
+            "PTA": pd.DataFrame(
+                {
+                    "仓单数量": [80.0, 20.0],
+                    "当日增减": [-6.0, 1.0],
+                }
+            )
+        }
+
+    monkeypatch.setattr(data_cache.aks, "futures_czce_warehouse_receipt", fake_czce)
+
+    out = data_cache.get_warehouse_receipt("TA0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out == {"receipt_total": 100.0, "receipt_change": -5.0, "exchange": "CZCE"}
+    assert seen == ["20250401"]
+
+
+def test_get_warehouse_receipt_prefers_czce_total_row_with_split_quantity_columns(monkeypatch):
+    monkeypatch.setattr(data_cache, "_czce_receipt_cache", {})
+
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_czce_warehouse_receipt",
+        lambda date="20200702": {
+            "PTA": pd.DataFrame(
+                {
+                    "仓库编号": ["小计", "总计"],
+                    "仓单数量(完税)": [9930.0, 173273.0],
+                    "仓单数量(保税)": [0.0, 11.0],
+                    "当日增减": [0.0, -1920.0],
+                }
+            )
+        },
+    )
+
+    out = data_cache.get_warehouse_receipt("TA0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out == {"receipt_total": 173284.0, "receipt_change": -1920.0, "exchange": "CZCE"}
+
+
+def test_get_warehouse_receipt_returns_none_for_unexpected_exchange_shape(monkeypatch):
+    monkeypatch.setattr(data_cache, "_dce_receipt_cache", {})
+    monkeypatch.setattr(
+        data_cache.aks,
+        "futures_dce_warehouse_receipt",
+        lambda date="20200702": {"豆粕": pd.DataFrame({"仓库": ["A"]})},
+    )
+
+    out = data_cache.get_warehouse_receipt("M0", as_of_date=pd.Timestamp("2025-04-01").date())
+
+    assert out is None
 
 
 def test_get_hog_fundamentals_respects_as_of_date(monkeypatch):

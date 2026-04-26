@@ -59,6 +59,34 @@ pre_market:
   # 目标价位
   fib_levels: [0.236, 0.382, 0.5, 0.618, 0.786]
 
+  # 回测基本面模式：strict 缺少真实历史基本面时不执行反转；proxy 允许代理回放但会在诊断中标记
+  backtest_fundamental_mode: strict
+
+  # 交易管理：趋势单偏向持有波段，反转单保留更多仓位等待极值修复
+  trade_management:
+    strategy_profiles:
+      trend_following:
+        tp1_exit_fraction: 0.33
+        move_stop_to_entry_after_tp1: false
+        post_tp1_stop_policy: risk_buffer
+        post_tp1_stop_r_buffer: 0.25
+        daily_invalidation_policy: reverse_confirmed
+        reverse_score_threshold: 20
+      reversal_fundamental:
+        tp1_exit_fraction: 0.33
+        move_stop_to_entry_after_tp1: false
+    entry_profiles:
+      trend:
+        tp1_exit_fraction: 0.33
+        move_stop_to_entry_after_tp1: false
+        post_tp1_stop_policy: risk_buffer
+        post_tp1_stop_r_buffer: 0.25
+        daily_invalidation_policy: reverse_confirmed
+        reverse_score_threshold: 20
+      reversal:
+        tp1_exit_fraction: 0.33
+        move_stop_to_entry_after_tp1: false
+
 # 基本面筛选门槛与分类
 fundamental_screening:
   default_threshold: 10

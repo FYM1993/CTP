@@ -125,6 +125,96 @@ BUILTIN_CASES: dict[str, BacktestCase] = {
     ),
 }
 
+
+_EXPANDED_TREND_WINDOW_SPECS: tuple[tuple[str, str, str, date, date, str], ...] = (
+    ("jm0_q1_2025", "JM0", "焦煤", date(2025, 1, 1), date(2025, 3, 1), "黑色链一季度趋势窗口"),
+    ("jm0_mar_apr_2025", "JM0", "焦煤", date(2025, 3, 2), date(2025, 4, 30), "黑色链春季趋势窗口"),
+    ("au0_mar_may_2025", "AU0", "黄金", date(2025, 3, 28), date(2025, 5, 26), "贵金属趋势窗口"),
+    ("ag0_aug_oct_2025", "AG0", "白银", date(2025, 8, 29), date(2025, 10, 27), "贵金属趋势窗口"),
+    ("bu0_q1_2025", "BU0", "沥青", date(2025, 1, 1), date(2025, 3, 1), "能化趋势窗口"),
+    ("fu0_q1_2025", "FU0", "燃料油", date(2025, 1, 1), date(2025, 3, 1), "能化趋势窗口"),
+    ("sc0_q1_2025", "SC0", "原油", date(2025, 1, 1), date(2025, 3, 1), "能源趋势窗口"),
+    ("ss0_jan_may_2025", "SS0", "不锈钢", date(2025, 1, 1), date(2025, 5, 1), "有色链趋势窗口"),
+    ("ao0_may_jun_2025", "AO0", "氧化铝", date(2025, 5, 1), date(2025, 6, 29), "有色链趋势窗口"),
+    ("si0_may_jun_2025", "SI0", "工业硅", date(2025, 5, 1), date(2025, 6, 29), "新能源材料趋势窗口"),
+    ("sp0_may_jun_2025", "SP0", "纸浆", date(2025, 5, 1), date(2025, 6, 29), "轻工趋势窗口"),
+    ("jd0_q1_2025", "JD0", "鸡蛋", date(2025, 1, 1), date(2025, 3, 1), "农产品趋势窗口"),
+    ("ap0_aug_oct_2025", "AP0", "苹果", date(2025, 8, 29), date(2025, 10, 27), "农产品趋势窗口"),
+    ("sa0_mar_apr_2025", "SA0", "纯碱", date(2025, 3, 2), date(2025, 4, 30), "建材化工趋势窗口"),
+    ("cs0_mar_apr_2025", "CS0", "淀粉", date(2025, 3, 2), date(2025, 4, 30), "农产品加工趋势窗口"),
+    ("sh0_q1_2025", "SH0", "烧碱", date(2025, 1, 1), date(2025, 3, 1), "化工趋势窗口"),
+)
+
+
+def _expanded_trend_cases() -> tuple[BacktestCase, ...]:
+    cases: list[BacktestCase] = []
+    for label, symbol, name, start_dt, end_dt, note in _EXPANDED_TREND_WINDOW_SPECS:
+        for direction in ("long", "short"):
+            cases.append(
+                BacktestCase(
+                    case_id=f"{symbol.lower()}_trend_{direction}_{label.removeprefix(symbol.lower() + '_')}",
+                    symbol=symbol,
+                    name=name,
+                    direction=direction,
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    strategy_family=STRATEGY_TREND,
+                    note=f"{note}：{direction}",
+                )
+            )
+    return tuple(cases)
+
+
+EXPANDED_TREND_CASES = _expanded_trend_cases()
+BUILTIN_CASES.update({case.case_id: case for case in EXPANDED_TREND_CASES})
+
+
+_LONG_TREND_CORE_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("JM0", "焦煤", "黑色链长历史趋势样本"),
+    ("AU0", "黄金", "贵金属长历史趋势样本"),
+    ("AG0", "白银", "贵金属长历史趋势样本"),
+    ("BU0", "沥青", "能化长历史趋势样本"),
+    ("FU0", "燃料油", "能化长历史趋势样本"),
+    ("SC0", "原油", "能源长历史趋势样本"),
+    ("SS0", "不锈钢", "有色链长历史趋势样本"),
+    ("AP0", "苹果", "农产品长历史趋势样本"),
+    ("SA0", "纯碱", "建材化工长历史趋势样本"),
+    ("CS0", "淀粉", "农产品加工长历史趋势样本"),
+)
+
+
+def _long_trend_core_cases() -> tuple[BacktestCase, ...]:
+    cases: list[BacktestCase] = []
+    for symbol, name, note in _LONG_TREND_CORE_SPECS:
+        for direction in ("long", "short"):
+            cases.append(
+                BacktestCase(
+                    case_id=f"{symbol.lower()}_trend_{direction}_2022_2025",
+                    symbol=symbol,
+                    name=name,
+                    direction=direction,
+                    start_dt=date(2022, 1, 1),
+                    end_dt=date(2025, 12, 31),
+                    strategy_family=STRATEGY_TREND,
+                    note=f"{note}：2022-2025 {direction}",
+                )
+            )
+    return tuple(cases)
+
+
+LONG_TREND_CORE_CASES = _long_trend_core_cases()
+BUILTIN_CASES.update({case.case_id: case for case in LONG_TREND_CORE_CASES})
+
+CASE_GROUPS: dict[str, tuple[str, ...]] = {
+    "expanded_trend_cached": tuple(case.case_id for case in EXPANDED_TREND_CASES),
+    "long_trend_core": tuple(case.case_id for case in LONG_TREND_CORE_CASES),
+    "trend_cached": (
+        "lh0_trend_short",
+        "ps0_trend_long",
+        *(case.case_id for case in EXPANDED_TREND_CASES),
+    ),
+}
+
 CASE_ALIASES = {
     "lh0_long": "lh0_reversal_long",
     "lh0_short": "lh0_trend_short",
@@ -139,3 +229,7 @@ def get_case(case_id: str) -> BacktestCase:
     if resolved_case_id == case_id:
         return case
     return replace(case, case_id=case_id)
+
+
+def get_case_group(group_id: str) -> list[BacktestCase]:
+    return [get_case(case_id) for case_id in CASE_GROUPS[group_id]]
