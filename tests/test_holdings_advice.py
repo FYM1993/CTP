@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
-from openpyxl import Workbook
+import pytest
+from openpyxl import Workbook, load_workbook
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
@@ -58,6 +60,206 @@ def test_load_holding_contexts_pairs_rows_and_normalizes_direction(tmp_path: Pat
     assert contexts[0]["record_id"] == "H001"
     assert contexts[0]["holding"]["direction"] == "long"
     assert contexts[0]["recommendation"]["direction"] == "long"
+
+
+def test_load_holding_contexts_autofills_original_recommendation_from_json(tmp_path: Path) -> None:
+    workbook = Workbook()
+    holdings_sheet = workbook.active
+    holdings_sheet.title = "持仓录入"
+    holdings_sheet.append(["记录ID", "合约代码", "品种名称", "方向", "手数", "开仓均价", "开仓日期", "推荐日期", "备注"])
+    holdings_sheet.append(["H001-持仓", "LH0", "生猪", "做多", 1, 11480, "2026-04-23", "2026-04-22", ""])
+
+    recommendation_sheet = workbook.create_sheet("原始推荐")
+    recommendation_sheet.append(
+        [
+            "记录ID",
+            "推荐日期",
+            "推荐时间",
+            "合约代码",
+            "品种名称",
+            "方向",
+            "计划类型",
+            "策略类型",
+            "入场触发",
+            "确认详情",
+            "确认低点",
+            "确认高点",
+            "执行剧本",
+            "市场阶段",
+            "原始入场价",
+            "原始第一止损位",
+            "原始止损位",
+            "原始第一止盈位",
+            "原始止盈位",
+            "原始第一止盈RR",
+            "原始准入RR",
+            "Phase2分",
+            "原始交易故事摘要",
+            "备注",
+        ]
+    )
+    path = tmp_path / "holdings-2026-04-23.xlsx"
+    workbook.save(path)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    (reports_dir / "2026-04-22_targets.json").write_text(
+        json.dumps(
+            {
+                "date": "2026-04-22",
+                "targets": [
+                    {
+                        "symbol": "LH0",
+                        "name": "生猪",
+                        "direction": "long",
+                        "strategy_family": "trend_following",
+                        "entry_family": "trend",
+                        "entry_signal_type": "Pullback",
+                        "entry_signal_detail": "markup 阶段顺势回踩",
+                        "selected_playbook": "trend_pullback",
+                        "market_stage": "clear_trend",
+                        "entry": 11490.0,
+                        "first_stop": 11160.0,
+                        "stop": 11142.0,
+                        "tp1": 12265.0,
+                        "tp2": 12445.0,
+                        "rr": 2.22,
+                        "admission_rr": 2.74,
+                        "score": 36.5,
+                        "phase1_reason_summary": "价格/OI共振上行",
+                        "reversal_status": {
+                            "signal_bar": {"low": 11380.0, "high": 11600.0}
+                        },
+                    }
+                ],
+                "watchlist": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    contexts = load_holding_contexts(path, reports_dir=reports_dir)
+
+    assert len(contexts) == 1
+    recommendation = contexts[0]["recommendation"]
+    assert recommendation["entry_family"] == "trend"
+    assert recommendation["strategy_family"] == "trend_following"
+    assert recommendation["entry_signal_type"] == "Pullback"
+    assert recommendation["entry_signal_detail"] == "markup 阶段顺势回踩"
+    assert recommendation["confirmation_low"] == 11380.0
+    assert recommendation["selected_playbook"] == "trend_pullback"
+    assert recommendation["score"] == 36.5
+
+    saved = load_workbook(path, data_only=True)
+    saved_sheet = saved["原始推荐"]
+    saved_headers = [cell.value for cell in saved_sheet[1]]
+    saved_row = {header: saved_sheet.cell(row=2, column=index + 1).value for index, header in enumerate(saved_headers)}
+    assert saved_row["记录ID"] == "H001-推荐"
+    assert saved_row["入场触发"] == "Pullback"
+    assert saved_row["确认低点"] == 11380.0
+    assert saved_row["原始入场价"] == 11490.0
+
+
+def test_load_holding_contexts_keeps_manual_recommendation_over_json(tmp_path: Path) -> None:
+    workbook = Workbook()
+    holdings_sheet = workbook.active
+    holdings_sheet.title = "持仓录入"
+    holdings_sheet.append(["记录ID", "合约代码", "品种名称", "方向", "手数", "开仓均价", "开仓日期", "推荐日期", "备注"])
+    holdings_sheet.append(["H001-持仓", "LH0", "生猪", "做多", 1, 11480, "2026-04-23", "2026-04-22", ""])
+
+    recommendation_sheet = workbook.create_sheet("原始推荐")
+    recommendation_sheet.append(
+        [
+            "记录ID",
+            "推荐日期",
+            "推荐时间",
+            "合约代码",
+            "品种名称",
+            "方向",
+            "计划类型",
+            "策略类型",
+            "入场触发",
+            "确认详情",
+            "确认低点",
+            "确认高点",
+            "执行剧本",
+            "市场阶段",
+            "原始入场价",
+            "原始第一止损位",
+            "原始止损位",
+            "原始第一止盈位",
+            "原始止盈位",
+            "原始第一止盈RR",
+            "原始准入RR",
+            "Phase2分",
+            "原始交易故事摘要",
+            "备注",
+        ]
+    )
+    recommendation_sheet.append(
+        [
+            "H001-推荐",
+            "2026-04-22",
+            "",
+            "LH0",
+            "生猪",
+            "做多",
+            "趋势",
+            "",
+            "ManualSignal",
+            "用户手填确认",
+            11200.0,
+            "",
+            "",
+            "",
+            11500.0,
+            "",
+            11100.0,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+    path = tmp_path / "holdings-2026-04-23.xlsx"
+    workbook.save(path)
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    (reports_dir / "2026-04-22_targets.json").write_text(
+        json.dumps(
+            {
+                "date": "2026-04-22",
+                "targets": [
+                    {
+                        "symbol": "LH0",
+                        "name": "生猪",
+                        "direction": "long",
+                        "entry_family": "trend",
+                        "entry_signal_type": "Pullback",
+                        "entry_signal_detail": "JSON确认",
+                        "entry": 11490.0,
+                        "stop": 11142.0,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    contexts = load_holding_contexts(path, reports_dir=reports_dir)
+
+    recommendation = contexts[0]["recommendation"]
+    assert recommendation["entry_signal_type"] == "ManualSignal"
+    assert recommendation["entry_signal_detail"] == "用户手填确认"
+    assert recommendation["confirmation_low"] == 11200.0
+    assert recommendation["entry"] == 11500.0
+    assert recommendation["stop"] == 11100.0
 
 
 def test_analyze_holding_record_marks_raise_stop_when_current_stop_improves() -> None:
@@ -137,6 +339,167 @@ def test_analyze_holding_record_marks_exit_when_trade_story_invalidates() -> Non
 
     assert result["action"] == "平仓"
     assert "原有顺势逻辑已失效" in result["reason"]
+
+
+def test_analyze_holding_record_exits_when_reversal_confirmation_level_breaks() -> None:
+    result = analyze_holding_record(
+        holding={
+            "record_id": "H003",
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "size": 1,
+            "entry_price": 11450.0,
+        },
+        recommendation={
+            "entry_family": "reversal",
+            "entry_signal_type": "Spring",
+            "confirmation_low": 11200.0,
+            "entry": 11450.0,
+            "first_stop": 11050.0,
+            "stop": 11050.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        current_plan={
+            "entry": 11190.0,
+            "first_stop": 11050.0,
+            "stop": 11050.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 5.0,
+            "admission_rr": 6.0,
+        },
+        hold_eval={"hold_valid": True, "story_family": "reversal"},
+        current_price=11190.0,
+        minimum_tick=1.0,
+    )
+
+    assert result["action"] == "平仓"
+    assert "原反转确认位11200已失守" in result["reason"]
+
+
+def test_analyze_holding_record_exits_when_trend_pullback_confirmation_level_breaks() -> None:
+    result = analyze_holding_record(
+        holding={
+            "record_id": "H004",
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "size": 1,
+            "entry_price": 11450.0,
+        },
+        recommendation={
+            "entry_family": "trend",
+            "entry_signal_type": "Pullback",
+            "confirmation_low": 11380.0,
+            "entry": 11450.0,
+            "first_stop": 11128.0,
+            "stop": 11128.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        current_plan={
+            "entry": 11370.0,
+            "first_stop": 11128.0,
+            "stop": 11128.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 6.0,
+            "admission_rr": 7.0,
+        },
+        hold_eval={"hold_valid": True, "story_family": "trend"},
+        current_price=11370.0,
+        minimum_tick=1.0,
+    )
+
+    assert result["action"] == "平仓"
+    assert "原趋势回踩确认位11380已失守" in result["reason"]
+
+
+def test_analyze_holding_record_uses_conservative_wording_when_story_snapshot_missing() -> None:
+    result = analyze_holding_record(
+        holding={
+            "record_id": "H005",
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "size": 1,
+            "entry_price": 11450.0,
+        },
+        recommendation={
+            "entry": 11450.0,
+            "first_stop": 11128.0,
+            "stop": 11128.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        current_plan={
+            "entry": 11405.0,
+            "first_stop": 11128.0,
+            "stop": 11128.0,
+            "tp1": 12265.0,
+            "tp2": 12445.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        hold_eval={"hold_valid": True, "snapshot_missing": True},
+        current_price=11405.0,
+        minimum_tick=1.0,
+    )
+
+    assert result["action"] == "继续持有"
+    assert "缺少原始交易剧本" in result["reason"]
+
+
+def test_analyze_holding_record_reduces_when_current_stop_risk_exceeds_account_cap() -> None:
+    result = analyze_holding_record(
+        holding={
+            "record_id": "H006",
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "size": 4,
+            "entry_price": 11450.0,
+        },
+        recommendation={
+            "entry_family": "trend",
+            "entry": 11450.0,
+            "first_stop": 11100.0,
+            "stop": 11100.0,
+            "tp1": 12200.0,
+            "tp2": 12400.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        current_plan={
+            "entry": 11400.0,
+            "first_stop": 11100.0,
+            "stop": 11100.0,
+            "tp1": 12200.0,
+            "tp2": 12400.0,
+            "rr": 2.70,
+            "admission_rr": 3.29,
+        },
+        hold_eval={"hold_valid": True, "story_family": "trend"},
+        current_price=11400.0,
+        minimum_tick=1.0,
+        account_equity=1_000_000.0,
+        risk_per_trade_pct=0.015,
+        contract_multiplier=16.0,
+    )
+
+    assert result["action"] == "减仓观察"
+    assert result["management_action"] == "减仓"
+    assert result["risk_control"]["risk_budget"] == pytest.approx(15_000.0)
+    assert result["risk_control"]["max_safe_size"] == 3
+    assert "当前到止损" in result["reason"]
 
 
 def test_analyze_holding_record_marks_exit_when_long_position_hits_original_stop() -> None:

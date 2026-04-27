@@ -632,7 +632,7 @@ def test_build_candidate_keeps_hog_reversal_high_when_spot_is_still_low(monkeypa
     assert "反转候选" in cand["labels"] or "双标签候选" in cand["labels"]
 
 
-def test_build_candidate_keeps_structural_distress_reversal_high_after_small_rebound(monkeypatch) -> None:
+def test_build_candidate_does_not_keep_structural_distress_reversal_high_without_turn(monkeypatch) -> None:
     dates = pd.date_range("2025-01-01", periods=120, freq="D")
     closes = [42000.0] * 120
     df = pd.DataFrame(
@@ -701,8 +701,101 @@ def test_build_candidate_keeps_structural_distress_reversal_high_after_small_reb
     )
 
     assert cand is not None
-    assert cand["reversal_score"] >= 60.0
-    assert "反转候选" in cand["labels"] or "双标签候选" in cand["labels"]
+    assert cand["reversal_score"] < 60.0
+    assert "反转候选" not in cand["labels"]
+    drivers = cand["phase1_score_details"]["reversal"]["drivers"]
+    assert not any("过剩/高库存" in item for item in drivers)
+
+
+def test_build_candidate_does_not_turn_unrelieved_high_inventory_into_long_reversal(monkeypatch) -> None:
+    dates = pd.date_range("2026-01-01", periods=120, freq="D")
+    closes = [100.0] * 120
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": closes,
+            "low": closes,
+            "close": closes,
+            "volume": [1000.0] * 120,
+            "oi": [5000.0] * 120,
+        }
+    )
+
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_price_stats",
+        lambda frame: {
+            "price": 100.0,
+            "range_pct": 20.0,
+            "price_percentile_300d": 20.0,
+            "price_percentile_full": 20.0,
+            "low_persistence_days": 25,
+            "high_persistence_days": 0,
+        },
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "_historical_proxy_scores",
+        lambda *, df, stats: (
+            {
+                "reversal_up": 0.0,
+                "reversal_down": 0.0,
+                "trend_up": 0.0,
+                "trend_down": 43.0,
+            },
+            [("历史代理:价格/OI共振下行", 100.0)],
+        ),
+    )
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "build_fundamental_snapshot",
+        lambda **kwargs: {
+            "evidence_domains_present": ["inventory"],
+            "evidence_domains_missing": ["spot_basis"],
+            "coverage_score": 0.75,
+            "coverage_status": "partial",
+            "extreme_state_direction": "long",
+            "extreme_state_confirmed": True,
+            "extreme_state_reasons": ["高库存", "累库"],
+            "marginal_turn_direction": "",
+            "marginal_turn_confirmed": False,
+            "marginal_turn_reasons": [],
+            "fundamental_reversal_confirmed": False,
+            "only_proxy_evidence": False,
+            "raw_details": {
+                "inventory": {
+                    "inv_now": 12580.0,
+                    "inv_change_4wk": 19.0,
+                    "inv_cumulating_weeks": 4,
+                    "inv_percentile": 78.8,
+                    "inv_trend": "累库",
+                },
+            },
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(phase1_pipeline, "get_hog_fundamentals", lambda as_of_date=None: None)
+    monkeypatch.setattr(
+        phase1_pipeline,
+        "get_oi_structure",
+        lambda frame: {"oi_vs_price": "增仓下跌", "oi_20d_change": 57.8, "oi_percentile": 72.4},
+    )
+
+    rows = phase1_pipeline.build_phase1_candidates(
+        all_data={"PS0": df},
+        symbols=[{"symbol": "PS0", "name": "多晶硅", "exchange": "gfex"}],
+        threshold=10.0,
+        config={"fundamental_screening": {"top_n": 5, "default_threshold": 10}},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["trend_direction"] == "short"
+    assert row["reversal_score"] < 60.0
+    assert "反转候选" not in row["labels"]
+    drivers = row["phase1_score_details"]["reversal"]["drivers"]
+    assert not any("过剩/高库存" in item for item in drivers)
 
 
 def test_build_candidate_uses_supply_pressure_as_short_reversal_driver(monkeypatch) -> None:
@@ -1594,7 +1687,7 @@ def test_run_dual_strategy_phase2_merges_results_with_strategy_family(monkeypatc
         "reversal_fundamental",
     }
     assert watchlist == []
-    assert set(grouped.keys()) == {"reversal_fundamental", "trend_following"}
+    assert set(grouped.keys()) == {"reversal_fundamental", "trend_following", "phase2_pre_sizing"}
 
 
 def test_run_dual_strategy_phase2_merges_same_direction_strategy_hits_into_one_playbook(monkeypatch) -> None:
@@ -2824,6 +2917,132 @@ def test_run_strategy_phase2_passes_position_contract_specs_to_plan_builder(monk
     assert watchlist == []
     assert seen_cfgs[0]["contract_specs"]["PS0"]["multiplier"] == 3
     assert seen_cfgs[0]["contract_specs"]["PS0"]["margin_rate"] == 0.12
+
+
+def test_run_dual_strategy_phase2_sizes_lots_by_phase2_weight_margin_pool_and_stop_risk(monkeypatch) -> None:
+    trend_rows = [
+        {
+            "symbol": "AU0",
+            "name": "黄金",
+            "direction": "long",
+            "strategy_family": "trend_following",
+            "entry_family": "trend",
+            "actionable": True,
+            "score": 80.0,
+            "rrf_score": 0.2,
+            "entry": 800.0,
+            "stop": 790.0,
+            "tp1": 830.0,
+            "tp2": 850.0,
+            "rr": 3.0,
+            "admission_rr": 5.0,
+            "margin_per_lot": 100_000.0,
+            "risk_per_lot": 10_000.0,
+            "max_lots_by_risk": 4,
+        },
+        {
+            "symbol": "AG0",
+            "name": "白银",
+            "direction": "long",
+            "strategy_family": "trend_following",
+            "entry_family": "trend",
+            "actionable": True,
+            "score": 40.0,
+            "rrf_score": 0.1,
+            "entry": 8000.0,
+            "stop": 7900.0,
+            "tp1": 8300.0,
+            "tp2": 8500.0,
+            "rr": 3.0,
+            "admission_rr": 5.0,
+            "margin_per_lot": 50_000.0,
+            "risk_per_lot": 7_000.0,
+            "max_lots_by_risk": 1,
+        },
+    ]
+
+    monkeypatch.setattr(daily_workflow, "run_trend_strategy_phase2", lambda *args, **kwargs: (trend_rows, []))
+    monkeypatch.setattr(daily_workflow, "run_reversal_strategy_phase2", lambda *args, **kwargs: ([], []))
+
+    actionable, watchlist, grouped = daily_workflow.run_dual_strategy_phase2(
+        [],
+        [],
+        {
+            "pre_market": {
+                "account_equity": 1_000_000.0,
+                "portfolio_max_margin_pct": 0.30,
+                "risk_per_trade_pct": 0.015,
+            }
+        },
+        max_picks=6,
+    )
+
+    rows = {row["symbol"]: row for row in actionable}
+    assert watchlist == []
+    assert rows["AU0"]["score_lots"] == 2
+    assert rows["AU0"]["portfolio_lots"] == 3
+    assert rows["AU0"]["risk_lots"] == 4
+    assert rows["AU0"]["suggested_lots"] == 2
+    assert rows["AG0"]["score_lots"] == 2
+    assert rows["AG0"]["portfolio_lots"] == 6
+    assert rows["AG0"]["risk_lots"] == 1
+    assert rows["AG0"]["suggested_lots"] == 1
+    pre_sizing = grouped["phase2_pre_sizing"]["actionable"]
+    assert [row["symbol"] for row in pre_sizing] == ["AU0", "AG0"]
+    assert "suggested_lots" not in pre_sizing[0]
+
+
+def test_apply_portfolio_position_sizing_logs_zero_lot_downgrade(monkeypatch) -> None:
+    seen_logs: list[str] = []
+    monkeypatch.setattr(daily_workflow.log, "info", lambda msg, *args: seen_logs.append(msg % args if args else msg))
+
+    rows = [
+        {
+            "symbol": "LH0",
+            "name": "生猪",
+            "direction": "long",
+            "actionable": True,
+            "score": 80.0,
+            "entry": 11000.0,
+            "margin_per_lot": 100_000.0,
+            "risk_per_lot": 20_000.0,
+        }
+    ]
+
+    daily_workflow._apply_portfolio_position_sizing(
+        rows,
+        {
+            "pre_market": {
+                "account_equity": 1_000_000.0,
+                "portfolio_max_margin_pct": 0.30,
+                "risk_per_trade_pct": 0.015,
+            }
+        },
+    )
+
+    assert rows[0]["suggested_lots"] == 0
+    assert rows[0]["actionable"] is False
+    assert any("资金管理" in line and "组合保证金池300000" in line for line in seen_logs)
+    assert any("生猪 (LH0)" in line and "分数仓位3手" in line and "止损风险0手" in line for line in seen_logs)
+    assert any("资金管理降级" in line and "生猪 (LH0)" in line for line in seen_logs)
+
+
+def test_apply_portfolio_position_sizing_logs_when_no_actionable_rows(monkeypatch) -> None:
+    seen_logs: list[str] = []
+    monkeypatch.setattr(daily_workflow.log, "info", lambda msg, *args: seen_logs.append(msg % args if args else msg))
+
+    daily_workflow._apply_portfolio_position_sizing(
+        [],
+        {
+            "pre_market": {
+                "account_equity": 1_000_000.0,
+                "portfolio_max_margin_pct": 0.30,
+                "risk_per_trade_pct": 0.015,
+            }
+        },
+    )
+
+    assert any("资金管理" in line and "无可执行品种" in line for line in seen_logs)
 
 
 def test_run_trend_strategy_phase2_downgrades_when_phase2_scores_reverse_candidate_direction(monkeypatch) -> None:

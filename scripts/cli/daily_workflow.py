@@ -30,6 +30,7 @@
 import time
 import argparse
 import json
+import math
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -68,6 +69,7 @@ from phase3.intraday import print_dashboard
 from wyckoff import assess_reversal_status
 from phase3.live import try_create_phase3_monitor
 from phase1.pipeline import build_phase1_candidates, is_phase1_candidate_eligible, select_top_candidates
+from market.contract_specs import builtin_contract_spec
 from strategy_reversal.screen import select_reversal_candidates
 from strategy_trend.screen import build_trend_universe as build_trend_universe_candidates, select_trend_candidates
 from strategy_reversal import pre_market as reversal_pre_market
@@ -780,6 +782,15 @@ def _pre_market_cfg_for_symbol(config: dict, symbol: str) -> dict:
     return pre_cfg
 
 
+def _contract_multiplier_for_symbol(pre_cfg: dict, symbol: str) -> float:
+    spec = builtin_contract_spec(symbol)
+    raw_specs = pre_cfg.get("contract_specs") or {}
+    configured = raw_specs.get(symbol) if isinstance(raw_specs, dict) else None
+    if isinstance(configured, dict):
+        spec.update(configured)
+    return _as_float(spec.get("multiplier") or pre_cfg.get("contract_multiplier"), 0.0)
+
+
 def _strategy_direction_from_scores(
     *,
     scores: dict,
@@ -1101,6 +1112,111 @@ def _apply_strategy_rrf(rows: list[dict], *, sort_field: str) -> None:
         row["rrf_score"] = 1.0 / (rrf_k + rank_1) + 1.0 / (rrf_k + rank_2)
         row["rank_p1"] = rank_1
         row["rank_p2"] = rank_2
+
+
+def _positive_int_floor(value: float) -> int:
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return max(int(math.floor(value)), 0)
+
+
+def _phase2_position_weight(row: dict) -> float:
+    weight = abs(_as_float(row.get("score"), 0.0))
+    return weight if weight > 0 else 1.0
+
+
+def _apply_portfolio_position_sizing(rows: list[dict], config: dict) -> None:
+    if not rows:
+        log.info("  💰 资金管理: 无可执行品种，跳过仓位分配")
+        return
+    pre_cfg = config.get("pre_market") or {}
+    account_equity = _as_float(pre_cfg.get("account_equity"), 0.0)
+    portfolio_pct = _as_float(pre_cfg.get("portfolio_max_margin_pct") or pre_cfg.get("max_margin_pct"), 0.0)
+    if account_equity <= 0 or portfolio_pct <= 0:
+        return
+
+    margin_pool = max(account_equity * portfolio_pct - _as_float(pre_cfg.get("portfolio_margin_used_cny"), 0.0), 0.0)
+    common_risk_budget = _as_float(pre_cfg.get("risk_per_trade_cny"), 0.0)
+    if common_risk_budget <= 0:
+        common_risk_budget = account_equity * _as_float(pre_cfg.get("risk_per_trade_pct"), 0.0)
+    log.info(
+        "  💰 资金管理: 可执行%d个, 账户权益%.0f, 组合保证金池%.0f, 单笔止损预算%.0f",
+        len(rows),
+        account_equity,
+        margin_pool,
+        common_risk_budget,
+    )
+    weights = [_phase2_position_weight(row) for row in rows]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        total_weight = float(len(rows))
+        weights = [1.0 for _ in rows]
+
+    for row, weight in zip(rows, weights, strict=False):
+        margin_per_lot = _as_float(row.get("margin_per_lot"), 0.0)
+        if margin_per_lot <= 0:
+            entry = _as_float(row.get("entry"), 0.0)
+            multiplier = _as_float(row.get("contract_multiplier"), 0.0)
+            margin_rate = _as_float(row.get("margin_rate"), 0.0)
+            margin_per_lot = entry * multiplier * margin_rate if entry > 0 and multiplier > 0 and margin_rate > 0 else 0.0
+            row["margin_per_lot"] = float(margin_per_lot)
+
+        score_margin_budget = margin_pool * weight / total_weight if total_weight > 0 else 0.0
+        score_lots = _positive_int_floor(score_margin_budget / margin_per_lot) if margin_per_lot > 0 else 0
+        portfolio_lots = _positive_int_floor(margin_pool / margin_per_lot) if margin_per_lot > 0 else 0
+        risk_budget = _as_float(row.get("risk_budget"), 0.0)
+        if risk_budget <= 0:
+            risk_budget = _as_float(pre_cfg.get("risk_per_trade_cny"), 0.0)
+        if risk_budget <= 0:
+            risk_budget = account_equity * _as_float(pre_cfg.get("risk_per_trade_pct"), 0.0)
+        risk_lots = int(row.get("max_lots_by_risk") or row.get("risk_lots") or 0)
+        risk_per_lot = _as_float(row.get("risk_per_lot"), 0.0)
+        if risk_budget > 0 and risk_lots <= 0 and risk_per_lot > 0:
+            risk_lots = _positive_int_floor(risk_budget / risk_per_lot)
+
+        caps = [score_lots, portfolio_lots]
+        if risk_budget > 0:
+            caps.append(risk_lots)
+        suggested_lots = min(caps) if caps else 0
+
+        row["position_weight"] = float(weight)
+        row["position_weight_pct"] = float(weight / total_weight) if total_weight > 0 else 0.0
+        row["portfolio_margin_budget"] = float(margin_pool)
+        row["score_margin_budget"] = float(score_margin_budget)
+        row["risk_budget"] = float(risk_budget)
+        row["score_lots"] = int(score_lots)
+        row["portfolio_lots"] = int(portfolio_lots)
+        row["risk_lots"] = int(risk_lots)
+        row["suggested_lots"] = int(suggested_lots)
+        row["suggested_margin"] = float(suggested_lots * margin_per_lot)
+        row["suggested_stop_risk"] = float(suggested_lots * risk_per_lot)
+        row["phase2_position_size_passed"] = bool(suggested_lots >= 1)
+        log.info(
+            "     %s (%s) Phase2分%.1f 权重%.1f%% 预算%.0f 每手保证金%.0f 每手止损%.0f "
+            "手数: 分数仓位%d手 / 组合上限%d手 / 止损风险%d手 -> 建议%d手",
+            row.get("name") or row.get("symbol") or "",
+            row.get("symbol") or "",
+            _as_float(row.get("score"), 0.0),
+            float(weight / total_weight * 100.0) if total_weight > 0 else 0.0,
+            score_margin_budget,
+            margin_per_lot,
+            risk_per_lot,
+            score_lots,
+            portfolio_lots,
+            risk_lots,
+            suggested_lots,
+        )
+        if suggested_lots < 1:
+            row["actionable"] = False
+            row["downgrade_reason"] = _append_downgrade_reason(
+                str(row.get("downgrade_reason") or ""),
+                "账户仓位和止损风险约束下建议手数为0",
+            )
+            log.info(
+                "     资金管理降级: %s (%s) 建议手数0，移入观察；原因=账户仓位和止损风险约束下建议手数为0",
+                row.get("name") or row.get("symbol") or "",
+                row.get("symbol") or "",
+            )
 
 
 def _run_strategy_phase2(
@@ -1479,6 +1595,12 @@ def run_dual_strategy_phase2(
         reversal_watchlist=reversal_watchlist,
         max_picks=max_picks,
     )
+    phase2_pre_sizing_actionable = [dict(row) for row in actionable]
+    _apply_portfolio_position_sizing(actionable, config)
+    sized_watchlist = [row for row in actionable if not _is_actionable(row)]
+    actionable = [row for row in actionable if _is_actionable(row)]
+    if sized_watchlist:
+        watchlist = sized_watchlist + watchlist
     grouped = {
         STRATEGY_REVERSAL: {
             "actionable": reversal_actionable,
@@ -1487,6 +1609,10 @@ def run_dual_strategy_phase2(
         STRATEGY_TREND: {
             "actionable": trend_actionable,
             "watchlist": trend_watchlist,
+        },
+        "phase2_pre_sizing": {
+            "actionable": phase2_pre_sizing_actionable,
+            "watchlist": [],
         },
     }
     return actionable, watchlist, grouped
@@ -2229,18 +2355,22 @@ def run_phase_4_holdings(
 
     results: list[dict] = []
     actions: dict[str, str] = {}
-    pre_cfg = config.get("pre_market", {})
-
     for context in contexts:
         recommendation = context.get("recommendation")
         if not recommendation:
-            log.warning("  ⚠️ %s: 缺少原始推荐，跳过", context.get("record_id"))
-            continue
+            recommendation = {
+                "record_id": context.get("record_id"),
+                "symbol": (context.get("holding") or {}).get("symbol"),
+                "name": (context.get("holding") or {}).get("name"),
+                "direction": (context.get("holding") or {}).get("direction"),
+                "entry": (context.get("holding") or {}).get("entry_price"),
+            }
 
         holding = dict(context["holding"])
         symbol = str(holding.get("symbol") or "")
         name = str(holding.get("name") or recommendation.get("name") or symbol)
         direction = str(holding.get("direction") or recommendation.get("direction") or "")
+        pre_cfg = _pre_market_cfg_for_symbol(config, symbol)
 
         live_df = live_frames.get(symbol)
         if live_df is None or live_df.empty:
@@ -2258,7 +2388,7 @@ def run_phase_4_holdings(
                 df=live_df,
                 cfg=pre_cfg,
             )
-        else:
+        elif plan_mode == "reversal":
             hold_eval = assess_active_reversal_hold_from_daily_df(
                 symbol=symbol,
                 name=name,
@@ -2266,16 +2396,21 @@ def run_phase_4_holdings(
                 df=live_df,
                 cfg=pre_cfg,
             )
+        else:
+            hold_eval = {"hold_valid": True, "snapshot_missing": True}
 
-        current_plan = _build_strategy_scoped_trade_plan(
-            base_row=recommendation,
-            symbol=symbol,
-            name=name,
-            direction=direction,
-            df=live_df,
-            cfg=pre_cfg,
-            allow_watch_plan=True,
-        ) or {}
+        if plan_mode in {"trend", "reversal"}:
+            current_plan = _build_strategy_scoped_trade_plan(
+                base_row=recommendation,
+                symbol=symbol,
+                name=name,
+                direction=direction,
+                df=live_df,
+                cfg=pre_cfg,
+                allow_watch_plan=True,
+            ) or {}
+        else:
+            current_plan = dict(recommendation)
 
         holding["name"] = name
         result = analyze_holding_record(
@@ -2285,6 +2420,9 @@ def run_phase_4_holdings(
             hold_eval=hold_eval,
             current_price=float(live_df.iloc[-1]["close"]),
             minimum_tick=1.0,
+            account_equity=_as_float(pre_cfg.get("account_equity"), 0.0),
+            risk_per_trade_pct=_as_float(pre_cfg.get("risk_per_trade_pct"), 0.0),
+            contract_multiplier=_contract_multiplier_for_symbol(pre_cfg, symbol),
         )
         result["original_plan_line"] = format_plan_line("原始计划", result["original_plan"])
         result["current_plan_line"] = format_plan_line("当前重评", result["current_plan"])
@@ -2488,6 +2626,7 @@ def save_targets(
     targets: list[dict],
     watchlist: list[dict] | None = None,
     phase1_summary: dict | None = None,
+    phase2_pre_sizing_candidates: list[dict] | None = None,
     grouped_results: dict[str, dict[str, list[dict]]] | None = None,
 ):
     """
@@ -2499,6 +2638,10 @@ def save_targets(
         watchlist = _normalize_phase2_plan_rows(_clean_numpy(watchlist))
     else:
         watchlist = []
+    if phase2_pre_sizing_candidates:
+        phase2_pre_sizing_candidates = _normalize_phase2_plan_rows(_clean_numpy(phase2_pre_sizing_candidates))
+    else:
+        phase2_pre_sizing_candidates = []
     if phase1_summary is None:
         phase1_summary = build_phase1_summary(top_n=max(len(targets), len(watchlist)))
 
@@ -2507,6 +2650,7 @@ def save_targets(
         "date": datetime.now().strftime("%Y-%m-%d"),
         "targets": targets,
         "watchlist": watchlist,
+        "phase2_pre_sizing_candidates": phase2_pre_sizing_candidates,
         "strategy_results": _clean_numpy(grouped_results or {}),
         "phase1_summary": phase1_summary,
     }
@@ -2517,6 +2661,7 @@ def save_targets(
 
     has_actionable = len(targets) > 0
     has_watchlist = len(watchlist) > 0
+    has_phase2_pre_sizing_candidates = len(phase2_pre_sizing_candidates) > 0
 
     lines = [
         f"# 每日交易建议 {now.strftime('%Y-%m-%d')}",
@@ -2537,6 +2682,10 @@ def save_targets(
             "> **方向**由 Phase 2 技术面总分解析得到；Phase 1 只负责给出关注候选、关注分与机会标签。"
             "机会标签描述的是基本面机会类型，不直接等同于最终交易方向。"
         )
+    elif has_phase2_pre_sizing_candidates:
+        lines.append("## 今日无资金管理后可执行/等待确认品种")
+        lines.append("")
+        lines.append("> Phase 2 策略已有候选，但资金管理后没有最终可开仓/等待确认条目。")
     else:
         lines.append("## 今日无信号")
         lines.append("")
@@ -2547,6 +2696,42 @@ def save_targets(
         if val is None:
             return "-"
         return str(val).replace("|", "｜")
+
+    def _format_risk_control_note(t: dict) -> str:
+        try:
+            risk_budget = float(t.get("risk_budget") or 0.0)
+            risk_per_lot = float(t.get("risk_per_lot") or 0.0)
+            score_margin_budget = float(t.get("score_margin_budget") or 0.0)
+            score_lots = int(t.get("score_lots") or 0)
+            portfolio_lots = int(t.get("portfolio_lots") or 0)
+            risk_lots = int(t.get("risk_lots") or 0)
+            suggested_lots = int(t.get("suggested_lots") or 0)
+            margin_per_lot = float(t.get("margin_per_lot") or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if score_margin_budget > 0 or score_lots > 0 or portfolio_lots > 0 or risk_lots > 0:
+            note = (
+                f"Phase2权重预算{score_margin_budget:.0f}元，"
+                f"分数仓位{score_lots}手，组合上限{portfolio_lots}手"
+            )
+            if risk_budget > 0:
+                note += f"，止损风险上限{risk_lots}手"
+            note += f"，建议{suggested_lots}手"
+            if margin_per_lot > 0:
+                note += f"；每手保证金约{margin_per_lot:.0f}元"
+            if risk_per_lot > 0:
+                note += f"，每手止损约{risk_per_lot:.0f}元"
+            return note
+        if risk_budget <= 0 or risk_per_lot <= 0:
+            return ""
+        if suggested_lots > 0:
+            lots_text = f"建议不超过{suggested_lots}手"
+        else:
+            lots_text = "当前不满足单笔止损预算"
+        note = f"单笔止损预算{risk_budget:.0f}元，每手止损约{risk_per_lot:.0f}元，{lots_text}"
+        if margin_per_lot > 0:
+            note += f"；每手保证金约{margin_per_lot:.0f}元"
+        return note
 
     def _build_fund_str(t):
         fp = []
@@ -2566,6 +2751,48 @@ def save_targets(
         if fd and not any(fd in p for p in fp):
             fp.append(fd)
         return ", ".join(fp) if fp else "-"
+
+    def _phase2_pre_sizing_status(row: dict, final_status: dict[str, str]) -> str:
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol in final_status:
+            return final_status[symbol]
+        return "资金管理后未保留"
+
+    def _render_phase2_pre_sizing_pool() -> None:
+        if not phase2_pre_sizing_candidates:
+            return
+        final_status = {
+            str(row.get("symbol") or ""): "最终可执行"
+            for row in targets
+            if str(row.get("symbol") or "")
+        }
+        final_status.update(
+            {
+                str(row.get("symbol") or ""): "资金管理后观察/等待确认"
+                for row in watchlist
+                if str(row.get("symbol") or "")
+            }
+        )
+        lines.append("")
+        lines.append("## Phase2资金管理前候选池")
+        lines.append("")
+        lines.append("| 合约 | 代码 | 方向 | P2分 | 入场 | 止损 | 止盈1 | RR | 每手保证金 | 每手止损 | 后续状态 |")
+        lines.append("| :--- | :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |")
+        for row in phase2_pre_sizing_candidates:
+            name = _md_cell(f"{row.get('name', row.get('symbol', ''))}(主力)")
+            symbol = _md_cell(row.get("symbol") or "")
+            direction = _direction_cn(str(row.get("direction") or ""))
+            lines.append(
+                f"| {name} | {symbol} | {direction} "
+                f"| {_as_float(row.get('score')):+.0f} "
+                f"| {_as_float(row.get('entry')):.0f} "
+                f"| {_as_float(row.get('stop')):.0f} "
+                f"| {_as_float(row.get('tp1')):.0f} "
+                f"| {_as_float(row.get('rr')):.2f} "
+                f"| {_as_float(row.get('margin_per_lot')):.0f} "
+                f"| {_as_float(row.get('risk_per_lot')):.0f} "
+                f"| {_phase2_pre_sizing_status(row, final_status)} |"
+            )
 
     def _fundamental_domain_list(domains) -> str:
         labels = [
@@ -2627,10 +2854,10 @@ def save_targets(
     if targets:
         lines.append("")
         lines.append(
-            "| 状态 | 合约 | 方向 | 关注理由 | 当前价 | 交易故事确认 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
+            "| 状态 | 合约 | 方向 | 建议手数 | 关注理由 | 当前价 | 交易故事确认 | 入场价 | 止损 | 止盈1 | 盈亏比 | RRF | #P1 | #P2 | 关注分 | P2分 | 信号强度 | 机会标签 | Phase1摘要 |"
         )
         lines.append(
-            "| :---: | :--- | :---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |"
+            "| :---: | :--- | :---: | ---: | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |"
         )
         for t in targets:
             signal_str = _format_entry_signal_for_table(t)
@@ -2645,9 +2872,10 @@ def save_targets(
             rrf_cell = _md_cell(f"**{rrf:.4f}**")
             name_cell = _md_cell(f"{t['name']}(主力)")
             dir_cell = _md_cell(dir_icon)
+            suggested_lots = int(t.get("suggested_lots") or 0)
             lines.append(
                 f"| {_md_cell('✅可执行')} | {name_cell} | {dir_cell} "
-                f"| {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
+                f"| {suggested_lots}手 | {epr} | {t['price']:.0f} | {_md_cell(signal_str)} | {t['entry']:.0f} | {t['stop']:.0f} "
                 f"| {t['tp1']:.0f} | {t['rr']:.2f} "
                 f"| {rrf_cell} | {r1} | {r2} "
                 f"| {t.get('attention_score', t.get('fund_screen_score', 0)):+.1f} | {t.get('score', 0):+.1f} "
@@ -2680,6 +2908,8 @@ def save_targets(
                 f"| {t.get('attention_score', t.get('fund_screen_score', 0)):+.1f} | {t.get('score', 0):+.1f} "
                 f"| {ss:.2f} | {_md_cell(phase1_labels)} | {phase1_summary} |"
             )
+
+    _render_phase2_pre_sizing_pool()
 
     lines.append("")
     lines.append("## 评分说明")
@@ -2888,6 +3118,9 @@ def save_targets(
             management_note = str(t.get("management_note") or "")
             if management_note:
                 lines.append(f"- 仓位管理: {_md_cell(management_note)}")
+            risk_note = _format_risk_control_note(t)
+            if risk_note:
+                lines.append(f"- 仓位建议: {_md_cell(risk_note)}")
         else:
             lines.append(f"**交易故事确认**: {_format_entry_signal_for_detail(t)}")
             lines.append(f"- 当前阶段: {_md_cell(rev.get('current_stage', '未知'))}")
@@ -3171,6 +3404,7 @@ def main():
         actionable,
         top_watch,
         phase1_summary=phase1_summary,
+        phase2_pre_sizing_candidates=(grouped_results.get("phase2_pre_sizing") or {}).get("actionable") or [],
         grouped_results=grouped_results,
     )
 

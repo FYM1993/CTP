@@ -24,6 +24,7 @@ from shared.ctp_log import get_log_path, get_logger
 from shared.config_loader import load_yaml_config
 from shared.strategy import STRATEGY_REVERSAL, STRATEGY_TREND
 from data_cache import get_completed_daily as get_daily
+from market.contract_specs import builtin_contract_spec
 from phase2.direction import choose_phase2_direction as _choose_phase2_direction
 
 log = get_logger("pre_market")
@@ -429,9 +430,12 @@ def _stop_risk_pct(direction: str, *, entry: float, stop: float) -> float:
 
 
 def _contract_spec_for_symbol(symbol: str, cfg: dict) -> dict:
+    out = builtin_contract_spec(symbol)
     specs = cfg.get("contract_specs") or {}
     spec = specs.get(symbol) if isinstance(specs, dict) else None
-    return spec if isinstance(spec, dict) else {}
+    if isinstance(spec, dict):
+        out.update(spec)
+    return out
 
 
 def _risk_budget_from_config(cfg: dict) -> float:
@@ -471,12 +475,23 @@ def _risk_gate_details(
         passed = False
         reasons.append(f"止损距离{risk_pct:.1%}超过单笔风险上限{max_loss_pct:.1%}")
 
+    risk_budget = _risk_budget_from_config(cfg)
     spec = _contract_spec_for_symbol(symbol, cfg)
-    multiplier = float(spec.get("multiplier") or cfg.get("contract_multiplier") or 1.0)
-    margin_rate = float(spec.get("margin_rate") or cfg.get("margin_rate") or 0.0)
+    raw_multiplier = spec.get("multiplier") or cfg.get("contract_multiplier")
+    raw_margin_rate = spec.get("margin_rate") or cfg.get("margin_rate")
+    try:
+        multiplier = float(raw_multiplier)
+    except (TypeError, ValueError):
+        multiplier = 0.0
+    try:
+        margin_rate = float(raw_margin_rate)
+    except (TypeError, ValueError):
+        margin_rate = 0.0
+    if risk_budget > 0 and multiplier <= 0:
+        passed = False
+        reasons.append("缺少合约乘数，无法计算每手止损风险")
     stop_distance = max(abs(float(entry) - float(stop)), 0.0)
     risk_per_lot = stop_distance * max(multiplier, 0.0)
-    risk_budget = _risk_budget_from_config(cfg)
 
     max_lots_by_risk = 0
     if risk_budget > 0 and risk_per_lot > 0:
@@ -489,6 +504,10 @@ def _risk_gate_details(
     account_equity = float(cfg.get("account_equity") or 0.0)
     max_lots_by_margin = 0
     max_margin_pct = float(cfg.get("max_margin_pct") or 0.0)
+    portfolio_max_margin_pct = float(cfg.get("portfolio_max_margin_pct") or 0.0)
+    if account_equity > 0 and (max_margin_pct > 0 or portfolio_max_margin_pct > 0) and margin_rate <= 0:
+        passed = False
+        reasons.append("缺少保证金率，无法计算保证金占用")
     if account_equity > 0 and max_margin_pct > 0 and margin_per_lot > 0:
         max_margin = account_equity * max_margin_pct
         max_lots_by_margin = _positive_int_floor(max_margin / margin_per_lot)
@@ -497,7 +516,6 @@ def _risk_gate_details(
             reasons.append(f"单笔保证金需求{margin_per_lot:.0f}超过保证金上限{max_margin:.0f}")
 
     max_lots_by_portfolio = 0
-    portfolio_max_margin_pct = float(cfg.get("portfolio_max_margin_pct") or 0.0)
     portfolio_margin_used = float(cfg.get("portfolio_margin_used_cny") or 0.0)
     if account_equity > 0 and portfolio_max_margin_pct > 0 and margin_per_lot > 0:
         remaining_margin = account_equity * portfolio_max_margin_pct - portfolio_margin_used

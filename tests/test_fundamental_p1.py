@@ -150,6 +150,59 @@ def test_save_targets_writes_phase1_summary_to_payload(monkeypatch, tmp_path) ->
     ]
 
 
+def test_save_targets_keeps_phase2_pre_sizing_pool_when_money_management_removes_final_trade(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(daily_workflow, "RESULT_DIR", tmp_path)
+    monkeypatch.setattr(daily_workflow, "_today_json_path", lambda: tmp_path / "2026-04-16_targets.json")
+    monkeypatch.setattr(daily_workflow, "_today_md_path", lambda: tmp_path / "2026-04-16_targets.md")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 4, 16, 9, 30)
+
+    monkeypatch.setattr(daily_workflow, "datetime", FixedDateTime)
+
+    phase2_pre_sizing_candidates = [
+        {
+            "symbol": "UR0",
+            "name": "尿素",
+            "direction": "long",
+            "strategy_family": "trend_following",
+            "entry_family": "trend",
+            "actionable": True,
+            "score": 55.0,
+            "entry": 1810.0,
+            "stop": 1760.0,
+            "tp1": 1920.0,
+            "tp2": 1980.0,
+            "rr": 2.2,
+            "admission_rr": 3.4,
+            "margin_per_lot": 43440.0,
+            "risk_per_lot": 1000.0,
+            "entry_signal_type": "Pullback",
+        },
+    ]
+
+    summary = daily_workflow.build_phase1_summary(6, "attention_score", "labels")
+    daily_workflow.save_targets(
+        [],
+        [],
+        phase1_summary=summary,
+        phase2_pre_sizing_candidates=phase2_pre_sizing_candidates,
+    )
+
+    payload = json.loads((tmp_path / "2026-04-16_targets.json").read_text(encoding="utf-8"))
+    md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert len(payload["phase2_pre_sizing_candidates"]) == 1
+    assert "## 今日无资金管理后可执行/等待确认品种" in md_text
+    assert "## Phase2资金管理前候选池" in md_text
+    assert "| 尿素(主力) | UR0 | 做多 | +55 | 1810 | 1760 | 1920 | 2.20 | 43440 | 1000 | 资金管理后未保留 |" in md_text
+    assert "今日无信号" not in md_text
+
+
 def test_save_targets_does_not_emit_obsolete_phase1_direction_risk_flags(
     monkeypatch,
     tmp_path,
@@ -253,6 +306,14 @@ def test_save_targets_renders_downgrade_and_extended_target_notes(monkeypatch, t
             "entry_family": "reversal",
             "entry_plan_type": "extended_target",
             "management_note": "第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈",
+            "risk_budget": 15000.0,
+            "risk_per_lot": 4800.0,
+            "score_margin_budget": 150000.0,
+            "score_lots": 3,
+            "portfolio_lots": 13,
+            "risk_lots": 3,
+            "suggested_lots": 3,
+            "margin_per_lot": 21800.0,
             "phase2_rr_gate_passed": True,
             "reversal_status": {
                 "has_signal": True,
@@ -311,8 +372,13 @@ def test_save_targets_renders_downgrade_and_extended_target_notes(monkeypatch, t
     daily_workflow.save_targets(targets, watchlist, phase1_summary=summary)
 
     md_text = (tmp_path / "2026-04-16_targets.md").read_text(encoding="utf-8")
+    assert "| ✅可执行 | 生猪(主力) | 🟢 做多 | 3手 |" in md_text
     assert "- 计划类型: 依赖第二止盈的延展计划" in md_text
     assert "- 仓位管理: 第一止盈附近减仓或收紧保护止损，剩余仓位才看第二止盈" in md_text
+    assert (
+        "- 仓位建议: Phase2权重预算150000元，分数仓位3手，组合上限13手，"
+        "止损风险上限3手，建议3手；每手保证金约21800元，每手止损约4800元"
+    ) in md_text
     assert "价格跌回突破位44350下方；基本面方向做空与交易方向做多冲突" in md_text
     assert "确认于2026-04-15触发，但未达执行条件" in md_text
     assert "测试弱确认" in md_text

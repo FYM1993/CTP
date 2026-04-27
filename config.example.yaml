@@ -37,6 +37,15 @@ positions:
 
 # ==================== 盘前分析参数 ====================
 pre_market:
+  # 账户风控（实盘建议与回测共用）
+  # Phase2最终分决定仓位权重；所有可执行品种共享30%组合保证金池；
+  # 单笔止损触发时的账户亏损预算为1.5%，最终建议手数取三道约束的最小值。
+  # 如账户权益变化，先更新 account_equity，否则建议手数会失真。
+  account_equity: 1000000
+  risk_per_trade_pct: 0.015
+  max_margin_pct: 0.30             # 兼容旧单品种保证金闸门
+  portfolio_max_margin_pct: 0.30   # 最终组合保证金池
+
   # 均线系统
   ma_windows: [5, 10, 20, 60, 120]
   direction_delta: 12      # Phase 2 自主判定多空时的最小分差

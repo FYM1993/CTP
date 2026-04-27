@@ -25,6 +25,10 @@ def test_ensure_daily_holdings_workbook_creates_schema(tmp_path: Path) -> None:
     assert workbook.sheetnames == ["持仓录入", "原始推荐"]
     assert [cell.value for cell in workbook["持仓录入"][1]] == HOLDINGS_HEADERS
     assert [cell.value for cell in workbook["原始推荐"][1]] == RECOMMENDATION_HEADERS
+    assert "推荐日期" in HOLDINGS_HEADERS
+    assert "入场触发" in RECOMMENDATION_HEADERS
+    assert "确认低点" in RECOMMENDATION_HEADERS
+    assert "确认高点" in RECOMMENDATION_HEADERS
 
 
 def test_ensure_daily_holdings_workbook_copies_previous_rows(tmp_path: Path) -> None:
@@ -38,6 +42,8 @@ def test_ensure_daily_holdings_workbook_copies_previous_rows(tmp_path: Path) -> 
     holdings_sheet["D2"] = "做多"
     holdings_sheet["E2"] = 2
     holdings_sheet["F2"] = 11480
+    holdings_sheet["G2"] = "2026-04-22"
+    holdings_sheet["H2"] = "旧备注"
     recommendation_sheet["A2"] = "H001-推荐"
     recommendation_sheet["B2"] = "2026-04-22"
     recommendation_sheet["C2"] = "09:12"
@@ -50,5 +56,7 @@ def test_ensure_daily_holdings_workbook_copies_previous_rows(tmp_path: Path) -> 
     current_workbook = load_workbook(current)
     assert current_workbook["持仓录入"]["A2"].value == "H001-持仓"
     assert current_workbook["持仓录入"]["B2"].value == "LH0"
+    assert current_workbook["持仓录入"]["G2"].value == "2026-04-22"
+    assert current_workbook["持仓录入"]["H2"].value == "旧备注"
     assert current_workbook["原始推荐"]["A2"].value == "H001-推荐"
     assert current_workbook["原始推荐"]["D2"].value == "LH0"

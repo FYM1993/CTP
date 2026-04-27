@@ -168,6 +168,23 @@ def _compact_drivers(*drivers: str | None) -> list[str]:
     return [driver for driver in drivers if driver]
 
 
+def _long_reversal_structural_score(
+    snapshot: dict[str, Any] | None,
+    structural_down: float,
+) -> float:
+    if structural_down <= 0:
+        return 0.0
+
+    snapshot = snapshot or {}
+    extreme_direction = str(snapshot.get("extreme_state_direction") or "")
+    turn_direction = str(snapshot.get("marginal_turn_direction") or "")
+    if bool(snapshot.get("fundamental_reversal_confirmed")) and extreme_direction == "long":
+        return structural_down
+    if extreme_direction == "long" and turn_direction == "long":
+        return structural_down
+    return 0.0
+
+
 def _phase1_score_details(
     *,
     reversal_direction: str,
@@ -183,6 +200,7 @@ def _phase1_score_details(
     low_persistence: float,
     high_persistence: float,
     structural_down: float,
+    reversal_up_structural: float,
     structural_up: float,
     hog_reversal: float,
     proxy_scores: dict[str, float],
@@ -194,7 +212,7 @@ def _phase1_score_details(
     reversal_up_drivers = _compact_drivers(
         _score_driver("价格低位", low_price),
         _score_driver("低位持续", low_persistence),
-        _score_driver("过剩/高库存", structural_down),
+        _score_driver("过剩/高库存边际转向", reversal_up_structural),
         _score_driver("利润压力", hog_reversal),
         _score_driver("历史代理反转向上", proxy_scores.get("reversal_up")),
     )
@@ -643,16 +661,17 @@ def _build_candidate(
     high_persistence = _clip_score(stats["high_persistence_days"] / 25.0 * 100.0)
     structural_down = max(inv_down, receipt_down)
     structural_up = max(inv_up, receipt_up)
+    reversal_up_structural = _long_reversal_structural_score(fundamental_snapshot, structural_down)
 
     reversal_up = (
         low_price * 0.18
         + low_persistence * 0.28
         + hog_reversal * 0.42
-        + structural_down * 0.30
+        + reversal_up_structural * 0.30
     )
     if low_price >= 50 and hog_reversal >= 45:
         reversal_up += 12.0
-    if low_persistence >= 60 and structural_down >= 70:
+    if low_persistence >= 60 and reversal_up_structural >= 70:
         reversal_up += 13.0
     if low_persistence >= 60 and hog_reversal >= 50:
         reversal_up += 6.0
@@ -716,7 +735,10 @@ def _build_candidate(
                 ]
             )
             dominant_reasons.extend([item for item in hog_reasons if "亏" in item[0] or "利润" in item[0]])
-            dominant_reasons.extend([item for item in inv_reasons + receipt_reasons if "高位" in item[0] or "累" in item[0]])
+            if reversal_up_structural > 0:
+                dominant_reasons.extend(
+                    [item for item in inv_reasons + receipt_reasons if "高位" in item[0] or "累" in item[0]]
+                )
         else:
             dominant_reasons.extend(
                 [
@@ -756,7 +778,7 @@ def _build_candidate(
     )
     reversal_evidence_domains = _reversal_evidence_domains(
         direction=reversal_direction,
-        structural_score=structural_down,
+        structural_score=reversal_up_structural if reversal_direction == "long" else structural_down,
         oi_structure=oi_structure,
         hog_reversal=hog_reversal,
         hog_profit=hog_profit,
@@ -775,6 +797,7 @@ def _build_candidate(
         low_persistence=low_persistence,
         high_persistence=high_persistence,
         structural_down=structural_down,
+        reversal_up_structural=reversal_up_structural,
         structural_up=structural_up,
         hog_reversal=hog_reversal,
         proxy_scores=proxy_scores,

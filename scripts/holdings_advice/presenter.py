@@ -120,6 +120,12 @@ def format_holding_status_text(result: dict) -> str:
     if action == "继续持有":
         return f"原有交易故事仍成立，继续按原计划持有，第一止盈继续看{tp1_text}"
     if action == "减仓观察":
+        if management_action == "减仓":
+            risk = result.get("risk_control") or {}
+            max_safe_size = int(risk.get("max_safe_size") or 0)
+            if max_safe_size > 0:
+                return f"当前止损风险超出账户预算，优先减仓到{max_safe_size}手以内"
+            return "当前止损风险超出账户预算，优先降低仓位风险"
         return "已进入第一兑现区，优先执行减仓管理"
     if action == "平仓":
         if "已达到" in reason and "旧计划已完成" in reason:

@@ -865,6 +865,72 @@ def test_build_trade_plan_from_daily_df_allows_trend_entry_when_tp1_rr_is_below_
     assert plan["phase2_rr_gate_passed"] is True
 
 
+def test_build_trend_trade_plan_rejects_when_account_risk_requires_missing_contract_multiplier(monkeypatch) -> None:
+    df = _build_daily_frame()
+
+    monkeypatch.setattr(
+        pre_market,
+        "assess_reversal_status",
+        lambda *args, **kwargs: {
+            "has_signal": False,
+            "signal_type": "",
+            "signal_date": "",
+            "signal_bar": {"low": 0.0, "high": 0.0},
+            "signal_detail": "",
+            "current_stage": "上涨中",
+            "next_expected": "等待回踩",
+            "confidence": 0.0,
+            "all_events": [],
+            "suspect_events": [],
+        },
+    )
+    monkeypatch.setattr(
+        pre_market,
+        "score_signals",
+        lambda *args, **kwargs: {
+            "均线排列": 12.0,
+            "MACD": 6.0,
+            "RSI": 4.0,
+            "布林带": 3.0,
+            "动量": 5.0,
+            "价格位置": 0.0,
+        },
+    )
+    monkeypatch.setattr(pre_market, "calc_atr", lambda *args, **kwargs: pd.Series([2.0] * len(df), index=df.index))
+    monkeypatch.setattr(pre_market, "find_support_resistance", lambda *args, **kwargs: ([100.0], [116.0, 120.0]))
+    monkeypatch.setattr(pre_market, "wyckoff_phase", lambda *args, **kwargs: type("P", (), {"phase": "markup"})())
+    monkeypatch.setattr(
+        pre_market,
+        "calc_ma",
+        lambda series, window: pd.Series(
+            [
+                (
+                    106.0 + i * 0.04
+                    if window == 5
+                    else 105.2 + i * 0.035
+                    if window == 10
+                    else 104.5 + i * 0.03
+                )
+                for i in range(len(series))
+            ],
+            index=series.index,
+        ),
+    )
+
+    plan = pre_market.build_trade_plan_from_daily_df(
+        symbol="ZZ0",
+        name="未知品种",
+        direction="long",
+        df=df,
+        cfg={"account_equity": 1_000_000.0, "risk_per_trade_pct": 0.015},
+    )
+
+    assert plan is not None
+    assert plan["actionable"] is False
+    assert plan["phase2_risk_gate_passed"] is False
+    assert "缺少合约乘数" in plan["downgrade_reason"]
+
+
 def test_build_trade_plan_from_daily_df_returns_trend_short_plan_without_reversal_signal(monkeypatch) -> None:
     df = _build_daily_frame()
 
