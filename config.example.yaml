@@ -45,6 +45,7 @@ pre_market:
   risk_per_trade_pct: 0.015
   max_margin_pct: 0.30             # 兼容旧单品种保证金闸门
   portfolio_max_margin_pct: 0.30   # 最终组合保证金池
+  trend_min_first_target_rr: 1.5    # 趋势入场第一目标收益风险比下限
 
   # 均线系统
   ma_windows: [5, 10, 20, 60, 120]

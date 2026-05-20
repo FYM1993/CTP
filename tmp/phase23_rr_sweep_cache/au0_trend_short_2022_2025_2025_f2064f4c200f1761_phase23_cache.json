@@ -1,0 +1,52 @@
+{
+  "version": "phase23-experiment-v1",
+  "case_id": "au0_trend_short_2022_2025_2025",
+  "symbol": "AU0",
+  "direction": "short",
+  "start_date": "2025-01-01",
+  "end_date": "2025-12-31",
+  "pre_market_fingerprint": "{\"account_equity\":1000000,\"atr_window\":14,\"backtest_fundamental_mode\":\"strict\",\"bollinger\":{\"std\":2,\"window\":20},\"fib_levels\":[0.236,0.382,0.5,0.618,0.786],\"ma_windows\":[5,10,20,60,120],\"macd\":{\"fast\":12,\"signal\":9,\"slow\":26},\"max_margin_pct\":0.3,\"portfolio_max_margin_pct\":0.3,\"risk_per_trade_pct\":0.015,\"rsi_window\":14,\"sr_lookback\":120,\"sr_touch_count\":3,\"trade_management\":{\"entry_profiles\":{\"reversal\":{\"move_stop_to_entry_after_tp1\":false,\"tp1_exit_fraction\":0.33},\"trend\":{\"daily_invalidation_policy\":\"reverse_confirmed\",\"move_stop_to_entry_after_tp1\":false,\"post_tp1_stop_policy\":\"risk_buffer\",\"post_tp1_stop_r_buffer\":0.25,\"reverse_score_threshold\":20,\"tp1_exit_fraction\":0.33}},\"strategy_profiles\":{\"reversal_fundamental\":{\"move_stop_to_entry_after_tp1\":false,\"tp1_exit_fraction\":0.33},\"trend_following\":{\"daily_invalidation_policy\":\"reverse_confirmed\",\"move_stop_to_entry_after_tp1\":false,\"post_tp1_stop_policy\":\"risk_buffer\",\"post_tp1_stop_r_buffer\":0.25,\"reverse_score_threshold\":20,\"tp1_exit_fraction\":0.33}}},\"trend_min_first_target_rr\":1.8}",
+  "signal_fingerprint": "{\"breakout\":{\"atr_stop_multiplier\":2,\"window\":20},\"daily_max_loss_pct\":0.05,\"max_loss_pct\":0.02,\"max_trades_per_day\":5,\"mean_reversion\":{\"bb_std\":2,\"bb_window\":20,\"rsi_overbought\":70,\"rsi_oversold\":30},\"volume_filter\":1.5}",
+  "result": {
+    "case_id": "au0_trend_short_2022_2025_2025",
+    "trades": [],
+    "summary": {
+      "num_trades": 0
+    },
+    "diagnostics": {
+      "daily_rows_loaded": 1038,
+      "first_trade_day_visible_daily_rows": 796,
+      "trade_days_total": 243,
+      "phase2_history_insufficient_days": 0,
+      "phase2_non_actionable_days": 243,
+      "phase2_actionable_days": 0,
+      "phase3_signal_eval_bars": 0,
+      "phase3_entry_signal_hits": 0,
+      "phase3_entry_adverse_deviation_rejects": 0,
+      "phase3_entry_confirmation_wait_bars": 0,
+      "phase3_initial_stop_grace_skips": 0,
+      "trades_opened": 0,
+      "backtest_fundamental_blocked_days": 0,
+      "backtest_fundamental_proxy_days": 0,
+      "phase2_reject_no_signal_days": 0,
+      "phase2_reject_score_gate_days": 0,
+      "phase2_reject_rr_gate_days": 0,
+      "phase2_reject_duplicate_signal_days": 0,
+      "phase2_reject_missing_fundamental_days": 0,
+      "phase2_actionable_reversal_days": 0,
+      "phase2_actionable_trend_days": 0,
+      "trades_opened_reversal": 0,
+      "trades_opened_trend": 0,
+      "phase2_actionable_strategy_reversal_days": 0,
+      "phase2_actionable_strategy_trend_days": 0,
+      "trades_opened_strategy_reversal": 0,
+      "trades_opened_strategy_trend": 0,
+      "daily_first_date": "2021-09-16",
+      "daily_last_date": "2025-12-30",
+      "first_trade_day": "2025-01-02",
+      "first_trade_day_visible_first_date": "2021-09-16",
+      "first_trade_day_visible_last_date": "2025-01-01"
+    },
+    "debug": {}
+  }
+}

@@ -21,6 +21,7 @@ wheels/
 *.egg
 config.yaml
 # Virtual Environment
+.venv/
 venv/
 ENV/
 env/
